@@ -42,10 +42,30 @@ export class ManagedAgent {
  return {message:`${item.name}: minimum ${minimum}, ${targetMatch?'target':'suggested target'} ${target}${max_price!=null?`, maximum ${existing?.currency&&existing.currency!=='EUR'?existing.currency+' ':'€'}${max_price} per ${price_quantity} ${parsedUnit||existing?.price_unit||item.unit}`:''}. Form filled — edit and save when ready.`,proposal:{query:item.name,minimum,target,on_hand:item.on_hand,max_price,price_quantity,currency:existing?.currency||'EUR',price_unit:parsedUnit||existing?.price_unit||item.unit}};}
 
  telemetry(s,category,message){(s.telemetry??=[]).push({at:new Date(this.now()).toISOString(),category,message});if(s.telemetry.length>200)s.telemetry.splice(0,s.telemetry.length-200);}
- simulationSetup(s){if(s.simulation)return;s.simulation={running:false,speed:'1x',governance:'autonomous',next_consumption:null};s.metrics={stockouts_prevented:0,autonomous_orders:0,spend_governed:0};s.telemetry=[];
- if(!s.rules.length)for(const item of s.inventory.slice(0,3)){item.on_hand=20;s.rules.push({...ruleSchema.parse({query:item.name,minimum:10,target:20,on_hand:20,price_unit:item.unit}),product_id:item.id,id:randomUUID(),version:1,sales_unit:item.unit,price_unit_factor:1});}}
+ seedSimulationProducts(s){
+  // A prior snapshot can represent a deliberate zero, so retain stock when a
+  // warehouse has ever been manually adjusted. Existing rules are never changed.
+  const hasSnapshot=s.activity.some(event=>event.status==='CONFIGURATION'&&event.message==='snapshot');
+  for(const item of s.inventory){
+   if(s.rules.some(rule=>rule.product_id===item.id))continue;
+   if(!hasSnapshot&&item.on_hand===0)item.on_hand=20;
+   s.rules.push({...ruleSchema.parse({query:item.name,minimum:10,target:20,on_hand:item.on_hand,price_unit:item.unit}),product_id:item.id,id:randomUUID(),version:1,sales_unit:item.unit,price_unit_factor:1});
+  }
+ }
+ migrateSimulationSeeds(s){
+  if(!s.simulation||s.simulation.seed_version!=null)return false;
+  // The original automatic seed was the first three demo products with these
+  // thresholds. Other existing rules may be custom and are left intact.
+  const originalIds=['demo-beer','demo-dark-beer','demo-eggs'];
+  const originalSeed=originalIds.every(id=>s.rules.some(rule=>rule.product_id===id&&rule.minimum===10&&rule.target===20&&rule.max_price==null));
+  if(originalSeed)this.seedSimulationProducts(s);
+  s.simulation.seed_version=2;
+  return true;
+ }
+ simulationSetup(s){if(s.simulation){this.migrateSimulationSeeds(s);return;}s.simulation={running:false,speed:'1x',governance:'autonomous',next_consumption:null,seed_version:2};s.metrics={stockouts_prevented:0,autonomous_orders:0,spend_governed:0};s.telemetry=[];
+ if(!s.rules.length)this.seedSimulationProducts(s);}
  consume(s,spike=false){const choices=s.rules.filter(r=>!r.episode&&(!spike||r.minimum>0)&&s.inventory.some(i=>i.id===r.product_id));if(!choices.length)return;const r=choices[Math.floor(Math.random()*choices.length)],item=s.inventory.find(i=>i.id===r.product_id),before=item.on_hand;item.on_hand=spike?Math.min(before,Math.max(0,Math.ceil(r.minimum)-1)):Math.max(0,before-(1+Math.floor(Math.random()*4)));r.on_hand=item.on_hand;const reason=spike?'Demand spike':['Kitchen service','Breakfast service','Order preparation','Production run'][Math.floor(Math.random()*4)];this.telemetry(s,'CONSUMPTION',`-${before-item.on_hand} ${item.name} (${reason}) | Stock: ${item.on_hand}/${r.target}`);if(item.on_hand<r.minimum)this.telemetry(s,'THRESHOLD',`${item.name} below minimum ${r.minimum}; evaluating replenishment`);}
- async simulationStep(user){await this.serial(async()=>{const s=this.state(user);if(!s.simulation)return;const sim=s.simulation;if(sim.running&&(!sim.next_consumption||this.now()>=sim.next_consumption)){this.consume(s);sim.next_consumption=this.now()+(sim.speed==='fast'?3000:8000);await this.save();}});await this.tick(user);}
+ async simulationStep(user){await this.serial(async()=>{const s=this.state(user);if(!s.simulation)return;const sim=s.simulation;let changed=this.migrateSimulationSeeds(s);if(sim.running&&(!sim.next_consumption||this.now()>=sim.next_consumption)){this.consume(s);sim.next_consumption=this.now()+(sim.speed==='fast'?3000:8000);changed=true;}if(changed)await this.save();});await this.tick(user);}
  async command(user,body){return this.serial(async()=>{const s=this.state(user);switch(body.action){
  case 'connect':case 'enable':break;
  case 'simulation':{this.simulationSetup(s);const sim=s.simulation;if(body.running!==undefined)sim.running=z.boolean().parse(body.running);if(body.speed!==undefined)sim.speed=z.enum(['1x','fast']).parse(body.speed);if(body.governance!==undefined)sim.governance=z.enum(['autonomous','human']).parse(body.governance);sim.next_consumption=sim.running?this.now()+(sim.speed==='fast'?3000:8000):null;break;}

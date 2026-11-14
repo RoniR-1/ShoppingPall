@@ -8,38 +8,49 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body class="inventory-dashboard">
-<header class="topbar dashboard-topbar">
-  <div class="topbar-left"><a class="brand" href="/user-agent-demo">shopping pal<span class="brand-dot">.</span></a><span class="dashboard-divider"></span><span class="workspace-label">OPERATIONS WORKSPACE</span></div>
-  <nav class="topbar-right" aria-label="Main navigation"><a class="nav-link" href="/user-agent-demo">User agent demo</a><a class="nav-link current" href="/agent-managed-inventory" aria-current="page">Agent-Managed Inventory</a><button id="new-session" class="dashboard-link" type="button">New session</button></nav>
+<header class="topbar">
+  <div class="topbar-left"><a class="brand" href="/user-agent-demo">shopping pal</a><span class="status-tag">demo warehouse · simulated</span></div>
+  <nav class="topbar-right" aria-label="Main navigation"><a class="nav-link" href="/user-agent-demo">User agent demo</a><a class="nav-link" href="/agent-managed-inventory" aria-current="page">Agent-Managed Inventory</a><span class="buyer-tag">buyer: <strong id="buyer-label"></strong></span><button id="new-session" class="ghost-btn small-btn" type="button">New Session</button></nav>
 </header>
-<main class="dashboard-shell">
-  <div class="dashboard-heading"><div><p class="eyebrow">AUTONOMOUS OPERATIONS <span>/</span> INVENTORY</p><h1>Inventory, in motion.</h1><p class="dashboard-subtitle">Your agent monitors demand, governs spend, and keeps stock moving.</p></div><div class="environment"><span class="environment-dot"></span> DEMO WAREHOUSE <small id="buyer-label"></small></div></div>
-  <p id="error" class="dashboard-error" role="alert" hidden></p>
-  <section class="kpi-grid" aria-label="Operations summary">
-    <article class="kpi-card"><div class="kpi-label">AGENT STATUS <span>01</span></div><div class="kpi-value agent-status" id="agent-status"><i></i><span>PAUSED</span></div><p id="status-caption">Simulation is paused</p></article>
-    <article class="kpi-card"><div class="kpi-label">STOCKOUTS PREVENTED <span>02</span></div><div class="kpi-value" id="stockouts">0</div><p>Replenishment cycles completed</p></article>
-    <article class="kpi-card"><div class="kpi-label">AUTONOMOUS ORDERS <span>03</span></div><div class="kpi-value" id="orders-count">0</div><p>Purchase orders dispatched</p></article>
-    <article class="kpi-card"><div class="kpi-label">SPEND GOVERNED <span>04</span></div><div class="kpi-value" id="spend">€0.00</div><p>Order value audited against policy</p></article>
-  </section>
-  <section class="control-deck dashboard-card" aria-labelledby="controls-title"><div class="section-heading"><div><p class="eyebrow">SIMULATION CONTROLS</p><h2 id="controls-title">Control deck</h2></div><span class="section-note">SIMULATED ENVIRONMENT</span></div><div class="control-grid">
-    <div class="control-item"><span class="control-label">SIMULATION STATE</span><button class="dashboard-button primary" id="simulation-toggle" type="button">Start simulation</button></div>
-    <div class="control-item"><span class="control-label" id="speed-label">SPEED</span><div class="segmented" role="group" aria-labelledby="speed-label"><button type="button" data-speed="1x">1x <small>8s</small></button><button type="button" data-speed="fast">Fast <small>3s</small></button></div></div>
-    <div class="control-item governance-control"><label class="control-label" for="governance">GOVERNANCE MODE</label><select id="governance"><option value="autonomous">Full Autonomous</option><option value="human">Human-in-the-Loop</option></select></div>
-    <div class="control-item"><span class="control-label">ON-DEMAND SCENARIO</span><button class="dashboard-button outline" id="demand-spike" type="button">Simulate demand spike</button></div>
-  </div></section>
-  <div class="dashboard-columns"><div class="dashboard-main-column">
-    <section class="dashboard-card stock-panel" aria-labelledby="stock-title"><div class="section-heading"><div><p class="eyebrow">WAREHOUSE OVERVIEW</p><h2 id="stock-title">Inventory health</h2><p class="section-description">Live stock position against your configured targets.</p></div><span id="sku-count" class="count-badge">0 MONITORED</span></div><div class="stock-head"><span>PRODUCT / STOCK LEVEL</span><span>STATUS</span></div><div id="stock-list" class="stock-list"><p class="dashboard-empty">Start the simulation to monitor inventory.</p></div><div class="stock-legend"><span><i class="legend-min"></i> Reorder threshold</span><span><i class="legend-target"></i> Target level</span></div></section>
-    <section class="dashboard-card approvals-panel" aria-labelledby="approvals-title"><div class="section-heading"><div><p class="eyebrow">HUMAN OVERSIGHT</p><h2 id="approvals-title">Approvals &amp; governance</h2><p class="section-description">Review orders requiring a decision.</p></div><span id="approval-count" class="count-badge">0 PENDING</span></div><div id="approvals"><p class="dashboard-empty">No orders awaiting approval.</p></div></section>
-  </div><div class="dashboard-side-column">
-    <section class="telemetry-panel" aria-labelledby="telemetry-title"><div class="telemetry-header"><div><p class="eyebrow">SYSTEM ACTIVITY</p><h2 id="telemetry-title">Live agent telemetry</h2></div><span class="live-label"><i></i> LIVE FEED</span></div><div class="telemetry-meta"><span>EVENT STREAM</span><span>LOCAL TIME</span></div><div id="telemetry" class="telemetry-feed" role="log" aria-live="polite"><p class="telemetry-empty">Awaiting agent activity...</p></div><div class="telemetry-footer"><span><i></i> AGENT EVENT STREAM</span><span>DEMO DATA</span></div></section>
-    <section class="dashboard-card config-panel"><p class="eyebrow">CONFIGURATION</p><h2>Operational settings</h2><p class="section-description">Adjust thresholds or inspect a stock position when needed.</p>
-      <details id="rule-details"><summary>Replenishment rules <span>Configure thresholds and price caps</span></summary><div class="details-content"><p>Stock thresholds use sales units. Price caps are checked against supplier quotes using the product's configured units.</p><button class="dashboard-button outline" id="open-agent-chat" type="button">Draft with agent</button><form id="rule" class="dashboard-form"><label>Product<select name="query" required></select></label><div class="form-grid"><label>Minimum<input name="minimum" step="any" type="number" value="10" min="0" required></label><label>Target<input name="target" step="any" type="number" value="20" min="0.001" required></label><label>On hand<input name="on_hand" type="number" value="0" min="0" readonly></label><label>Maximum price<input name="max_price" type="number" min="0" step="0.01" placeholder="No price cap"></label><label>Cap quantity<input name="price_quantity" type="number" min="0.001" step="any" value="1" required></label><label>Currency<select name="currency"><option>EUR</option><option>USD</option><option>GBP</option><option>SEK</option><option>NOK</option><option>DKK</option></select></label><label>Price unit<select name="price_unit" required></select></label></div><p id="rule-units" class="form-hint"></p><p id="rule-draft" role="status"></p><button class="dashboard-button primary">Save reviewed rule</button></form></div></details>
-      <details><summary>Manual stock override <span>For edge-case testing</span></summary><div class="details-content"><form id="inventory" class="dashboard-form"><label>Product<select id="inventory-product" required></select></label><p id="inventory-current"></p><label>New on-hand amount<input id="inventory-amount" type="number" min="0" step="any" required></label><div class="form-actions"><button class="dashboard-button primary" type="submit">Save quantity</button><button class="dashboard-button outline" id="inventory-edit" type="button">Edit rule</button></div></form><p id="inventory-status" role="status"></p></div></details>
-      <details><summary>Decision evidence <span>Audit and reconciliation</span></summary><div class="details-content" id="activity"></div></details>
+<main class="container inventory-workspace">
+  <div class="col">
+    <section class="panel" aria-labelledby="simulation-title">
+      <div class="panel-bar"><span id="simulation-title">01 · Inventory simulation</span><span class="muted">Demo only · no live orders</span></div>
+      <p class="intro">Monitor stock and let the agent replenish products when they fall below their minimum.</p>
+      <p id="error" class="input-error" role="alert" hidden></p>
+      <div class="simulation-actions"><button class="primary-btn" id="simulation-toggle" type="button">Start simulation</button><button class="ghost-btn" id="demand-spike" type="button">Simulate demand spike</button></div>
+      <div class="control-grid">
+        <div><span class="field-label" id="speed-label">Speed</span><div class="speed-options" role="group" aria-labelledby="speed-label"><button class="ghost-btn" type="button" data-speed="1x">1x (8s)</button><button class="ghost-btn" type="button" data-speed="fast">Fast (3s)</button></div></div>
+        <label><span class="field-label">Governance mode</span><select id="governance"><option value="autonomous">Full Autonomous</option><option value="human">Human-in-the-Loop</option></select></label>
+      </div>
+      <div class="kpi-grid" aria-label="Operations summary">
+        <div><span>Agent status</span><strong class="agent-status" id="agent-status"><i></i><span>PAUSED</span></strong><small id="status-caption">Simulation is paused</small></div>
+        <div><span>Stockouts prevented</span><strong id="stockouts">0</strong><small>Completed restocks</small></div>
+        <div><span>Autonomous orders</span><strong id="orders-count">0</strong><small>Orders dispatched</small></div>
+        <div><span>Spend governed</span><strong id="spend">€0.00</strong><small>Order value reviewed</small></div>
+      </div>
     </section>
-  </div></div>
-  <footer class="dashboard-footer"><span>SHOPPING PAL / AGENT-MANAGED INVENTORY</span><span>SIMULATION ONLY · NO LIVE ORDERS</span></footer>
+    <section class="panel" aria-labelledby="stock-title">
+      <div class="panel-bar"><span id="stock-title">02 · Inventory</span><span class="muted" id="sku-count">0 MONITORED</span></div>
+      <p class="intro">Stock is shown against each product's target. The marker indicates its reorder minimum.</p>
+      <div id="stock-list" class="stock-list"><p class="dashboard-empty">Start the simulation to load the demo products.</p></div>
+      <div class="stock-legend"><span><i class="legend-min"></i> Minimum</span><span><i class="legend-target"></i> Target</span></div>
+      <details id="rule-details" class="inventory-details"><summary>+ Replenishment rules <span class="muted">(thresholds and price caps)</span></summary><div class="details-content"><p>Stock thresholds use sales units. Price caps are checked against supplier quotes using the product's configured units.</p><button class="ghost-btn" id="open-agent-chat" type="button">Draft with agent</button><form id="rule" class="dashboard-form"><label>Product<select name="query" required></select></label><div class="form-grid"><label>Minimum<input name="minimum" step="any" type="number" value="10" min="0" required></label><label>Target<input name="target" step="any" type="number" value="20" min="0.001" required></label><label>On hand<input name="on_hand" type="number" value="0" min="0" readonly></label><label>Maximum price<input name="max_price" type="number" min="0" step="0.01" placeholder="No price cap"></label><label>Cap quantity<input name="price_quantity" type="number" min="0.001" step="any" value="1" required></label><label>Currency<select name="currency"><option>EUR</option><option>USD</option><option>GBP</option><option>SEK</option><option>NOK</option><option>DKK</option></select></label><label>Price unit<select name="price_unit" required></select></label></div><p id="rule-units" class="muted"></p><p id="rule-draft" role="status"></p><button class="primary-btn">Save reviewed rule</button></form></div></details>
+      <details class="inventory-details"><summary>+ Manual stock override <span class="muted">(edge-case testing)</span></summary><div class="details-content"><form id="inventory" class="dashboard-form"><label>Product<select id="inventory-product" required></select></label><p id="inventory-current"></p><label>New on-hand amount<input id="inventory-amount" type="number" min="0" step="any" required></label><div class="form-actions"><button class="primary-btn" type="submit">Save quantity</button><button class="ghost-btn" id="inventory-edit" type="button">Edit rule</button></div></form><p id="inventory-status" role="status"></p></div></details>
+    </section>
+  </div>
+  <div class="col">
+    <section class="panel" aria-labelledby="activity-title">
+      <div class="panel-bar"><span id="activity-title">03 · Agent activity</span><span class="muted">Live demo feed</span></div>
+      <div class="activity-heading"><strong>Approval queue</strong><span class="muted" id="approval-count">0 PENDING</span></div>
+      <p class="intro">Orders needing human review appear here.</p>
+      <div id="approvals"><p class="dashboard-empty">No orders awaiting approval.</p></div>
+      <details class="inventory-details" open><summary>+ Live agent telemetry <span class="muted">(local time)</span></summary><div id="telemetry" class="telemetry-feed" role="log" aria-live="polite"><p class="telemetry-empty">Awaiting agent activity...</p></div></details>
+      <details class="inventory-details"><summary>+ Decision evidence <span class="muted">(audit and reconciliation)</span></summary><div class="details-content" id="activity"></div></details>
+    </section>
+  </div>
 </main>
-<dialog class="dashboard-dialog" id="agent-chat" aria-labelledby="agent-chat-title"><div class="dialog-heading"><div><p class="eyebrow">RULE ASSISTANT</p><h2 id="agent-chat-title">Chat with your agent</h2></div><button class="dashboard-button outline" id="close-agent-chat" type="button">Close</button></div><p>Describe your stock and price requirements. The agent will prepare a rule for your review.</p><form id="chat" class="dashboard-form"><label>Instruction<input name="text" placeholder="Keep at least 10 milk" required></label><button class="dashboard-button primary">Send instruction</button></form><div id="reply" role="status"></div></dialog>
+<dialog class="agent-chat-dialog" id="agent-chat" aria-labelledby="agent-chat-title"><div class="panel-bar"><strong id="agent-chat-title">Rule assistant</strong><button class="ghost-btn small-btn" id="close-agent-chat" type="button">Close</button></div><p>Describe your stock and price requirements. The agent will prepare a rule for your review.</p><form id="chat" class="dashboard-form"><label>Instruction<input name="text" placeholder="Keep at least 10 milk" required></label><button class="primary-btn">Send instruction</button></form><div id="reply" role="status"></div></dialog>
 <script src="/agent-managed-inventory.js" type="module"></script>
-</body></html>
+</body>
+</html>

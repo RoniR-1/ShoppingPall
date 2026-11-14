@@ -30,7 +30,7 @@ test('simulation cadence, pause and delayed receipt survive restart',async()=>{
     const args={file:dir+'/state.json',now:()=>now,submit:async(lines)=>({id:`order-${++calls}`,status:'APPROVED',total:10,items:[{quantity:lines[0].quantity}]})};
     const a=new ManagedAgent(args);
     await a.command('buyer',{action:'simulation',running:true,speed:'fast',governance:'autonomous'});
-    assert.equal(a.state('buyer').rules.length,3);
+    assert.equal(a.state('buyer').rules.length,7);
     const before=a.state('buyer').inventory.map(i=>i.on_hand);
     now+=2999;await a.simulationStep('buyer');assert.deepEqual(a.state('buyer').inventory.map(i=>i.on_hand),before);
     now++;await a.simulationStep('buyer');assert.ok(a.state('buyer').inventory.some((i,n)=>i.on_hand<before[n]));
@@ -44,6 +44,45 @@ test('simulation cadence, pause and delayed receipt survive restart',async()=>{
     now++;await b.simulationStep('buyer');assert.equal(b.state('buyer').inventory.find(i=>i.id===rule.product_id).on_hand,rule.target);
     await b.simulationStep('buyer');assert.equal(b.state('buyer').metrics.stockouts_prevented,1);assert.equal(calls,1);
     assert.ok(b.state('buyer').telemetry.some(e=>e.category==='RESTOCK'));
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('older default simulations gain products without changing custom rules or stock',async()=>{
+  const dir=await mkdtemp(tmpdir()+'/managed-seed-migration-');
+  try{
+    const file=dir+'/state.json';
+    const a=new ManagedAgent({file});
+    await a.command('buyer',{action:'simulation',running:false});
+    const original=a.state('buyer');
+    original.rules=original.rules.slice(0,3);
+    delete original.simulation.seed_version;
+    original.inventory.find(item=>item.id==='demo-milk').on_hand=6;
+    original.inventory.find(item=>item.id==='demo-potato-salad').on_hand=0;
+    original.activity.push({status:'CONFIGURATION',message:'snapshot'});
+    original.rules.push({...ruleSchema.parse({query:'Milk',minimum:3,target:12,on_hand:6}),id:'custom',product_id:'demo-milk',version:1,sales_unit:'ST',price_unit_factor:1});
+    await a.save();
+    const b=new ManagedAgent({file});await b.load();await b.simulationStep('buyer');
+    const migrated=b.state('buyer');
+    assert.equal(migrated.rules.length,7);
+    assert.equal(migrated.simulation.seed_version,2);
+    assert.equal(migrated.rules.find(rule=>rule.product_id==='demo-milk').minimum,3);
+    assert.equal(migrated.inventory.find(item=>item.id==='demo-milk').on_hand,6);
+    assert.equal(migrated.inventory.find(item=>item.id==='demo-potato-salad').on_hand,0);
+    const c=new ManagedAgent({file});await c.load();
+    assert.equal(c.state('buyer').rules.length,7);
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('custom simulations are not reseeded on migration',async()=>{
+  const dir=await mkdtemp(tmpdir()+'/managed-custom-seed-');
+  try{
+    const a=new ManagedAgent({file:dir+'/state.json'});
+    await a.command('buyer',{action:'rule',rule:{query:'Eggs',minimum:2,target:5,on_hand:0}});
+    await a.command('buyer',{action:'simulation',running:false});
+    delete a.state('buyer').simulation.seed_version;
+    await a.save();await a.simulationStep('buyer');
+    assert.equal(a.state('buyer').rules.length,1);
+    assert.equal(a.state('buyer').rules[0].minimum,2);
   }finally{await rm(dir,{recursive:true,force:true});}
 });
 
