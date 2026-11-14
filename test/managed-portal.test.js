@@ -104,6 +104,8 @@ test('managed portal serves its page, drafts rules, enforces caps and reconciles
   assert.equal(auto.metrics.autonomous_orders,1);
   const alias=await api('/agent-managed-inventory?user_id=sim-buyer');
   assert.equal(alias.simulated,true);
+  await api('/agent-managed-inventory',{user_id:'sim-buyer',action:'snapshot',id:'demo-eggs',on_hand:20});
+  await api('/agent-managed-inventory',{user_id:'sim-buyer',action:'rule',rule:{query:'Eggs',minimum:10,target:20,on_hand:20}});
   await api('/agent-managed-inventory',{user_id:'sim-buyer',action:'simulation',governance:'human',running:false});
   await api('/agent-managed-inventory',{user_id:'sim-buyer',action:'demand_spike'});
   let simulated=await api('/agent-managed-inventory?user_id=sim-buyer');
@@ -118,4 +120,12 @@ test('managed portal serves its page, drafts rules, enforces caps and reconciles
   assert.equal(simulated.orders[0].status,'PENDING_APPROVAL');
   assert.match(simulated.orders[0].reason,/Price cap review required/);
   assert.match(simulated.orders[0].policy_breach,/Price cap exceeded/);
+  await api('/agent-managed-inventory',{user_id:'sim-milk',action:'rule',rule:{query:'Milk',minimum:1,target:2,on_hand:0}});
+  await api('/agent-managed-inventory',{user_id:'sim-milk',action:'simulation',governance:'autonomous',running:false});
+  const blocked=await api('/agent-managed-inventory?user_id=sim-milk');
+  assert.equal(blocked.orders.length,0);
+  const denied=blocked.activity.find(a=>a.status==='DENIED');
+  assert.match(denied.message,/Milk:.*allergen policy/);
+  assert.ok(blocked.telemetry.some(event=>event.category==='POLICY'&&event.message===denied.message));
+  assert.equal(blocked.metrics.spend_governed,0);
 });

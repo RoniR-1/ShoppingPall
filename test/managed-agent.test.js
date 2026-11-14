@@ -47,6 +47,20 @@ test('simulation cadence, pause and delayed receipt survive restart',async()=>{
   }finally{await rm(dir,{recursive:true,force:true});}
 });
 
+test('6x simulation follows the configured cadence without accumulating a backlog',async()=>{
+  const dir=await mkdtemp(tmpdir()+'/managed-6x-');
+  try{
+    let now=100000;
+    const a=new ManagedAgent({file:dir+'/state.json',now:()=>now,submit:async()=>{throw Error('unexpected order');}});
+    await a.command('buyer',{action:'simulation',running:true,speed:'6x'});
+    const start=a.state('buyer').inventory.map(item=>item.on_hand);
+    now+=1332;await a.simulationStep('buyer');assert.deepEqual(a.state('buyer').inventory.map(item=>item.on_hand),start);
+    now++;await a.simulationStep('buyer');assert.ok(a.state('buyer').inventory.some((item,index)=>item.on_hand<start[index]));
+    assert.equal(a.state('buyer').simulation.next_consumption,102666);
+    now+=10000;await a.simulationStep('buyer');assert.equal(a.state('buyer').simulation.next_consumption,now+1333);
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
 test('older default simulations gain products without changing custom rules or stock',async()=>{
   const dir=await mkdtemp(tmpdir()+'/managed-seed-migration-');
   try{
