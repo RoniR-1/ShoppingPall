@@ -99,6 +99,17 @@ export class SuspicionScorer {
       );
     }
 
+    if (order.budget_overrun) {
+      const amount = Number(order.total || 0);
+      const budget = Number(order.budget_limit || 0);
+      points += 85;
+      reasons.push(`Order total €${amount.toFixed(2)} exceeds stated budget €${budget.toFixed(2)} (+85)`);
+      addCheck('flag', 'budgetOverrun', 85, `Order total €${amount.toFixed(2)} exceeds the requested budget of €${budget.toFixed(2)} (+85 pts).`);
+      addQuestion('budgetOverrun', 85, items[0],
+        `The requested total budget is €${budget.toFixed(2)}, but this order costs €${amount.toFixed(2)}. Review or reduce the order before approving it.`,
+        { allowSubstitution: true });
+    }
+
     const totalQty = lines.reduce((n, l) => n + Number(l.quantity || 0), 0);
     if (lines.length > 20 || totalQty > 100) {
       points += 80;
@@ -363,6 +374,6 @@ export function route(order, scorer = new SuspicionScorer(), threshold = 25) {
     ...result,
     score,
     threshold: limit,
-    status: score > limit || order.incomplete ? 'PENDING_APPROVAL' : 'APPROVED'
+    status: score > limit || order.incomplete || order.budget_overrun ? 'PENDING_APPROVAL' : 'APPROVED'
   };
 }

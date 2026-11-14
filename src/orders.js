@@ -176,7 +176,8 @@ export async function createOrder(user, key, input, screening = defaultScreening
     try { screeningResult = screening.evaluate({ user, items: scoredItems, total_cents: total, quote_id: quote.id }); }
     catch (error) { assert(false, 503, `Order screening failed; retry after the screening service is fixed: ${error.message}`); }
     assert(screeningResult && [OrderStatus.APPROVED, OrderStatus.PENDING_REVIEW].includes(screeningResult.status), 503, 'Order screening returned an invalid decision');
-    const reason = input.force_flag ? 'Demo: force_flag requested' : items.some(i => i.orig_product_id) ? 'Substitution requires human sign-off' : risk.questions.some(q => q.rule === 'deliveryDelay') ? 'Delivery delay requires human sign-off' : screeningResult.status === OrderStatus.PENDING_REVIEW ? 'Order screening requires human sign-off' : risk.decision === 'REQUIRES_INTERVENTION' ? `Risk score ${risk.score.toFixed(2)} requires human sign-off` : null;
+    const reason = input.force_flag ? (input.force_flag_reason || 'Demo: force_flag requested') : items.some(i => i.orig_product_id) ? 'Substitution requires human sign-off' : risk.questions.some(q => q.rule === 'deliveryDelay') ? 'Delivery delay requires human sign-off' : screeningResult.status === OrderStatus.PENDING_REVIEW ? 'Order screening requires human sign-off' : risk.decision === 'REQUIRES_INTERVENTION' ? `Risk score ${risk.score.toFixed(2)} requires human sign-off` : null;
+
     const status = reason ? 'PENDING_APPROVAL' : 'APPROVED';
     const routine = status === 'APPROVED' && !input.force_flag && risk.decision === 'AUTO_APPROVE';
     const result = (await db.query(`INSERT INTO orders (id,user_id,quote_id,idempotency_key,request_hash,status,flag_reason,items,currency,total_cents,mocked,requested_date,risk_score,risk_details,routine,decided_at)

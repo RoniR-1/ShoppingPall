@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { recipeCart } from './agent.js';
-import { round3 } from './contracts.js';
+import { round3, parseDeliveryDeadline } from './contracts.js';
 const help = `Usage:
   npm run cli -- agent --user-id CUSTOMER --preset normal-order
   npm run cli -- agent --user-id CUSTOMER --preset suspicious-order
@@ -44,7 +44,9 @@ try {
   if (command === 'agent') {
     if (Boolean(flags.preset) === Boolean(flags.recipe)) throw new Error('Choose exactly one of --preset or --recipe');
     let cart;
-    const requestedDate = flags.date || new Date(Date.now() + 86400000).toISOString().slice(0,10);
+    // --date wins; otherwise use a delivery window stated in the recipe ("delivered in 3 days"), else tomorrow.
+    const requestedDate = flags.date || (flags.recipe && parseDeliveryDeadline(flags.recipe)) ||
+      new Date(Date.now() + 86400000).toISOString().slice(0,10);
     if (flags.preset) {
       if (!['normal-order','suspicious-order'].includes(flags.preset)) throw new Error('Unknown preset');
       cart = { items: [], selection_ids: [] };
@@ -61,9 +63,25 @@ try {
       cart = await recipeCart(flags.recipe,api,undefined,message => console.log(message),{ requestedDate });
     }
     const quote = await api('/quotes', { requestedDate, products: cart.items.map(i => i.productId), selection_ids: cart.selection_ids });
+    // The order is billed at quote prices, which can differ from the prices the agent planned with.
+    if (cart.budget != null && !cart.requiresApproval) {
+      const quoteItems = typeof quote.items === 'string' ? JSON.parse(quote.items) : quote.items;
+      const prices = cart.items.map(i => quoteItems?.find(q => q.productId === i.productId)?.unit_price);
+      const total = cart.items.reduce((sum, item, index) => sum + Number(prices[index]) * item.quantity, 0);
+      if (!prices.every(Number.isFinite)) {
+        cart.requiresApproval = true;
+        cart.approvalReason = 'Budget cannot be verified: the quote is missing prices for some products.';
+      } else if (Math.round(total * 100) > Math.round(cart.budget * 100)) {
+        cart.requiresApproval = true;
+        cart.approvalReason = `Quoted total EUR ${total.toFixed(2)} exceeds the stated budget of EUR ${cart.budget.toFixed(2)}.`;
+      }
+      if (cart.requiresApproval) console.log(`${cart.approvalReason} Sending for human approval.`);
+    }
     const key = flags['idempotency-key'] || randomUUID();
     const payload = { quote_id: quote.id, items: cart.items,
-      force_flag: Boolean(flags['force-flag'] || flags.recipe || flags.preset === 'suspicious-order') };
+    force_flag: Boolean(flags['force-flag'] || flags.recipe || flags.preset === 'suspicious-order' || cart.requiresApproval),
+    ...(cart.requiresApproval ? { force_flag_reason: cart.approvalReason } : {}) };
+
     // Print exact submission before sending so a network failure can be retried with the same key/body.
     console.log(`Submission: ${JSON.stringify({ idempotency_key: key, payload })}`);
     const order = await api('/orders',payload,{ 'Idempotency-Key': key });

@@ -4,6 +4,11 @@ describe('Gatekeeper',()=>{
  for(const [score,status] of [[49,'APPROVED'],[50,'APPROVED'],[51,'PENDING_APPROVAL']])it(`score ${score}`,()=>expect(route({},{score:()=>({score,reason:'test'})},50).status).toBe(status));
  it('runtime threshold changes routing',()=>{const scorer={score:()=>({score:50,reason:'test'})};expect(route({},scorer,49).status).toBe('PENDING_APPROVAL');expect(route({},scorer,50).status).toBe('APPROVED');});
  it('shortfall always requires review',()=>expect(route({incomplete:true},{score:()=>({score:0,reason:'test'})},50).status).toBe('PENDING_APPROVAL'));
+ it('a stated budget overrun always requires human review',()=>{
+  const result=route({budget_overrun:true,budget_limit:10,total:17.5,items:[{lineIndex:0,productId:'eggs',quantity:1,price:17.5}]},undefined,200);
+  expect(result.status).toBe('PENDING_APPROVAL');
+  expect(result.questions.some(q=>q.rule==='budgetOverrun'&&q.message.includes('€17.50'))).toBe(true);
+ });
  it('demo flag is high risk',()=>expect(new SuspicionScorer().score({force_flag:true}).score).toBe(85));
  it('auto-approves regular patterns without human interaction while flagging unfamiliar or spiked orders',()=>{
   const regular=route({
