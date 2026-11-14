@@ -195,7 +195,8 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
   }
   app.use((_req,res) => res.status(404).json({ error: 'Endpoint not found' }));
   app.use((error,_req,res,_next) => {
-    const status = error instanceof ZodError ? 422 : error.status || 500;
+    const isInventoryConflict = typeof error?.message === 'string' && error.message.startsWith('Insufficient local inventory');
+    const status = error instanceof ZodError ? 422 : isInventoryConflict ? 409 : error.status || 500;
     if (status >= 500) console.error(error.message);
     res.status(status).json({ error: error instanceof ZodError ? 'Invalid request' : status === 500 ? 'Internal server error' : error.message,
       ...(error instanceof ZodError ? { issues: error.issues } : {}) });

@@ -30,7 +30,7 @@ app.use((req,res,next)=>{
   if(req.method==='GET'&&path==='/internal/catalog-overview')return res.json(demo.overview());
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
   if(req.method==='POST'&&path==='/internal/suggestions')return res.json(closestProducts(req.body.q,demo.products));
-  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q));
+  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id||'demo-buyer'));
   if(req.method==='POST'&&path==='/internal/setup'){demo.reset(req.body.stock);return res.json({ok:true,stock:req.body.stock});}
   if(req.method==='POST'&&path==='/internal/save')return res.json(demo.save(req.body));
   if(req.method==='POST'&&path==='/internal/decision')return res.json(demo.decide(req.body));
@@ -60,34 +60,26 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
   const rows=(await pool.query(`
     WITH history AS (
       SELECT product_id,
-        SUM(bought_count)::int AS bought_count,
-        SUM(human_approved_count)::int AS human_approved_count,
-        COALESCE(MAX(prior_max_qty), 0)::double precision AS prior_max_qty,
-        COALESCE(MIN(prior_min_qty), 0)::double precision AS prior_min_qty,
-        COALESCE(AVG(prior_avg_qty), 0)::double precision AS prior_avg_qty
+        COUNT(*)::int AS bought_count,
+        COUNT(*) FILTER (WHERE is_human_approved)::int AS human_approved_count,
+        COALESCE(MAX(qty), 0)::double precision AS prior_max_qty,
+        COALESCE(MIN(qty), 0)::double precision AS prior_min_qty,
+        COALESCE(AVG(qty), 0)::double precision AS prior_avg_qty
       FROM (
         SELECT item->>'productId' AS product_id,
-          COUNT(*)::int AS bought_count,
-          COUNT(*) FILTER (
-            WHERE o.flag_reason IS NOT NULL
-              OR EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.status = 'PENDING_APPROVAL')
-          )::int AS human_approved_count,
-          MAX((item->>'quantity')::numeric) AS prior_max_qty,
-          MIN((item->>'quantity')::numeric) AS prior_min_qty,
-          AVG((item->>'quantity')::numeric) AS prior_avg_qty
+          (item->>'quantity')::numeric AS qty,
+          (
+            o.flag_reason IS NOT NULL
+            OR EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.status = 'PENDING_APPROVAL')
+          ) AS is_human_approved
         FROM orders o, jsonb_array_elements(o.items) item
         WHERE o.user_id = $1 AND o.status = 'APPROVED'
-        GROUP BY item->>'productId'
         UNION ALL
         SELECT item->>'productId' AS product_id,
-          COUNT(*)::int AS bought_count,
-          COUNT(*) FILTER (WHERE COALESCE((po.body->>'human_approved')::boolean, false))::int AS human_approved_count,
-          MAX((item->>'quantity')::numeric) AS prior_max_qty,
-          MIN((item->>'quantity')::numeric) AS prior_min_qty,
-          AVG((item->>'quantity')::numeric) AS prior_avg_qty
+          (item->>'quantity')::numeric AS qty,
+          COALESCE((po.body->>'human_approved')::boolean, false) AS is_human_approved
         FROM portal_orders po, jsonb_array_elements(COALESCE(po.body->'items','[]'::jsonb)) item
         WHERE po.user_id = $1 AND po.body->>'status' = 'APPROVED'
-        GROUP BY item->>'productId'
       ) combined
       GROUP BY product_id
     ),
@@ -170,9 +162,8 @@ app.get('/internal/buyer-config',async(req,res)=>{
   await seedPgBuyers();
   const id=normBuyerId(req.query.user_id||'demo-buyer');
   const def=defaultThreshold();
-  await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES($1,$2::double precision) ON CONFLICT(user_id) DO NOTHING`,[id,def]);
   const row=(await pool.query(`SELECT user_id,threshold FROM portal_buyers WHERE user_id=$1`,[id])).rows[0];
-  res.json({user_id:row.user_id,threshold:round3(row.threshold)});
+  res.json({user_id:id,threshold:round3(row?row.threshold:def)});
 });
 app.post('/internal/buyers',async(req,res)=>{
   await seedPgBuyers();
@@ -232,13 +223,14 @@ app.get('/internal/orders',async(req,res)=>{
 });
 app.post('/internal/decision',async(req,res)=>res.json(await transaction(async db=>{
  await db.query(portalSchema);
- const {id,user_id,action,human=false}=req.body;
+ const {id,user_id,action,human=false}=req.body||{};
+ if(!['approve','reject'].includes(action)) throw Error('Invalid action');
  const row=(await db.query('SELECT body FROM portal_orders WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,user_id])).rows[0];
  if(!row) throw Error('Order not found'); const o=row.body;
  if(o.status!=='PENDING_APPROVAL') return o;
  if(action==='reject') o.status='REJECTED';
  else {
-  if(o.incomplete) throw Error('Resolve substitutions or explicitly accept the available partial quantities first');
+  if(o.incomplete||!o.items?.length) throw Error('Resolve substitutions or explicitly accept the available partial quantities first');
   for(const item of [...o.items].sort((a,b)=>a.productId.localeCompare(b.productId))){
    const r=await db.query('UPDATE inventory SET quantity=quantity-$2 WHERE product_id=$1 AND quantity>=$2',[item.productId,item.quantity]);
    if(!r.rowCount&&client.mock) throw Error(`Insufficient stock for ${item.name||item.productId}`);

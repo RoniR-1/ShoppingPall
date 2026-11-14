@@ -5,6 +5,7 @@ let activeBuyer = (localStorage.getItem('activeBuyer') || '').trim() || 'demo-bu
 let settingsOpen = false;
 let lastExecOrder = null;
 let lastOrders = [];
+const acceptedQuestionsByOrder = new Map();
 
 const esc = s => String(s ?? '—').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtNum = v => {
@@ -48,9 +49,21 @@ async function api(path, body) {
     headers: { 'Content-Type': 'application/json', 'X-Data-Source': dataSource },
     body: body ? JSON.stringify(body) : undefined
   });
-  const data = await r.json();
+  const raw = await r.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = { error: raw.slice(0, 300) || r.statusText || 'Request failed' };
+  }
   if (!r.ok) throw Error(data.error || 'Request failed');
   return data;
+}
+
+function resetExecutionView() {
+  lastExecOrder = null;
+  $('execution').hidden = true;
+  clearInputError();
 }
 
 async function run(fn) {
@@ -88,7 +101,7 @@ function statusBadge(status, score, threshold) {
   return `<span class="badge ${cls}">${statusLabel(status)}${riskText}</span>`;
 }
 
-function renderItemsTable(items) {
+function renderItemsTable(items, interactive = false) {
   if (!items?.length) return '<p class="order-meta">No matched items yet.</p>';
   return `<table>
     <thead>
@@ -99,12 +112,14 @@ function renderItemsTable(items) {
         <th class="num">Line total</th>
         <th class="num">CO₂ kg/kg</th>
         <th class="num">Reliability</th>
+        ${interactive ? '<th class="num">Item</th>' : ''}
       </tr>
     </thead>
     <tbody>
-      ${items.map(i => {
+      ${items.map((i, idx) => {
         const lineTotal = i.lineTotal ?? (Number(i.quantity) * Number(i.price));
         const fav = i.human_approved_count ? ` · ${i.human_approved_count}× approved` : (i.bought_count ? ` · ${i.bought_count}× bought` : '');
+        const lineIdx = i.lineIndex ?? idx;
         return `<tr>
           <td>
             <strong>${esc(i.name)}</strong> <small>(${esc(i.productId)})</small>
@@ -115,68 +130,120 @@ function renderItemsTable(items) {
           <td class="num">${fmtMoney(lineTotal)}</td>
           <td class="num">${fmtNum(i.carbon)}</td>
           <td class="num">${i.reliability == null ? '—' : `${fmtNum(Number(i.reliability) * 100)}%`}</td>
+          ${interactive ? `<td class="num"><button type="button" class="ghost-btn small-btn" data-action="remove-line" data-line="${lineIdx}" title="Remove this item from the order">Remove</button></td>` : ''}
         </tr>`;
       }).join('')}
     </tbody>
   </table>`;
 }
 
+function getAcceptedQuestions(orderId) {
+  if (!acceptedQuestionsByOrder.has(orderId)) {
+    acceptedQuestionsByOrder.set(orderId, new Set());
+  }
+  return acceptedQuestionsByOrder.get(orderId);
+}
+
 function renderQuestionsHtml(o, interactive = true) {
   if (!interactive || o.status !== 'PENDING_APPROVAL' || !o.questions?.length) return '';
-  return o.questions.map(q => {
-    const alts = q.alternatives || [];
-    return `<div class="question-box" data-qid="${esc(q.id)}">
+  const accepted = getAcceptedQuestions(o.id);
+  const totalQ = o.questions.length;
+  const currentIdx = o.questions.findIndex(q => !accepted.has(q.id));
+
+  if (currentIdx === -1) {
+    return `<div class="question-box accepted">
       <div class="question-row">
         <div class="question-text">
-          <strong>+${fmtNum(q.points)} pts:</strong> ${esc(q.message)}
+          <strong>✓ All ${totalQ} check${totalQ === 1 ? '' : 's'} reviewed.</strong> ${o.incomplete ? 'Resolve the availability issue below to approve.' : 'Ready to approve.'}
         </div>
         <div class="question-btns">
-          <button type="button" class="ghost-btn small-btn" data-q-decide="yes">Yes, reasonable</button>
-          <button type="button" class="ghost-btn small-btn" data-q-decide="no">No, show substitutes</button>
+          <button type="button" class="ghost-btn small-btn" data-q-reset="${esc(o.id)}">Review again</button>
         </div>
       </div>
-      <div class="question-sub-panel" hidden>
-        ${alts.length ? `
-          <label>Pick a substitute for <strong>${esc(q.productName || 'this item')}</strong>:
-            <select data-line="${q.lineIndex ?? 0}">
-              <option value="">Choose a substitute item…</option>
-              ${alts.map(p => `<option value="${esc(p.productId)}">${esc(p.name)} (${esc(p.unit)}) · ${fmtMoney(p.price)} · CO₂ ${fmtNum(p.carbon)} · ${fmtNum(p.available)} in stock</option>`).join('')}
-            </select>
-          </label>
-          <div class="sub-actions">
-            <button type="button" class="primary-btn small-btn" data-action="approve">Use substitute &amp; approve</button>
-            <button type="button" class="ghost-btn small-btn" data-action="substitute">Swap &amp; re-evaluate</button>
-            <button type="button" class="ghost-btn small-btn" data-action="reject">Cancel order</button>
-          </div>
-        ` : `
-          <div class="order-meta">No alternative catalog substitutes found for this item.</div>
-          <div class="sub-actions">
-            <button type="button" class="ghost-btn small-btn" data-action="reject">Cancel order</button>
-          </div>
-        `}
-      </div>
     </div>`;
-  }).join('');
+  }
+
+  const q = o.questions[currentIdx];
+  const alts = q.alternatives || [];
+  const lineIdx = q.lineIndex ?? 0;
+  const canEditQty = q.allowQuantityEdit !== false && q.productId != null;
+  const canSubstitute = q.allowSubstitution !== false && alts.length > 0;
+  const stepTag = totalQ > 1 ? `<span class="question-step">Question ${currentIdx + 1} of ${totalQ}</span> ` : '';
+  const noBtnLabel = !q.allowSubstitution
+    ? 'No, adjust amount'
+    : 'No, change this';
+
+  return `<div class="question-box" data-qid="${esc(q.id)}">
+    <div class="question-row">
+      <div class="question-text">
+        ${stepTag}<strong>+${fmtNum(q.points)} pts:</strong> ${esc(q.message)}
+      </div>
+      <div class="question-btns">
+        <button type="button" class="primary-btn small-btn" data-q-decide="yes">Yes, looks good</button>
+        <button type="button" class="ghost-btn small-btn" data-q-decide="no">${noBtnLabel}</button>
+      </div>
+    </div>
+    <div class="question-sub-panel" hidden>
+      ${canEditQty ? `
+        <div class="qty-edit-row">
+          <label>
+            <span>Set quantity for <strong>${esc(q.productName || 'this item')}</strong> (${esc(q.unit || 'unit')}, step ${fmtNum(q.lot || 1)}):</span>
+            <input type="number" class="qty-edit-input" data-qty-line="${lineIdx}" min="${q.lot || 1}" step="${q.lot || 1}" value="${q.suggestedQty ?? q.currentQty ?? 1}">
+          </label>
+          <button type="button" class="primary-btn small-btn" data-action="update-qty" data-line="${lineIdx}">Update quantity</button>
+        </div>
+      ` : ''}
+      ${canSubstitute ? `
+        <label>Or pick a substitute for <strong>${esc(q.productName || 'this item')}</strong>:
+          <select data-line="${lineIdx}">
+            <option value="">Choose a substitute item…</option>
+            ${alts.map(p => `<option value="${esc(p.productId)}">${esc(p.name)} (${esc(p.unit)}) · ${fmtMoney(p.price)} · CO₂ ${fmtNum(p.carbon)} · ${fmtNum(p.available)} in stock</option>`).join('')}
+          </select>
+        </label>
+      ` : ''}
+      <div class="sub-actions">
+        ${canSubstitute ? `
+          <button type="button" class="primary-btn small-btn" data-action="approve">Use substitute &amp; approve</button>
+          <button type="button" class="ghost-btn small-btn" data-action="substitute">Swap &amp; re-evaluate</button>
+        ` : ''}
+        ${q.productId != null ? `
+          <button type="button" class="ghost-btn small-btn" data-action="remove-line" data-line="${lineIdx}">Don't include ${esc(q.productName || 'this item')}</button>
+        ` : ''}
+        <button type="button" class="ghost-btn small-btn" data-action="reject">Cancel entire order</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 function renderPlainCard(o, interactive = true) {
   const total = o.total ?? o.items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.price || 0), 0);
   const itemsText = o.items?.length
-    ? o.items.map(i => `#${esc(i.productId)} × ${fmtNum(i.quantity)} ${esc(i.unit)} (${fmtMoney(i.lineTotal ?? Number(i.quantity) * Number(i.price))})`).join(', ')
+    ? o.items.map((i, idx) => `#${esc(i.productId)} × ${fmtNum(i.quantity)} ${esc(i.unit)} (${fmtMoney(i.lineTotal ?? Number(i.quantity) * Number(i.price))})${interactive && o.status === 'PENDING_APPROVAL' ? ` <button type="button" data-action="remove-line" data-line="${i.lineIndex ?? idx}">drop</button>` : ''}`).join(', ')
     : 'none';
-  const questionsHtml = interactive && o.status === 'PENDING_APPROVAL' && o.questions?.length
-    ? o.questions.map(q => `
-      <div class="question-box" data-qid="${esc(q.id)}">
-        <div>+${fmtNum(q.points)}: ${esc(q.message)} <button type="button" data-q-decide="yes">yes</button> <button type="button" data-q-decide="no">no</button></div>
-        <div class="question-sub-panel" hidden>
-          ${q.alternatives?.length ? `<select data-line="${q.lineIndex ?? 0}">
-            <option value="">sub…</option>
-            ${q.alternatives.map(p => `<option value="${esc(p.productId)}">#${esc(p.productId)} (${esc(p.unit)}) ${fmtMoney(p.price)} [${fmtNum(p.available)}]</option>`).join('')}
-          </select> <button type="button" data-action="approve">use &amp; ok</button> <button type="button" data-action="substitute">swap</button>` : ''}
-          <button type="button" data-action="reject">cancel</button>
-        </div>
-      </div>`).join('')
-    : '';
+  let questionsHtml = '';
+  if (interactive && o.status === 'PENDING_APPROVAL' && o.questions?.length) {
+    const accepted = getAcceptedQuestions(o.id);
+    const currentIdx = o.questions.findIndex(q => !accepted.has(q.id));
+    if (currentIdx !== -1) {
+      const q = o.questions[currentIdx];
+      const lineIdx = q.lineIndex ?? 0;
+      const canEditQty = q.allowQuantityEdit !== false && q.productId != null;
+      const canSubstitute = q.allowSubstitution !== false && q.alternatives?.length > 0;
+      questionsHtml = `
+        <div class="question-box" data-qid="${esc(q.id)}">
+          <div>[${currentIdx + 1}/${o.questions.length}] +${fmtNum(q.points)}: ${esc(q.message)} <button type="button" data-q-decide="yes">yes</button> <button type="button" data-q-decide="no">no</button></div>
+          <div class="question-sub-panel" hidden>
+            ${canEditQty ? `<input type="number" data-qty-line="${lineIdx}" min="${q.lot || 1}" step="${q.lot || 1}" value="${q.suggestedQty ?? q.currentQty ?? 1}"> <button type="button" data-action="update-qty" data-line="${lineIdx}">qty</button> ` : ''}
+            ${canSubstitute ? `<select data-line="${lineIdx}">
+              <option value="">sub…</option>
+              ${q.alternatives.map(p => `<option value="${esc(p.productId)}">#${esc(p.productId)} (${esc(p.unit)}) ${fmtMoney(p.price)} [${fmtNum(p.available)}]</option>`).join('')}
+            </select> <button type="button" data-action="approve">use &amp; ok</button> <button type="button" data-action="substitute">swap</button> ` : ''}
+            ${q.productId != null ? `<button type="button" data-action="remove-line" data-line="${lineIdx}">drop item</button> ` : ''}
+            <button type="button" data-action="reject">cancel</button>
+          </div>
+        </div>`;
+    }
+  }
   const issuesHtml = (o.issues || []).map(i => `
     <div>
       <span>${esc(i.reason)} (-${fmtNum(i.shortfall)})</span>
@@ -223,10 +290,16 @@ function renderOrderCard(o, interactive = true) {
     : '';
 
   const actionsHtml = interactive && o.status === 'PENDING_APPROVAL'
-    ? `<div class="actions">
-        <button class="primary-btn small-btn" data-action="approve" type="button">${o.incomplete ? 'Apply & approve' : 'Approve order'}</button>
-        <button class="ghost-btn small-btn" data-action="reject" type="button">Cancel order</button>
-      </div>`
+    ? (o.incomplete
+      ? `<div class="actions">
+          <button class="primary-btn small-btn" data-action="approve" type="button">Apply selection &amp; approve</button>
+          <button class="link-btn" data-action="reject" type="button">Discard order</button>
+        </div>`
+      : `<div class="order-override-actions">
+          <span class="override-label">Or decide without review:</span>
+          <button class="link-btn" data-action="approve" type="button">Approve as-is</button>
+          <button class="link-btn danger" data-action="reject" type="button">Discard order</button>
+        </div>`)
     : '';
 
   return `<article class="order-card" data-id="${esc(o.id)}">
@@ -237,7 +310,7 @@ function renderOrderCard(o, interactive = true) {
       </div>
       ${statusBadge(o.status, o.score, o.threshold)}
     </div>
-    ${renderItemsTable(o.items)}
+    ${renderItemsTable(o.items, interactive && o.status === 'PENDING_APPROVAL')}
     ${o.items?.length ? `<div class="order-total">Total: ${fmtMoney(total)}</div>` : ''}
     ${questionsHtml}
     ${issuesHtml}
@@ -248,11 +321,20 @@ function renderOrderCard(o, interactive = true) {
 
 function showExecution(o) {
   lastExecOrder = o;
+  if (plainMode && o.status === 'PENDING_APPROVAL') {
+    $('execution').hidden = true;
+    return;
+  }
   $('execution').hidden = false;
   const badgeEl = $('exec-badge');
   badgeEl.className = `badge ${o.status === 'APPROVED' ? 'approved' : o.status === 'REJECTED' ? 'rejected' : 'pending'}`;
   badgeEl.textContent = `${statusLabel(o.status)} · Risk ${fmtNum(o.score)}/${fmtNum(o.threshold)}`;
-  $('item-summary').innerHTML = renderOrderCard(o, o.status === 'PENDING_APPROVAL');
+  if (o.status === 'PENDING_APPROVAL') {
+    const title = o.lines?.map(l => l.requested || `${fmtNum(l.quantity)} × ${l.query}`).join(', ') || o.id;
+    $('item-summary').innerHTML = `<p class="order-meta"><strong>${esc(title)}</strong> queued in <strong>02 · Approval queue</strong>${o.reason ? ` — ${esc(o.reason)}` : ''}.</p>`;
+  } else {
+    $('item-summary').innerHTML = renderOrderCard(o, false);
+  }
   $('steps').innerHTML = (o.steps || []).map(s => `<li>${esc(s)}</li>`).join('');
   $('raw').textContent = JSON.stringify(o, null, 2);
 }
@@ -313,7 +395,7 @@ function applyPlainMode() {
   document.title = plainMode ? 'notes' : 'shopping pal';
   document.querySelectorAll('[data-chrome]').forEach(el => { el.hidden = plainMode; });
   setSettingsView(false);
-  $('prompt').rows = plainMode ? 1 : 2;
+  $('prompt').rows = plainMode ? 1 : 4;
   $('prompt').placeholder = plainMode ? '' : 'Enter query here';
   $('submit').textContent = plainMode ? 'Run' : 'Run order';
   if (lastExecOrder) showExecution(lastExecOrder);
@@ -344,37 +426,105 @@ async function refresh() {
 }
 
 async function handleOrderDecision(e) {
+  const resetBtn = e.target.closest('button[data-q-reset]');
+  if (resetBtn) {
+    acceptedQuestionsByOrder.delete(resetBtn.dataset.qReset);
+    renderOrders(lastOrders);
+    return;
+  }
+
   const qBtn = e.target.closest('button[data-q-decide]');
   if (qBtn) {
     const qBox = qBtn.closest('.question-box');
-    const subPanel = qBox?.querySelector('.question-sub-panel');
+    const card = qBtn.closest('.order-card');
     const decide = qBtn.dataset.qDecide;
+    if (decide === 'yes' && card && qBox?.dataset.qid) {
+      const orderId = card.dataset.id;
+      const accepted = getAcceptedQuestions(orderId);
+      accepted.add(qBox.dataset.qid);
+      const orderObj = lastOrders.find(x => x.id === orderId);
+      const allAnsweredYes = orderObj && (orderObj.questions || []).every(q => accepted.has(q.id));
+      if (allAnsweredYes && !orderObj.incomplete) {
+        await run(async () => {
+          clearInputError();
+          const approved = await api(`/orders/${orderId}/approve`, {
+            user_id: activeBuyer,
+            choices: {},
+            acceptPartial: false
+          });
+          acceptedQuestionsByOrder.delete(orderId);
+          showExecution(approved);
+          await refresh();
+        });
+        return;
+      }
+      renderOrders(lastOrders);
+      return;
+    }
+    const subPanel = qBox?.querySelector('.question-sub-panel');
     qBox.querySelectorAll('button[data-q-decide]').forEach(b => b.classList.toggle('active', b === qBtn));
-    qBox.classList.toggle('accepted', decide === 'yes');
     qBox.classList.toggle('declined', decide === 'no');
     if (subPanel) {
       subPanel.hidden = decide !== 'no';
-      if (decide === 'yes') {
-        const sel = subPanel.querySelector('select[data-line]');
-        if (sel) sel.value = '';
-      }
     }
     return;
   }
 
-  const action = e.target.dataset.action;
-  if (!action) return;
-  const el = e.target.closest('.order-card');
+  const actionBtn = e.target.closest('button[data-action]');
+  if (!actionBtn) return;
+  const action = actionBtn.dataset.action;
+  const el = actionBtn.closest('.order-card');
   if (!el) return;
 
+  if (action === 'remove-line') {
+    const lineIndex = Number(actionBtn.dataset.line ?? 0);
+    await run(async () => {
+      clearInputError();
+      const updated = await api(`/orders/${el.dataset.id}/substitute`, {
+        user_id: activeBuyer,
+        removeLines: [lineIndex]
+      });
+      showExecution(updated);
+      await refresh();
+    });
+    return;
+  }
+
+  if (action === 'update-qty') {
+    const lineIndex = Number(actionBtn.dataset.line ?? 0);
+    const insideSubPanel = actionBtn.closest('.question-sub-panel') || el;
+    const qtyInput = insideSubPanel.querySelector(`input[data-qty-line="${lineIndex}"]`);
+    const newQty = Number(qtyInput?.value);
+    if (!Number.isFinite(newQty) || newQty <= 0) {
+      showInputError('Enter a valid quantity greater than 0.');
+      return;
+    }
+    await run(async () => {
+      clearInputError();
+      const updated = await api(`/orders/${el.dataset.id}/substitute`, {
+        user_id: activeBuyer,
+        quantities: { [lineIndex]: newQty }
+      });
+      showExecution(updated);
+      await refresh();
+    });
+    return;
+  }
+
+  const insideSubPanel = actionBtn.closest('.question-sub-panel');
+  const selectEls = insideSubPanel
+    ? [...insideSubPanel.querySelectorAll('select[data-line]')]
+    : [
+        ...el.querySelectorAll('.issue-box select[data-line]'),
+        ...el.querySelectorAll('.question-sub-panel:not([hidden]) select[data-line]')
+      ];
   const choices = Object.fromEntries(
-    [...el.querySelectorAll('select[data-line]')].filter(s => s.value).map(s => [s.dataset.line, s.value])
+    selectEls.filter(s => s.value).map(s => [s.dataset.line, s.value])
   );
   if (action === 'substitute' && !Object.keys(choices).length) {
     showInputError('Select a substitute from the dropdown first, or click Cancel order.');
     return;
   }
-  const insideSubPanel = e.target.closest('.question-sub-panel');
   if (insideSubPanel && action === 'approve' && !Object.keys(choices).length) {
     showInputError('Select a substitute from the dropdown first, or click Cancel order.');
     return;
@@ -393,7 +543,6 @@ async function handleOrderDecision(e) {
 }
 
 $('orders').onclick = handleOrderDecision;
-$('item-summary').onclick = handleOrderDecision;
 
 async function submit() {
   clearInputError();
@@ -411,7 +560,7 @@ async function submit() {
     const result = await api('/requests', {
       user_id: activeBuyer,
       text,
-      force_flag: $('force-flag').checked
+      force_flag: !plainMode && $('force-flag').checked
     });
     showExecution(result);
     await refresh();
@@ -448,6 +597,7 @@ $('create-buyer-btn').onclick = () => run(async () => {
   if (!Number.isFinite(thresholdVal) || thresholdVal < 0) throw Error('Enter a valid non-negative threshold.');
   const created = await api('/buyers', { user_id: userId, threshold: thresholdVal });
   activeBuyer = created.user_id;
+  resetExecutionView();
   $('new-buyer-id').value = '';
   await refresh();
   showSettingsFeedback(`Created and selected buyer "${created.user_id}" (threshold ${fmtNum(created.threshold)}).`, 'ok');
@@ -457,6 +607,7 @@ $('buyers-table').onclick = e => {
   const btn = e.target.closest('button[data-select-buyer]');
   if (!btn) return;
   activeBuyer = btn.dataset.selectBuyer;
+  resetExecutionView();
   run(async () => {
     await refresh();
     showSettingsFeedback(`Switched active buyer to "${activeBuyer}" (threshold ${fmtNum($('threshold').value)}).`, 'ok');
@@ -465,6 +616,7 @@ $('buyers-table').onclick = e => {
 
 $('user').onchange = () => run(async () => {
   activeBuyer = $('user').value;
+  resetExecutionView();
   await refresh();
   showSettingsFeedback(`Switched active buyer to "${activeBuyer}" (threshold ${fmtNum($('threshold').value)}).`, 'ok');
 });
@@ -481,6 +633,7 @@ $('source').onchange = () => run(async () => {
     $('source').value = previous;
     throw e;
   }
+  resetExecutionView();
   await refresh();
   showSettingsFeedback(`Switched catalog source to "${dataSource}".`, 'ok');
 });

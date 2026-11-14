@@ -34,7 +34,9 @@ try {
       headers: { 'Content-Type': 'application/json', 'X-User-Id': flags['user-id'], ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) })
     });
-    const result = await response.json();
+    const raw = await response.text();
+    let result;
+    try { result = JSON.parse(raw); } catch { result = { error: raw.slice(0, 300) || response.statusText }; }
     if (!response.ok) throw new Error(`${response.status}: ${result.error}${result.issues ? ` ${JSON.stringify(result.issues)}` : ''}`);
     return result;
   };

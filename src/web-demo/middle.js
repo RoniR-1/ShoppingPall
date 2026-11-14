@@ -5,6 +5,7 @@ import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {route} from './policy.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
+import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {rankCandidates} from '../agent.js';
 import {round3} from '../contracts.js';
 
@@ -30,7 +31,9 @@ async function core(path,body){
     body:body?JSON.stringify(body):undefined,
     signal:AbortSignal.timeout(120000)
   });
-  const data=await r.json();
+  const raw=await r.text();
+  let data;
+  try{data=JSON.parse(raw);}catch{data={error:raw.slice(0,300)||r.statusText};}
   if(!r.ok)throw Error(data.error||JSON.stringify(data.detail));
   return data;
 }
@@ -117,7 +120,7 @@ function snapToLot(qty,lot){
   return round3(steps*validLot);
 }
 
-async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false){
+async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={}){
   const o={
     id:randomUUID(),
     user_id:user,
@@ -126,6 +129,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     force_flag,
     demo_unavailable,
     approved,
+    ...(context?{context}:{}),
     items:[],
     issues:[],
     steps:['Parsed request with Gemini'],
@@ -145,10 +149,11 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       if(candidates.length)break;
     }
     let suggested=false;
+    const chosenId=approved[index]||pinned[index];
     if(!candidates.length){
       suggested=true;
       candidates=await core('/internal/suggestions',{q:line.query});
-    }else if(candidates.length<4&&!approved[index]){
+    }else if(candidates.length<4&&!chosenId){
       const extra=await core('/internal/suggestions',{q:line.query});
       const seen=new Set(candidates.map(c=>c.id));
       for(const s of extra)if(!seen.has(s.id)){candidates.push(s);seen.add(s.id);if(candidates.length>=8)break;}
@@ -159,13 +164,13 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       candidates=broad?await core('/internal/search',{q:broad,user_id:user}):[];
       candidates=candidates.filter(p=>/\bchocolate\b/i.test(p.name)&&!/\b(sauce|powder|drink|ice cream|biscuit|cookie|cake|cereal|spread)\b/i.test(p.name));
     }
-    if(approved[index]){
-      if(!candidates.some(p=>p.id===approved[index])){
-        const byId=await core('/internal/search',{q:String(approved[index]),user_id:user});
+    if(chosenId){
+      if(!candidates.some(p=>p.id===chosenId)){
+        const byId=await core('/internal/search',{q:String(chosenId),user_id:user});
         for(const p of byId)if(!candidates.some(c=>c.id===p.id))candidates.push(p);
       }
-      if(!candidates.some(p=>p.id===approved[index]))throw Error('Invalid substitution');
-      candidates=[candidates.find(p=>p.id===approved[index]),...candidates.filter(p=>p.id!==approved[index])];
+      if(!candidates.some(p=>p.id===chosenId))throw Error('Invalid substitution');
+      candidates=[candidates.find(p=>p.id===chosenId),...candidates.filter(p=>p.id!==chosenId)];
       suggested=false;
     }
     if(!candidates.length){
@@ -178,8 +183,12 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     const enriched=candidates.map(p=>{
       const price=prices.products.find(x=>x.productId===p.id);
       const a=stock.products.find(x=>x.productId===p.id);
-      const s=a?.scheduleLines?.[0];
-      const available=a&&!a.salesBlock&&a.logisticModel==='Stock'&&s&&(s.salesUnit==='MOCK'||s.salesUnit===p.sales_unit)&&!s.salesBlock&&s.availableDate.slice(0,10)<=date&&(!a.closingTime||Date.parse(a.closingTime)>Date.now())?round3(s.availableAmount):0;
+      const eligibleLines=(Array.isArray(a?.scheduleLines)?a.scheduleLines:[]).filter(
+        l=>!l.salesBlock&&(l.salesUnit==='MOCK'||l.salesUnit===p.sales_unit)&&typeof l.availableDate==='string'&&l.availableDate.slice(0,10)<=date&&Number(l.availableAmount)>0
+      );
+      const s=eligibleLines[0]||a?.scheduleLines?.[0];
+      const cutoffOk=!a?.closingTime||(Number.isFinite(Date.parse(a.closingTime))&&Date.parse(a.closingTime)>Date.now());
+      const available=a&&!a.salesBlock&&a.logisticModel==='Stock'&&eligibleLines.length>0&&cutoffOk?round3(s.availableAmount):0;
       const unitPrice=price?.error?null:round3(price?.priceWithTax?.value??price?.catalogPrice?.valueWithTax);
       return {
         ...p,
@@ -189,7 +198,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
         available,
         in_stock:available>0,
         available_amount:available,
-        available_date:s?.availableDate?.slice(0,10)||date,
+        available_date:typeof s?.availableDate==='string'?s.availableDate.slice(0,10):date,
         price:unitPrice,
         unit_price:unitPrice,
         carbon:round3(p.carbon_kg_co2_per_kg),
@@ -201,26 +210,32 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
   }
 
   let aiSelections=new Map();
-  const selectableLines=lineOptions.filter( entry=>!entry.suggested&&entry.options.length>0&&!approved[entry.index]);
+  const selectableLines=lineOptions.filter(entry=>!entry.suggested&&entry.options.length>0&&!entry.line.manualQuantity);
   if(process.env.LUNA_API_KEY&&selectableLines.length>0&&sourceContext.getStore()==='real'){
     try{
-      const promptData=selectableLines.map(entry=>({
-        lineIndex:entry.index,
-        requested:entry.line.requested||`${entry.line.quantity} ${entry.line.query}`,
-        requestedQuantity:entry.line.quantity,
-        candidates:entry.options.slice(0,8).map(c=>({
-          productId:c.productId,
-          name:c.name,
-          sales_unit:c.unit,
-          allowed_lot_size:c.lot,
-          units:c.units,
-          unit_price:c.price,
-          available:c.available,
-          allergen_safe:c.allergen_safe,
-          human_approved_count:c.human_approved_count||0,
-          bought_count:c.bought_count||0
-        }))
-      }));
+      const promptData=selectableLines.map(entry=>{
+        const forcedId=approved[entry.index]||pinned[entry.index];
+        const candidatePool=forcedId&&entry.options.some(c=>c.productId===forcedId)
+          ?[entry.options.find(c=>c.productId===forcedId)]
+          :entry.options.slice(0,8);
+        return {
+          lineIndex:entry.index,
+          requested:entry.line.requested||`${entry.line.quantity} ${entry.line.query}`,
+          requestedQuantity:entry.line.quantity,
+          candidates:candidatePool.map(c=>({
+            productId:c.productId,
+            name:c.name,
+            sales_unit:c.unit,
+            allowed_lot_size:c.lot,
+            units:c.units,
+            unit_price:c.price,
+            available:c.available,
+            allergen_safe:c.allergen_safe,
+            human_approved_count:c.human_approved_count||0,
+            bought_count:c.bought_count||0
+          }))
+        };
+      });
       const picked=selectionSchema.parse(await callGeminiJSON(
         `Select the single best catalog product and exact quantity in SALES UNITS for each requested line.
 Return ONLY valid JSON:
@@ -245,8 +260,9 @@ Rules:
       continue;
     }
     const aiPick=aiSelections.get(index);
-    const orderedOptions=approved[index]&&options.some(p=>p.productId===approved[index])
-      ?[options.find(p=>p.productId===approved[index]),...options.filter(p=>p.productId!==approved[index])]
+    const forcedId=approved[index]||pinned[index];
+    const orderedOptions=forcedId&&options.some(p=>p.productId===forcedId)
+      ?[options.find(p=>p.productId===forcedId),...options.filter(p=>p.productId!==forcedId)]
       :(aiPick&&options.some(p=>p.productId===aiPick.productId)
         ?[options.find(p=>p.productId===aiPick.productId),...options.filter(p=>p.productId!==aiPick.productId)]
         :options);
@@ -259,7 +275,8 @@ Rules:
       for(const p of orderedOptions){
         if(p.price==null)continue;
         const availLeft=Math.max(0,p.available-(used.get(p.productId)||0));
-        const alloc=Math.floor((Math.min(remaining,availLeft)+1e-9)/p.lot)*p.lot;
+        const desired=p.productId===orderedOptions[0]?.productId?remaining:snapToLot(remaining,p.lot);
+        const alloc=Math.floor((Math.min(desired,availLeft)+1e-9)/p.lot)*p.lot;
         const quantity=round3(alloc);
         if(quantity<=0)continue;
         o.items.push({
@@ -282,6 +299,7 @@ Rules:
           allergen_safe:p.allergen_safe!==false,
           requested:line.requested||`${line.quantity} × ${line.query}`,
           substitution:Boolean(approved[index]),
+          userSelected:Boolean(pinned[index]),
           alternatives:orderedOptions
             .filter(opt=>opt.productId!==p.productId&&opt.price!=null&&opt.available>0)
             .slice(0,8)
@@ -315,6 +333,7 @@ Rules:
 
   o.total=round3(o.items.reduce((sum,i)=>sum+(i.lineTotal??i.quantity*i.price),0));
   o.incomplete=o.issues.length>0;
+  if(context)enforcePriceCap(o.items,context);
   o.steps.push('Ranked catalog matches, prices & stock');
   const buyerHistory=await core('/internal/buyer-profile?user_id='+encodeURIComponent(user));
   const buyerCfg=await core('/internal/buyer-config?user_id='+encodeURIComponent(user));
@@ -330,6 +349,38 @@ Rules:
   o.steps.push('Paused for human approval');
   return core('/internal/save',o);
 }
+
+const managedAgent=new ManagedAgent({
+  file:'.local/managed-agent.json',
+  submit:(lines,user,context)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context)),
+  listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user)))
+});
+const managedReady=managedAgent.load().catch(()=>{});
+async function managedStatePayload(user){
+  await managedReady;
+  const s=managedAgent.state(user);
+  const orders=await core('/internal/orders?user_id='+encodeURIComponent(user));
+  return {...structuredClone(s),preview:managedAgent.preview(user),orders};
+}
+
+app.get('/portal/managed-agent',async(req,res)=>{
+  const user=z.string().trim().min(1).max(100).default('demo-buyer').parse(req.query.user_id);
+  await managedReady;
+  await managedAgent.tick(user);
+  res.json(await managedStatePayload(user));
+});
+app.post('/portal/managed-agent',async(req,res)=>{
+  const b=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),action:z.string().min(1)}).passthrough().parse(req.body||{});
+  await managedReady;
+  if(b.action==='check')await managedAgent.tick(b.user_id);
+  else await managedAgent.command(b.user_id,b);
+  res.json(await managedStatePayload(b.user_id));
+});
+app.post('/portal/managed-agent/chat',async(req,res)=>{
+  const b=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),text:z.string().min(1).max(2000)}).parse(req.body||{});
+  await managedReady;
+  res.json(managedAgent.chat(b.user_id,b.text));
+});
 
 app.get('/portal/catalog-overview',async(req,res)=>{
   const q=encodeURIComponent(String(req.query.q||''));
@@ -374,15 +425,56 @@ app.post('/portal/requests',async(req,res)=>{
   res.json(await plan(lines,b.user_id,b.force_flag,{},b.demo_unavailable));
 });
 app.post('/portal/orders/:id/:action',async(req,res)=>{
-  const {user_id,choices={},acceptPartial=false}=req.body;
+  const {user_id,choices,quantities,removeLines,acceptPartial}=z.object({
+    user_id:z.string().trim().min(1).max(100),
+    choices:z.record(z.string(),z.string().min(1)).default({}),
+    quantities:z.record(z.string(),z.number().positive().max(100000)).default({}),
+    removeLines:z.array(z.number().int().min(0)).default([]),
+    acceptPartial:z.boolean().default(false)
+  }).parse(req.body||{});
   const orders=await core('/internal/orders?user_id='+encodeURIComponent(user_id));
   const o=orders.find(o=>o.id===req.params.id);
   if(!o)throw Error('Order not found');
   if(!['approve','reject','substitute'].includes(req.params.action))throw Error('Invalid action');
-  if((req.params.action==='approve'||req.params.action==='substitute')&&Object.keys(choices).length){
-    const replacement=await plan(o.lines,user_id,false,{...o.approved,...choices},o.demo_unavailable);
+  if(o.status!=='PENDING_APPROVAL')throw Error('Order has already been decided');
+
+  const hasLineEdits=Object.keys(choices).length>0||Object.keys(quantities).length>0||removeLines.length>0;
+  if((req.params.action==='approve'||req.params.action==='substitute')&&hasLineEdits){
+    const removeSet=new Set(removeLines);
+    const nextLines=[];
+    const nextApproved={};
+    const nextPinned={};
+    (o.lines||[]).forEach((line,oldIdx)=>{
+      if(removeSet.has(oldIdx))return;
+      const newIdx=nextLines.length;
+      const updatedLine={...line};
+      if(quantities[oldIdx]!==undefined){
+        const newQty=round3(quantities[oldIdx]);
+        updatedLine.quantity=newQty;
+        updatedLine.manualQuantity=true;
+        updatedLine.requested=`${newQty} × ${line.query}`;
+      }
+      const existingItem=(o.items||[]).find(i=>i.lineIndex===oldIdx);
+      if(choices[oldIdx]){
+        // Buyer manually selected this product from the review UI; pin it without re-flagging it as an unexpected swap.
+        nextPinned[newIdx]=choices[oldIdx];
+      }else if(o.approved?.[oldIdx]){
+        nextApproved[newIdx]=o.approved[oldIdx];
+      }else if(existingItem?.productId){
+        nextPinned[newIdx]=existingItem.productId;
+      }
+      nextLines.push(updatedLine);
+    });
+
+    if(!nextLines.length){
+      return res.json(await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true}));
+    }
+
+    const keepForceFlag=req.params.action==='substitute'?Boolean(o.force_flag):false;
+    const replacement=await plan(nextLines,user_id,keepForceFlag,nextApproved,o.demo_unavailable,o.context||null,nextPinned);
     await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
-    if(req.params.action==='approve'&&!replacement.incomplete&&replacement.status!=='APPROVED'){
+    const safeToAutoFinalize=req.params.action==='approve'&&!replacement.incomplete&&replacement.items.every(i=>i.allergen_safe!==false);
+    if(safeToAutoFinalize&&replacement.status!=='APPROVED'){
       return res.json(await core('/internal/decision',{id:replacement.id,user_id,action:'approve',human:true}));
     }
     return res.json(replacement);
