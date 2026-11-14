@@ -17,7 +17,7 @@ app.use((req,res,next)=>{
   sourceContext.run(source,next);
 });
 
-let threshold=Number(process.env.SUSPICION_THRESHOLD??25);
+const defaultThreshold=()=>Math.round(Number(process.env.SUSPICION_THRESHOLD??25)*1000)/1000;
 
 async function core(path,body){
   const r=await fetch(`http://127.0.0.1:${process.env.BACKEND_PORT||4003}${path}`,{
@@ -52,7 +52,8 @@ const selectionSchema=z.object({
 
 async function callGeminiJSON(systemPrompt,userPrompt){
   const base=(process.env.LUNA_BASE_URL||'https://generativelanguage.googleapis.com/v1beta/openai/').trim().replace(/\/+$/,'');
-  const apiKey=process.env.LUNA_API_KEY||'';
+  const rawKey=(process.env.LUNA_API_KEY||'').trim();
+  const apiKey=rawKey.startsWith('Ab8RN6')?`AQ.${rawKey}`:rawKey;
   if(!apiKey)throw Error('Configure LUNA_API_KEY in .env to use the Gemini agent');
   const model=process.env.LUNA_MODEL||'gemini-2.5-flash';
   const r=await fetch(`${base}/chat/completions`,{
@@ -84,7 +85,7 @@ async function callGeminiJSON(systemPrompt,userPrompt){
 
 async function parseRequestLines(text){
   const trimmed=String(text||'').trim();
-  if(!trimmed)throw Error('Enter what you would like to order.');
+  if(!trimmed)throw Error('Try specifying products and quantities, or describe what you want to order.');
   if(!process.env.LUNA_API_KEY){
     return planLinesSchema.parse(directLines(trimmed).map(l=>({...l,requested:`${l.quantity} ${l.query}`})));
   }
@@ -92,13 +93,22 @@ async function parseRequestLines(text){
     `You extract B2B food catalog search lines from a buyer's request.
 Return ONLY valid JSON:
 {"lines":[{"requested":"original item phrase with amount (e.g. 2kg apples)","query":"singular English catalog search keyword (e.g. apple)","alternatives":["plural or synonym","Finnish translation (e.g. omena)"],"quantity":2}]}
+If the input does NOT mention any food, drink, product, ingredient, or dish to order (for example a greeting like "hi" or unrelated text), return:
+{"lines":[],"error":"Try specifying products and quantities, or describe the dish or items you want to order."}
 Rules:
 1. Only include items explicitly mentioned or strictly required by a named dish/recipe. If the buyer asks for a single item (like "2kg apples" or "12 apples"), return ONLY that 1 item—never invent extra ingredients!
 2. "query" and "alternatives" must contain ONLY product/ingredient names, with NO numbers or units.
 3. For simple item counts without weight (e.g. "12 apples" -> ~2 kg), keep "requested" exact ("12 apples") and set "quantity" to a sensible numeric estimate.`,
     trimmed
   );
-  return planLinesSchema.parse(parsed.lines);
+  if(!Array.isArray(parsed?.lines)||parsed.lines.length===0){
+    throw Error(parsed?.error||'Try specifying products and quantities, or describe the dish or items you want to order.');
+  }
+  const checked=planLinesSchema.safeParse(parsed.lines);
+  if(!checked.success){
+    throw Error(parsed?.error||'Could not understand the order items. Try specifying products and quantities.');
+  }
+  return checked.data;
 }
 
 function snapToLot(qty,lot){
@@ -138,6 +148,10 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     if(!candidates.length){
       suggested=true;
       candidates=await core('/internal/suggestions',{q:line.query});
+    }else if(candidates.length<4&&!approved[index]){
+      const extra=await core('/internal/suggestions',{q:line.query});
+      const seen=new Set(candidates.map(c=>c.id));
+      for(const s of extra)if(!seen.has(s.id)){candidates.push(s);seen.add(s.id);if(candidates.length>=8)break;}
     }
     if(demo_unavailable&&index===0){
       suggested=true;
@@ -146,8 +160,12 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       candidates=candidates.filter(p=>/\bchocolate\b/i.test(p.name)&&!/\b(sauce|powder|drink|ice cream|biscuit|cookie|cake|cereal|spread)\b/i.test(p.name));
     }
     if(approved[index]){
+      if(!candidates.some(p=>p.id===approved[index])){
+        const byId=await core('/internal/search',{q:String(approved[index]),user_id:user});
+        for(const p of byId)if(!candidates.some(c=>c.id===p.id))candidates.push(p);
+      }
       if(!candidates.some(p=>p.id===approved[index]))throw Error('Invalid substitution');
-      candidates=candidates.filter(p=>p.id===approved[index]);
+      candidates=[candidates.find(p=>p.id===approved[index]),...candidates.filter(p=>p.id!==approved[index])];
       suggested=false;
     }
     if(!candidates.length){
@@ -227,9 +245,11 @@ Rules:
       continue;
     }
     const aiPick=aiSelections.get(index);
-    const orderedOptions=aiPick&&options.some(p=>p.productId===aiPick.productId)
-      ?[options.find(p=>p.productId===aiPick.productId),...options.filter(p=>p.productId!==aiPick.productId)]
-      :options;
+    const orderedOptions=approved[index]&&options.some(p=>p.productId===approved[index])
+      ?[options.find(p=>p.productId===approved[index]),...options.filter(p=>p.productId!==approved[index])]
+      :(aiPick&&options.some(p=>p.productId===aiPick.productId)
+        ?[options.find(p=>p.productId===aiPick.productId),...options.filter(p=>p.productId!==aiPick.productId)]
+        :options);
     const targetQty=aiPick&&orderedOptions[0]?.productId===aiPick.productId
       ?snapToLot(aiPick.quantity,orderedOptions[0].lot)
       :snapToLot(line.quantity,orderedOptions[0].lot);
@@ -243,6 +263,7 @@ Rules:
         const quantity=round3(alloc);
         if(quantity<=0)continue;
         o.items.push({
+          lineIndex:index,
           productId:p.productId,
           name:p.name,
           unit:p.unit,
@@ -260,7 +281,20 @@ Rules:
           prior_avg_qty:round3(p.prior_avg_qty||0),
           allergen_safe:p.allergen_safe!==false,
           requested:line.requested||`${line.quantity} × ${line.query}`,
-          substitution:Boolean(approved[index])
+          substitution:Boolean(approved[index]),
+          alternatives:orderedOptions
+            .filter(opt=>opt.productId!==p.productId&&opt.price!=null&&opt.available>0)
+            .slice(0,8)
+            .map(opt=>({
+              productId:opt.productId,
+              name:opt.name,
+              unit:opt.unit,
+              lot:opt.lot,
+              price:opt.price,
+              available:opt.available,
+              carbon:opt.carbon,
+              reliability:opt.reliability
+            }))
         });
         used.set(p.productId,round3((used.get(p.productId)||0)+quantity));
         remaining=round3(Math.max(0,remaining-quantity));
@@ -283,6 +317,8 @@ Rules:
   o.incomplete=o.issues.length>0;
   o.steps.push('Ranked catalog matches, prices & stock');
   const buyerHistory=await core('/internal/buyer-profile?user_id='+encodeURIComponent(user));
+  const buyerCfg=await core('/internal/buyer-config?user_id='+encodeURIComponent(user));
+  const threshold=round3(buyerCfg.threshold);
   Object.assign(o,route({...o,buyerHistory},undefined,threshold));
   o.score=round3(o.score);
   o.steps.push(`Risk score: ${o.score} / ${threshold} (${o.reason})`);
@@ -300,12 +336,31 @@ app.get('/portal/catalog-overview',async(req,res)=>{
   const u=encodeURIComponent(String(req.query.user_id||'demo-buyer'));
   res.json(await core(`/internal/catalog-overview?user_id=${u}&q=${q}`));
 });
-app.get('/portal/config',async(_,res)=>res.json({threshold,model:process.env.LUNA_MODEL||'gemini-2.5-flash',...await core('/internal/source')}));
+app.get('/portal/buyers',async(_req,res)=>res.json(await core('/internal/buyers')));
+app.post('/portal/buyers',async(req,res)=>{
+  const b=z.object({
+    user_id:z.string().trim().min(1).max(100),
+    threshold:z.number().min(0).default(defaultThreshold())
+  }).parse(req.body);
+  res.json(await core('/internal/buyers',{user_id:b.user_id,threshold:round3(b.threshold),createOnly:true}));
+});
+app.get('/portal/config',async(req,res)=>{
+  const user=String(req.query.user_id||'demo-buyer').trim()||'demo-buyer';
+  const [cfg,src]=await Promise.all([
+    core('/internal/buyer-config?user_id='+encodeURIComponent(user)),
+    core('/internal/source')
+  ]);
+  res.json({user_id:cfg.user_id,threshold:round3(cfg.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash',...src});
+});
 app.post('/portal/config',async(req,res)=>{
-  const b=z.object({threshold:z.number().min(0),stock:z.enum(['normal','low']).optional()}).parse(req.body);
+  const b=z.object({
+    user_id:z.string().trim().min(1).max(100).default('demo-buyer'),
+    threshold:z.number().min(0),
+    stock:z.enum(['normal','low']).optional()
+  }).parse(req.body);
   if(b.stock)await core('/internal/setup',{stock:b.stock});
-  threshold=round3(b.threshold);
-  res.json({threshold,model:process.env.LUNA_MODEL||'gemini-2.5-flash'});
+  const saved=await core('/internal/buyers',{user_id:b.user_id,threshold:round3(b.threshold)});
+  res.json({user_id:saved.user_id,threshold:round3(saved.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash'});
 });
 app.get('/portal/orders',async(req,res)=>res.json(await core('/internal/orders?user_id='+encodeURIComponent(z.string().min(1).parse(req.query.user_id)))));
 app.post('/portal/requests',async(req,res)=>{
@@ -323,13 +378,16 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
   const orders=await core('/internal/orders?user_id='+encodeURIComponent(user_id));
   const o=orders.find(o=>o.id===req.params.id);
   if(!o)throw Error('Order not found');
-  if(!['approve','reject'].includes(req.params.action))throw Error('Invalid action');
-  if(req.params.action==='approve'&&o.incomplete){
-    if(Object.keys(choices).length){
-      const replacement=await plan(o.lines,user_id,true,{...o.approved,...choices},o.demo_unavailable);
-      await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
-      return res.json(replacement);
+  if(!['approve','reject','substitute'].includes(req.params.action))throw Error('Invalid action');
+  if((req.params.action==='approve'||req.params.action==='substitute')&&Object.keys(choices).length){
+    const replacement=await plan(o.lines,user_id,false,{...o.approved,...choices},o.demo_unavailable);
+    await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
+    if(req.params.action==='approve'&&!replacement.incomplete&&replacement.status!=='APPROVED'){
+      return res.json(await core('/internal/decision',{id:replacement.id,user_id,action:'approve',human:true}));
     }
+    return res.json(replacement);
+  }
+  if(req.params.action==='approve'&&o.incomplete){
     if(!acceptPartial||!o.items.length)throw Error('Select substitutions or accept the available partial order');
     o.incomplete=false;
     o.steps.push('Human accepted partial quantities');
@@ -337,5 +395,8 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
   }
   res.json(await core('/internal/decision',{id:o.id,user_id,action:req.params.action,human:true}));
 });
-app.use((e,_req,res,_next)=>res.status(422).json({error:e.message}));
+app.use((e,_req,res,_next)=>{
+  const msg=e instanceof z.ZodError?e.issues.map(i=>i.message).join('; '):e.message;
+  res.status(422).json({error:msg||'Request failed'});
+});
 app.listen(Number(process.env.MIDDLE_LAYER_PORT||4002),'127.0.0.1',()=>console.log('Middle :'+(process.env.MIDDLE_LAYER_PORT||4002)));

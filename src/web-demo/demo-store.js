@@ -10,12 +10,31 @@ export class DemoStore {
  constructor(){
   const fixtures=[['demo-beer','Lager beer','demo-dark-beer'],['demo-dark-beer','Dark beer','demo-beer'],['demo-eggs','Eggs',null],['demo-dark-chocolate','Dark chocolate','demo-milk-chocolate'],['demo-milk-chocolate','Milk chocolate','demo-dark-chocolate'],['demo-milk','Milk',null],['demo-potato-salad','Potato salad',null]];
   this.products=fixtures.map(([id,name,sub])=>({id,name,net_contents:demoContents[id],search_text:name.toLowerCase(),sales_unit:'ST',allowed_lot_size:1,carbon_kg_co2_per_kg:null,delivery_reliability:null,raw:{substitutions:sub?[{product:id,substituteProduct:sub}]:[]}}));
-  this.orders=new Map();this.reset('normal');
+  this.orders=new Map();this.buyers=new Map([['demo-buyer',this.#normThreshold(process.env.SUSPICION_THRESHOLD??25)]]);this.reset('normal');
+ }
+ #normThreshold(v){const n=Number(v);if(!Number.isFinite(n)||n<0)throw Error('Invalid threshold');return Math.round(n*1000)/1000;}
+ #normUser(u){const id=String(u||'').trim();if(!id)throw Error('Buyer ID required');return id;}
+ listBuyers(defaultThreshold=process.env.SUSPICION_THRESHOLD??25){
+  const def=this.#normThreshold(defaultThreshold);
+  for(const o of this.orders.values())if(o.user_id&&!this.buyers.has(o.user_id))this.buyers.set(o.user_id,def);
+  return [...this.buyers.entries()].map(([user_id,threshold])=>({user_id,threshold}));
+ }
+ getBuyer(userId,defaultThreshold=process.env.SUSPICION_THRESHOLD??25){
+  const id=this.#normUser(userId);
+  if(!this.buyers.has(id))this.buyers.set(id,this.#normThreshold(defaultThreshold));
+  return {user_id:id,threshold:this.buyers.get(id)};
+ }
+ upsertBuyer(userId,threshold,{createOnly=false}={}){
+  const id=this.#normUser(userId);
+  if(createOnly&&this.buyers.has(id))throw Error(`Buyer "${id}" already exists`);
+  const t=this.#normThreshold(threshold);
+  this.buyers.set(id,t);
+  return {user_id:id,threshold:t};
  }
  reset(stock){if(!['normal','low'].includes(stock))throw Error('Unknown stock preset');this.stock=new Map(this.products.map(p=>[p.id,stock==='low'?1:100]));}
  search(q){q=String(q||'').trim().toLowerCase();if(!q)throw Error('Search required');return structuredClone(this.products.filter(p=>p.id===q||p.search_text.includes(q)));}
  overview(){const row=p=>({...p,quantity:this.stock.get(p.id)});return {mocked:true,products:this.products.map(p=>({...row(p),substitutions:p.raw.substitutions.map(s=>row(this.products.find(p=>p.id===s.substituteProduct)))}))};}
- save(o){const prior=this.orders.get(o.id);if(prior&&(prior.user_id!==o.user_id||prior.status!=='PENDING_APPROVAL'))throw Error('Order cannot be replaced');this.orders.set(o.id,structuredClone(o));return o;}
+ save(o){const prior=this.orders.get(o.id);if(prior&&(prior.user_id!==o.user_id||prior.status!=='PENDING_APPROVAL'))throw Error('Order cannot be replaced');if(o.user_id&&!this.buyers.has(o.user_id))this.buyers.set(o.user_id,this.#normThreshold(process.env.SUSPICION_THRESHOLD??25));this.orders.set(o.id,structuredClone(o));return o;}
  list(user){return structuredClone([...this.orders.values()].filter(o=>o.user_id===user));}
  decide({id,user_id,action}){
   const o=this.orders.get(id);if(!o||o.user_id!==user_id)throw Error('Order not found');

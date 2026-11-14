@@ -14,7 +14,8 @@ const clients={
 const client={get mock(){return sourceName()==='demo'||useMockValio();},price:r=>clients[sourceName()].price(r),availability:r=>clients[sourceName()].availability(r)};
 app.use(express.json({limit:'1mb'}));
 app.use((req,res,next)=>req.get('X-API-Key')===(process.env.CORE_API_KEY||'local-demo-key')?next():res.status(401).json({detail:'Invalid API key'}));
-const portalSchema=`CREATE TABLE IF NOT EXISTS portal_orders(id uuid PRIMARY KEY,user_id text NOT NULL, body jsonb NOT NULL); CREATE TABLE IF NOT EXISTS portal_purchases(id uuid PRIMARY KEY)`;
+const defaultThreshold=()=>round3(Number(process.env.SUSPICION_THRESHOLD??25));
+const portalSchema=`CREATE TABLE IF NOT EXISTS portal_orders(id uuid PRIMARY KEY,user_id text NOT NULL, body jsonb NOT NULL); CREATE TABLE IF NOT EXISTS portal_purchases(id uuid PRIMARY KEY); CREATE TABLE IF NOT EXISTS portal_buyers(user_id text PRIMARY KEY, threshold double precision NOT NULL DEFAULT 25, created_at timestamptz NOT NULL DEFAULT now())`;
 app.use((req,res,next)=>{const source=req.get('X-Data-Source')||'real';if(!['demo','real'].includes(source))return res.status(422).json({error:'Invalid database source'});sourceContext.run(source,next);});
 const demo=new DemoStore();
 app.use((req,res,next)=>{
@@ -22,6 +23,9 @@ app.use((req,res,next)=>{
  try{
   const path=req.path;
   if(req.method==='GET'&&path==='/internal/source')return res.json({source:'demo',realConfigured:Boolean(databaseUrls.real),storage:'memory'});
+  if(req.method==='GET'&&path==='/internal/buyers')return res.json({buyers:demo.listBuyers(defaultThreshold())});
+  if(req.method==='GET'&&path==='/internal/buyer-config')return res.json(demo.getBuyer(req.query.user_id||'demo-buyer',defaultThreshold()));
+  if(req.method==='POST'&&path==='/internal/buyers')return res.json(demo.upsertBuyer(req.body?.user_id,req.body?.threshold??defaultThreshold(),{createOnly:Boolean(req.body?.createOnly)}));
   if(req.method==='GET'&&path==='/internal/buyer-profile'){const approved=demo.list(req.query.user_id).filter(o=>o.status==='APPROVED');const totals=approved.map(o=>Number(o.total||0)).filter(n=>n>0);const maxOrderTotal=round3(totals.length?Math.max(...totals):0);const minOrderTotal=round3(totals.length?Math.min(...totals):0);return res.json({maxOrderTotal,minOrderTotal,spendCap:round3(Math.max(200,maxOrderTotal*1.5))});}
   if(req.method==='GET'&&path==='/internal/catalog-overview')return res.json(demo.overview());
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
@@ -141,6 +145,48 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
     quantity:r.stock_quantity==null?null:round3(r.stock_quantity)
   }));
 }
+async function seedPgBuyers(){
+  await pool.query(portalSchema);
+  const def=defaultThreshold();
+  await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES('demo-buyer',$1::double precision) ON CONFLICT(user_id) DO NOTHING`,[def]);
+  await pool.query(`INSERT INTO portal_buyers(user_id,threshold) SELECT DISTINCT user_id,$1::double precision FROM portal_orders WHERE NULLIF(BTRIM(user_id),'') IS NOT NULL ON CONFLICT(user_id) DO NOTHING`,[def]);
+}
+function normBuyerId(v){
+  const id=String(v||'').trim();
+  if(!id)throw Error('Buyer ID required');
+  return id;
+}
+function normBuyerThreshold(v){
+  const n=Number(v);
+  if(!Number.isFinite(n)||n<0)throw Error('Invalid threshold');
+  return round3(n);
+}
+app.get('/internal/buyers',async(_req,res)=>{
+  await seedPgBuyers();
+  const rows=(await pool.query(`SELECT user_id,threshold FROM portal_buyers ORDER BY created_at ASC, user_id ASC`)).rows;
+  res.json({buyers:rows.map(r=>({user_id:r.user_id,threshold:round3(r.threshold)}))});
+});
+app.get('/internal/buyer-config',async(req,res)=>{
+  await seedPgBuyers();
+  const id=normBuyerId(req.query.user_id||'demo-buyer');
+  const def=defaultThreshold();
+  await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES($1,$2::double precision) ON CONFLICT(user_id) DO NOTHING`,[id,def]);
+  const row=(await pool.query(`SELECT user_id,threshold FROM portal_buyers WHERE user_id=$1`,[id])).rows[0];
+  res.json({user_id:row.user_id,threshold:round3(row.threshold)});
+});
+app.post('/internal/buyers',async(req,res)=>{
+  await seedPgBuyers();
+  const id=normBuyerId(req.body?.user_id);
+  const t=normBuyerThreshold(req.body?.threshold??defaultThreshold());
+  const createOnly=Boolean(req.body?.createOnly);
+  if(createOnly){
+    const r=await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES($1,$2::double precision) ON CONFLICT(user_id) DO NOTHING RETURNING user_id,threshold`,[id,t]);
+    if(!r.rowCount)throw Error(`Buyer "${id}" already exists`);
+    return res.json({user_id:r.rows[0].user_id,threshold:round3(r.rows[0].threshold)});
+  }
+  const r=await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES($1,$2::double precision) ON CONFLICT(user_id) DO UPDATE SET threshold=EXCLUDED.threshold RETURNING user_id,threshold`,[id,t]);
+  res.json({user_id:r.rows[0].user_id,threshold:round3(r.rows[0].threshold)});
+});
 app.get('/internal/buyer-profile',async(req,res)=>{
   await pool.query(portalSchema);
   const user=String(req.query.user_id||'demo-buyer');
