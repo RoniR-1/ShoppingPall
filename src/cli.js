@@ -52,7 +52,7 @@ try {
       }
     } else {
       console.log('Planning recipe with local Ollama, then searching the static catalog…');
-      cart = await recipeCart(flags.recipe,api);
+      cart = await recipeCart(flags.recipe,api,undefined,message => console.log(message));
     }
     const requestedDate = flags.date || new Date(Date.now() + 86400000).toISOString().slice(0,10);
     const quote = await api('/quotes', { requestedDate, products: cart.items.map(i => i.productId), selection_ids: cart.selection_ids });

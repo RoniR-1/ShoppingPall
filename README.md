@@ -26,13 +26,17 @@ The workspace used during implementation has an ignored `.env` pointing to a tem
 
 ## Recipe agent
 
-Run Ollama locally, pull a model (for example `ollama pull deepseek-r1:8b`), then:
+Run Ollama locally and pull the smaller default model with `ollama pull qwen2.5:3b`. Set `OLLAMA_MODEL=qwen2.5:3b` in your existing `.env` (copying a new `.env.example` is unnecessary), then:
 
 ```sh
 npm run cli -- agent --user-id customer-123 --recipe "50 portions of creamy salmon soup" --date 2026-11-16
 ```
 
-`OLLAMA_URL` and `OLLAMA_MODEL` select the local provider/model. The adapter first asks for ingredient search terms, searches the static catalog with five candidates per ingredient, then asks the model to select IDs and quantities using the returned package/unit information. If an ingredient has no results, it asks for up to three alternative names or Finnish translations and retries until a search matches. Only selected IDs are accepted. Missing search results after these retries, invalid model JSON, invalid quantities, or unavailable stock stop submission. Generated recipe carts always require approval; quantity conversion and ingredient suitability are not guaranteed by the model. Technical unit codes are not fully documented in the source data.
+`OLLAMA_URL` and `OLLAMA_MODEL` select the local provider/model. The adapter first asks for ingredient search terms and alternative names/Finnish translations together, searches the static catalog with five candidates per ingredient, then asks the model to select IDs and quantities using the returned package/unit information. If an ingredient has no results, it tries up to three alternatives; an additional model call is needed only if the plan omitted alternatives. Only selected IDs are accepted. Missing search results after these retries, invalid model JSON, invalid quantities, or unavailable stock stop submission. Generated recipe carts always require approval; quantity conversion and ingredient suitability are not guaranteed by the model. Technical unit codes are not fully documented in the source data.
+
+The CLI prints each stage and model-call durations. Requests use a JSON schema, request thinking off, and cap generation at 1,024 tokens; truncated responses fail explicitly. `OLLAMA_TIMEOUT_MS` controls the per-call timeout (default 180,000 ms). Run `ollama ps` while generating to check the `PROCESSOR` column: `100% CPU` means your GPU is not being used. An 8B reasoning model such as `deepseek-r1:8b` can be slow on CPU, and some reasoning models cannot disable thinking. For quick adapter checks without model inference or PostgreSQL, run `node --test test/agent.test.js`.
+
+Repeated ingredient names are merged and catalog searches are cached within a recipe run. Before requesting a quote, the agent checks quantity limits, selected product IDs, duplicate product IDs, and lot sizes. An invalid cart gets one model correction attempt with validation feedback; a second failure stops with a readable error and no quote or order request. Quantities are never silently clamped or rounded. These checks do not establish recipe suitability or accurate portion-to-package conversion; human review is still required.
 
 The CLI never receives the Valio API key or database credentials through the API. Its HTTP interface needs only `BACKEND_URL` and a customer ID. The model proposes structured data and cannot execute arbitrary tools. API identity comes from `X-User-Id` and is forwarded as Valio's `customer`.
 

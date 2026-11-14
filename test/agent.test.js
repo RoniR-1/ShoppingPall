@@ -1,6 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recipeCart } from '../src/agent.js';
+import { recipeCart, ollamaJSON } from '../src/agent.js';
+import { z } from 'zod';
+
+test('recipe reuses planned synonyms without an extra model call', async () => {
+  const replies = [
+    { ingredients: [{ query: 'fish broth', alternatives: ['fish bouillon'] }] },
+    { items: [{ productId: '463838', quantity: 1 }] }
+  ];
+  const messages = [];
+  const cart = await recipeCart('salmon soup', async path => path.includes('fish%20bouillon')
+    ? { selection_id: 'matched', products: [{ id: '463838' }] }
+    : { products: [] }, async () => {
+    assert.ok(replies.length, 'No extra model call should be needed');
+    return replies.shift();
+  }, message => messages.push(message));
+  assert.equal(cart.items[0].productId, '463838');
+  assert.equal(replies.length, 0);
+  assert.ok(messages.some(message => message.includes('Selecting products and quantities completed')));
+});
+
+test('Ollama requests bounded structured output with thinking disabled', async () => {
+  const schema = z.object({ ok: z.boolean() });
+  const result = await ollamaJSON('test', schema, async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.think, false);
+    assert.equal(body.keep_alive, '15m');
+    assert.equal(body.options.num_predict, 1024);
+    assert.equal(body.format.properties.ok.type, 'boolean');
+    return new Response(JSON.stringify({ message: { content: '{"ok":true}' } }));
+  });
+  assert.deepEqual(result, { ok: true });
+});
+
+test('Ollama timeouts identify the model and suggest a diagnostic', async () => {
+  await assert.rejects(ollamaJSON('test', z.object({}), async () => {
+    throw new DOMException('timed out', 'TimeoutError');
+  }), /Ollama model .* timed out after .*ollama ps/);
+});
+
+test('Ollama output limit explains failure instead of parsing truncated JSON', async () => {
+  await assert.rejects(ollamaJSON('test', z.object({}), async () =>
+    new Response(JSON.stringify({ done_reason: 'length', message: { content: '{' } }))),
+  /1024-token output limit/);
+});
 
 test('recipe retries an unmatched ingredient and uses only the successful selection', async () => {
   const queries = [];
@@ -41,6 +84,7 @@ test('retry products cannot bypass the selected product check', async () => {
   const replies = [
     { ingredients: [{ query: 'fish broth' }] },
     { queries: ['kalaliemi'] },
+    { items: [{ productId: 'unselected', quantity: 1 }] },
     { items: [{ productId: 'unselected', quantity: 1 }] }
   ];
   let searches = 0;
@@ -48,4 +92,75 @@ test('retry products cannot bypass the selected product check', async () => {
     ? { products: [] }
     : { selection_id: 'matched', products: [{ id: '463838' }] },
   async () => replies.shift()), /unselected products/);
+});
+
+test('duplicate ingredient queries merge alternatives and search only once', async () => {
+  const replies = [
+    { ingredients: [{ query: ' Fish   Broth ' }, { query: 'fish broth', alternatives: ['kalaliemi'] }] },
+    { items: [{ productId: '463838', quantity: 2 }] }
+  ];
+  const queries = [];
+  const cart = await recipeCart('soup', async path => {
+    const query = new URL(path, 'http://localhost').searchParams.get('q');
+    queries.push(query);
+    return { selection_id: 'selection', products: query === 'kalaliemi' ? [{ id: '463838', allowed_lot_size: 1 }] : [] };
+  }, async () => replies.shift());
+  assert.deepEqual(queries, ['fish broth', 'kalaliemi']);
+  assert.deepEqual(cart.selection_ids, ['selection']);
+  assert.equal(replies.length, 0);
+});
+
+test('oversized model quantities get one correction before returning a cart', async () => {
+  const replies = [
+    { ingredients: [{ query: 'cream' }] },
+    { items: [{ productId: 'cream', quantity: 12345678 }] },
+    { items: [{ productId: 'cream', quantity: 2 }] }
+  ];
+  const prompts = [];
+  const cart = await recipeCart('50 portions', async path => {
+    assert.ok(path.startsWith('/catalog/search?'), 'Must not request quotes or submit orders');
+    return { selection_id: 'selection', products: [{ id: 'cream', allowed_lot_size: 1 }] };
+  }, async prompt => { prompts.push(prompt); return replies.shift(); });
+  assert.equal(cart.items[0].quantity, 2);
+  assert.equal(prompts.length, 3);
+  assert.match(prompts[2], /previous response was rejected.*1,000,000/);
+});
+
+test('repeated invalid quantities stop with a concise error and no further retries', async () => {
+  let calls = 0;
+  await assert.rejects(recipeCart('soup', async path => {
+    assert.ok(path.startsWith('/catalog/search?'));
+    return { selection_id: 'selection', products: [{ id: 'cream' }] };
+  }, async () => ++calls === 1 ? { ingredients: [{ query: 'cream' }] }
+    : { items: [{ productId: 'cream', quantity: 1e12 }] }), error => {
+    assert.match(error.message, /failed after one correction attempt/);
+    assert.match(error.message, /Invalid quantities for 1 item/);
+    assert.match(error.message, /No quote or order was requested/);
+    assert.doesNotMatch(error.message, /"origin"|"path"|"too_big"/);
+    return true;
+  });
+  assert.equal(calls, 3);
+});
+
+test('invalid lot quantities are corrected without rounding silently', async () => {
+  const replies = [
+    { ingredients: [{ query: 'cream' }] },
+    { items: [{ productId: 'cream', quantity: 1 }] },
+    { items: [{ productId: 'cream', quantity: 6 }] }
+  ];
+  const cart = await recipeCart('soup', async () => ({ selection_id: 'selection',
+    products: [{ id: 'cream', allowed_lot_size: 6 }] }), async () => replies.shift());
+  assert.equal(cart.items[0].quantity, 6);
+  assert.equal(replies.length, 0);
+});
+
+test('actual Ollama schema errors use the same readable validation message', async () => {
+  await assert.rejects(ollamaJSON('test', z.object({ items: z.array(z.object({ quantity: z.number().max(1000000) })) }),
+    async () => new Response(JSON.stringify({ message: { content: '{"items":[{"quantity":1000001}]}' } }))),
+  /Invalid quantities for 1 item/);
+});
+
+test('invalid ingredient plans fail with a readable stage before searching', async () => {
+  await assert.rejects(recipeCart('soup', async () => assert.fail('Must not search invalid plans'),
+    async () => ({ ingredients: [] })), /Planning ingredients: Invalid model response/);
 });
