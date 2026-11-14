@@ -8,7 +8,6 @@ Node 22+ / Express monolith, PostgreSQL catalog and approval queue, and a Node C
 
 ```sh
 npm ci
-# Create .env with DATABASE_URL, VALIO_MOCK and Luna settings described below
 docker compose up -d db
 npm run seed
 npm start
