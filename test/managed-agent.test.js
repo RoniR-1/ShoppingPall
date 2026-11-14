@@ -22,3 +22,42 @@ test('state lock prevents concurrent processes from dispatching twice',async()=>
 test('failed state persistence does not dispatch',async()=>{const dir=await mkdtemp(tmpdir()+'/managed-save-');try{let calls=0;const a=new ManagedAgent({file:dir+'/state.json',submit:async()=>{calls++;}});await a.command('buyer',{action:'rule',rule:{query:'Eggs',minimum:10,target:20,on_hand:0}});a.save=async()=>{throw Error('disk full');};await assert.rejects(a.tick('buyer'),/disk full/);assert.equal(calls,0);}finally{await rm(dir,{recursive:true,force:true});}});
 test('uncertain order is held until a human attaches the matching order',async()=>{const dir=await mkdtemp(tmpdir()+'/managed-reconcile-');try{let order;const a=new ManagedAgent({file:dir+'/state.json',listOrders:async()=>order?[order]:[],submit:async(_lines,_user,context)=>{order={id:context.action_id,status:'APPROVED',items:[{quantity:20}]};throw Error('response lost');}});await a.command('buyer',{action:'rule',rule:{query:'Eggs',minimum:10,target:20,on_hand:0}});await a.tick('buyer');const id=a.state('buyer').rules[0].episode;await a.tick('buyer');assert.equal(a.state('buyer').activity.find(x=>x.id===id).status,'RECONCILING');assert.equal(a.preview('buyer')[0].position,0);await assert.rejects(a.command('buyer',{action:'resolve',id,resolution:'no_order'}),/order exists/);await a.command('buyer',{action:'resolve',id,resolution:'attach_order'});assert.equal(a.preview('buyer')[0].position,20);}finally{await rm(dir,{recursive:true,force:true});}});
 test('rejected and denied episodes remain held until a human resets them',async()=>{const dir=await mkdtemp(tmpdir()+'/managed-reset-');try{let calls=0;let order={id:'pending',status:'PENDING_APPROVAL',items:[]};const a=new ManagedAgent({file:dir+'/state.json',listOrders:async()=>[order],submit:async()=>{calls++;return order;}});await a.command('buyer',{action:'rule',rule:{query:'Eggs',minimum:10,target:20,on_hand:0}});await a.tick('buyer');const id=a.state('buyer').rules[0].episode;order={...order,status:'REJECTED'};await a.tick('buyer');assert.equal(a.state('buyer').activity.find(x=>x.id===id).status,'REJECTED');await a.tick('buyer');assert.equal(calls,1);await a.command('buyer',{action:'reset_episode',id});await a.tick('buyer');assert.equal(calls,2);const denied=new ManagedAgent({file:dir+'/denied.json',submit:async()=>{throw Object.assign(Error('cap'),{code:'PRICE_CAP'});}});await denied.command('buyer',{action:'rule',rule:{query:'Eggs',minimum:1,target:2,on_hand:0}});await denied.tick('buyer');const did=denied.state('buyer').rules[0].episode;await denied.command('buyer',{action:'reset_episode',id:did});assert.equal(denied.state('buyer').rules[0].episode,null);}finally{await rm(dir,{recursive:true,force:true});}});
+
+test('simulation cadence, pause and delayed receipt survive restart',async()=>{
+  const dir=await mkdtemp(tmpdir()+'/managed-simulation-');
+  try{
+    let now=100000, calls=0;
+    const args={file:dir+'/state.json',now:()=>now,submit:async(lines)=>({id:`order-${++calls}`,status:'APPROVED',total:10,items:[{quantity:lines[0].quantity}]})};
+    const a=new ManagedAgent(args);
+    await a.command('buyer',{action:'simulation',running:true,speed:'fast',governance:'autonomous'});
+    assert.equal(a.state('buyer').rules.length,3);
+    const before=a.state('buyer').inventory.map(i=>i.on_hand);
+    now+=2999;await a.simulationStep('buyer');assert.deepEqual(a.state('buyer').inventory.map(i=>i.on_hand),before);
+    now++;await a.simulationStep('buyer');assert.ok(a.state('buyer').inventory.some((i,n)=>i.on_hand<before[n]));
+    await a.command('buyer',{action:'simulation',running:false});
+    const paused=a.state('buyer').inventory.map(i=>i.on_hand);
+    now+=10000;await a.simulationStep('buyer');assert.deepEqual(a.state('buyer').inventory.map(i=>i.on_hand),paused);
+    await a.command('buyer',{action:'demand_spike'});await a.tick('buyer');assert.equal(calls,1);
+    const rule=a.state('buyer').rules.find(r=>r.episode), item=a.state('buyer').inventory.find(i=>i.id===rule.product_id);
+    assert.ok(item.on_hand<rule.minimum);
+    const b=new ManagedAgent(args);await b.load();now+=3999;await b.simulationStep('buyer');assert.ok(b.state('buyer').inventory.find(i=>i.id===rule.product_id).on_hand<rule.minimum);
+    now++;await b.simulationStep('buyer');assert.equal(b.state('buyer').inventory.find(i=>i.id===rule.product_id).on_hand,rule.target);
+    await b.simulationStep('buyer');assert.equal(b.state('buyer').metrics.stockouts_prevented,1);assert.equal(calls,1);
+    assert.ok(b.state('buyer').telemetry.some(e=>e.category==='RESTOCK'));
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('simulation holds a missing pending order for reconciliation',async()=>{
+  const dir=await mkdtemp(tmpdir()+'/managed-simulation-reconnect-');
+  try{
+    let orders=[];
+    const a=new ManagedAgent({file:dir+'/state.json',submit:async lines=>{const order={id:'pending',status:'PENDING_APPROVAL',items:[{quantity:lines[0].quantity}]};orders=[order];return order;},listOrders:async()=>orders});
+    await a.command('buyer',{action:'simulation',governance:'human'});
+    await a.command('buyer',{action:'demand_spike'});await a.tick('buyer');
+    orders=[];await a.tick('buyer');
+    const episode=a.state('buyer').activity.find(event=>event.id===a.state('buyer').rules.find(rule=>rule.episode)?.episode);
+    assert.equal(episode.status,'RECONCILING');assert.match(episode.message,/unavailable/);
+    await a.command('buyer',{action:'resolve',id:episode.id,resolution:'no_order'});
+    assert.equal(a.state('buyer').rules.find(rule=>rule.id===episode.context.why.rule_id).episode,null);
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
