@@ -260,3 +260,52 @@ Real requires `REAL_DATABASE_URL` with the seeded catalog schema and
 PostgreSQL. Real checkout remains preview-only. The selector validates the real
 connection before switching and retains Demo on failure. Demo resets cannot touch
 PostgreSQL. `DEMO_DATABASE_URL` is no longer used.
+
+### Managed inventory agent (local simulated MVP)
+
+Open `/managed-agent` on the portal after `npm run web`. Connect the Demo
+warehouse, enter a product and minimum/target/on-hand quantities, review the
+preview, and enable monitoring. The middle process checks every 30 seconds.
+Chat supports `keep at least 10 milk` and fills a proposed rule for explicit
+review/save. Customer warehouse quantities are independent of supplier stock.
+
+Managed orders call the same `plan` function, `route` screening, core save and
+approval commands used by custom portal requests. Structured trigger data,
+source evidence, provenance and purpose are attached before screening. Activity
+also records resulting items and risk constraints. The dedicated page supports
+approval/rejection of complete proposals; substitutions use the existing portal.
+
+State is persisted atomically in `.local/managed-agent.json` (override with
+`MANAGED_STATE_FILE`). Only one middle process may own this file. An episode is
+persisted before dispatch: uncertain results are held as RECONCILING and are
+never automatically retried. An episode remains suppressed until a later check
+observes warehouse stock above the minimum. Pausing/disconnecting stops future
+checks; it does not cancel already-created orders. Demo orders and supplier
+stock remain in the core's process memory and reset when core restarts.
+
+This is not the production architecture described in the design: no real
+inventory connector, OAuth/credential vault, authenticated tenant identities,
+agent scopes, shared transactional spending reservations, database-backed jobs,
+fraud-service outbox, or supplier checkout has been added. Existing portal risk
+scoring is a demo and is separate from legacy monolith buyer policies. Do not
+expose this localhost demo as a production autonomous purchasing service.
+Real-data mode rejects managed-agent endpoints. All purchase outcomes are
+explicitly simulated. Warehouse snapshots are manually entered demo inputs.
+
+Focused checks: `node --test test/managed-agent.test.js`.
+
+Managed price caps now store currency, quantity, and a product-specific price
+unit. Unit conversions use `baseUnit` and `units[].sizeInBaseUnits` relative to
+`salesUnit`, following the supplied product schema; unknown conversions are
+rejected. Existing demo fixtures expose only ST, so their unit menu intentionally
+contains ST only. No technical-code translations or package sizes are invented.
+Currency choices are EUR, USD, GBP, SEK, NOK and DKK. A cap with a different
+currency from the quote blocks dispatch: currency conversion is not configured.
+
+Simulated approved replenishments now receive the ordered quantities into the
+customer warehouse exactly once and close the shortage episode. The worker also
+reconciles approvals made after submission and prior simulated placements. A new
+low-stock snapshot can then trigger a new replenishment; pending or uncertain
+orders remain held to prevent duplicates. This receipt is a demo simulation,
+not evidence of real supplier delivery. The activity panel displays events since
+page load while preserving the full persisted audit history.
