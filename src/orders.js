@@ -1,6 +1,8 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { transaction } from './db.js';
 import { assert } from './contracts.js';
+import { OrderScreeningService, OrderStatus } from './order-screening.js';
+const defaultScreening = new OrderScreeningService();
 export function buildOrderItems(requestItems, quote) {
   return requestItems.map(item => {
     const p = quote.items.find(p => p.productId === item.productId);
@@ -112,7 +114,7 @@ function buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLi
     `This order would exceed your weekly spend cap of €${Number(weeklyLimit).toFixed(2)}. Approve this total?`, ['remove_item', 'cancel']);
   return questions.sort((a,b) => b.points - a.points || a.id.localeCompare(b.id));
 }
-export async function createOrder(user, key, input) {
+export async function createOrder(user, key, input, screening = defaultScreening) {
   const request = { ...input, items: [...input.items].sort((a, b) => a.productId.localeCompare(b.productId)) };
   const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
   return transaction(async db => {
