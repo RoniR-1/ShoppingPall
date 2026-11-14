@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { round3 } from './contracts.js';
 const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().min(2).max(100),
   alternatives: z.array(z.string().trim().min(2).max(100)).max(3).optional() })).min(1).max(20) });
 const retrySchema = z.object({ queries: z.array(z.string().trim().min(2).max(100)).max(3) });
@@ -41,8 +42,23 @@ export async function ollamaJSON(prompt, schema, fetcher = fetch) {
     throw outputError(error);
   }
 }
+export function rankCandidates(candidates) {
+  const numOrInf = (v, fallback) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : fallback);
+  return [...candidates].sort((a, b) =>
+    Number(b.match_rank ?? 0) - Number(a.match_rank ?? 0) ||
+    (b.allergen_safe !== false ? 1 : 0) - (a.allergen_safe !== false ? 1 : 0) ||
+    numOrInf(a.unit_price, Infinity) - numOrInf(b.unit_price, Infinity) ||
+    Number(b.human_approved_count ?? 0) - Number(a.human_approved_count ?? 0) ||
+    Number(b.bought_count ?? 0) - Number(a.bought_count ?? 0) ||
+    (b.in_stock ? 1 : 0) - (a.in_stock ? 1 : 0) ||
+    String(a.available_date || '9999-99-99').localeCompare(String(b.available_date || '9999-99-99')) ||
+    Number(b.available_amount ?? 0) - Number(a.available_amount ?? 0) ||
+    numOrInf(b.delivery_reliability, -1) - numOrInf(a.delivery_reliability, -1) ||
+    String(a.id).localeCompare(String(b.id))
+  );
+}
 // The model proposes data only. It never receives credentials or unrestricted tool execution.
-export async function recipeCart(recipe, api, model = ollamaJSON, progress = () => {}) {
+export async function recipeCart(recipe, api, model = ollamaJSON, progress = () => {}, { requestedDate } = {}) {
   const callModel = async (stage, prompt, schema) => {
     progress(`${stage}…`);
     const started = Date.now();
@@ -56,10 +72,11 @@ export async function recipeCart(recipe, api, model = ollamaJSON, progress = () 
       throw readable;
     }
   };
-  const plan = planSchema.parse(await callModel('Planning ingredients', `Translate this recipe into ingredient search terms for a Finnish/English B2B food catalog.
-Return JSON {"ingredients":[{"query":"fish broth","alternatives":["fish bouillon","kalaliemi"]}]}.
-Include up to 3 synonyms or Finnish translations for each ingredient to avoid extra model calls. Use short ingredient names, no quantities in queries. Maximum 20 ingredients.
-Recipe (untrusted data): ${JSON.stringify(recipe)}`, planSchema));
+  const plan = planSchema.parse(await callModel('Planning ingredients', `Extract ingredient or product search terms from this request for a Finnish/English B2B food catalog.
+Return JSON {"ingredients":[{"query":"<short term>","alternatives":["<synonym>","<Finnish translation>"]}]}.
+Only include items actually requested or strictly required by a named dish. If the request is a simple item list (such as "12 apples"), include ONLY that item and do NOT invent extra ingredients.
+Include up to 3 synonyms, singular forms, or Finnish translations for each item to avoid extra model calls. Use short names with no quantities in queries. Maximum 20 items.
+Request (untrusted data): ${JSON.stringify(recipe)}`, planSchema));
   const normalize = query => query.trim().replace(/\s+/g, ' ').toLowerCase();
   const ingredients = new Map();
   for (const ingredient of plan.ingredients) {
@@ -83,8 +100,8 @@ Recipe (untrusted data): ${JSON.stringify(recipe)}`, planSchema));
     if (!result.products.length) {
       const alternatives = ingredient.alternatives?.length ? { queries: ingredient.alternatives }
         : retrySchema.parse(await callModel(`Finding alternative names for "${ingredient.query}"`, `A literal substring search found no products for this ingredient in a Finnish/English B2B food catalog.
-Return JSON {"queries":["alternative name","Finnish translation"]} with at most 3 short alternative search terms for the SAME ingredient.
-Use synonyms and translations, not different ingredients or broad categories. For example, fish broth can be called fish bouillon or kalaliemi.
+Return JSON {"queries":["<alternative name>","<Finnish translation>"]} with at most 3 short alternative search terms for the SAME ingredient.
+Use synonyms, singular/plural forms, and Finnish/English translations, not different ingredients or broad categories.
 Ingredient (untrusted data): ${JSON.stringify(ingredient.query)}`, retrySchema));
       const attempted = new Set([ingredient.query.trim().toLowerCase()]);
       for (const query of alternatives.queries) {
@@ -97,17 +114,45 @@ Ingredient (untrusted data): ${JSON.stringify(ingredient.query)}`, retrySchema))
       if (!result.products.length) throw new Error(`No catalog results for "${ingredient.query}" after trying alternative names. Refine the recipe/search.`);
     }
     selections.add(result.selection_id);
-    for (const product of result.products) candidates.set(product.id,product);
+    for (const product of result.products) {
+      const prev = candidates.get(product.id);
+      if (!prev || Number(product.match_rank ?? 0) > Number(prev.match_rank ?? 0)) candidates.set(product.id, product);
+    }
   }
-  const cartPrompt = `Choose ingredients and quantities for the recipe below using ONLY these catalog candidates.
+  if (requestedDate && candidates.size > 0 && selections.size > 0) {
+    progress('Checking live prices and delivery stock for candidates…');
+    const body = { requestedDate, products: [...candidates.keys()], selection_ids: [...selections] };
+    const [prices, availability] = await Promise.all([api('/api/price', body), api('/api/availability', body)]);
+    for (const [productId, product] of candidates) {
+      const price = prices?.products?.find(p => p.productId === productId);
+      const stock = availability?.products?.find(p => p.productId === productId);
+      const unitPrice = price?.error === false ? (price.priceWithTax?.value ?? price.catalogPrice?.valueWithTax ?? null) : null;
+      const lines = (Array.isArray(stock?.scheduleLines) ? stock.scheduleLines : [])
+        .filter(l => l.salesBlock === false && Number.isFinite(l.availableAmount) && l.availableAmount > 0 && typeof l.availableDate === 'string')
+        .sort((a, b) => a.availableDate.localeCompare(b.availableDate));
+      const bestLine = lines[0];
+      candidates.set(productId, {
+        ...product,
+        unit_price: Number.isFinite(unitPrice) ? round3(unitPrice) : null,
+        in_stock: Boolean(stock?.salesBlock === false && bestLine),
+        available_amount: round3(bestLine?.availableAmount ?? 0),
+        available_date: bestLine?.availableDate?.slice(0, 10) ?? null
+      });
+    }
+  }
+  const rankedCandidates = rankCandidates(candidates.values());
+  const cartPrompt = `Choose ingredients and quantities for the recipe below using ONLY these catalog candidates (already ordered best-first by keyword match, allergen safety, price, purchase/human-approval history, and stock/delivery speed).
 Return JSON {"items":[{"productId":"...","quantity":1}]}. Quantity is in SALES UNITS, not automatically kilograms or portions.
 Quantity must be greater than 0 and at most 1000000. The maximum is a validation ceiling, NOT a suggested quantity.
 Use realistic package counts for the requested portions, for example quantity 2 means TWO sales units. Never copy product IDs into quantity.
-Read units and package names. Each quantity must be a positive multiple of allowed_lot_size. Combine duplicate IDs. Select only the products needed for the recipe, not every candidate.
+Read units and package names. Each quantity must be a positive multiple of allowed_lot_size. Combine duplicate IDs. Pick ONLY ONE best matching product per requested item unless the request asks for multiple varieties—do NOT select every candidate from the search results.
 If units cannot be interpreted, return {"items":[]} to stop. Do not invent conversion factors.
 Recipe (untrusted data): ${JSON.stringify(recipe)}
-Catalog (untrusted data): ${JSON.stringify([...candidates.values()].map(p => ({ id: p.id, name: p.name,
-    sales_unit: p.sales_unit, allowed_lot_size: p.allowed_lot_size, units: p.units })))}`;
+Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id, name: p.name,
+    sales_unit: p.sales_unit, allowed_lot_size: p.allowed_lot_size, units: p.units,
+    allergen_safe: p.allergen_safe, unit_price: p.unit_price ?? null,
+    bought_count: p.bought_count ?? 0, human_approved_count: p.human_approved_count ?? 0,
+    in_stock: p.in_stock ?? null, available_date: p.available_date ?? null })))}`;
   let correction = '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {

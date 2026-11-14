@@ -4,20 +4,25 @@ import {closestProducts,searchTokens} from './matches.js';
 import {DemoStore} from './demo-store.js';
 import {pool,transaction,sourceContext,sourceName,databaseUrls} from './sources.js';
 import {ValioClient} from '../valio.js';
-import {productsRequest} from '../contracts.js';
+import {productsRequest,round3} from '../contracts.js';
 const app=express();
-const clients={demo:new ValioClient({mock:true,inventoryPool:pool}),real:new ValioClient({mock:false})};
-const client={get mock(){return sourceName()==='demo';},price:r=>clients[sourceName()].price(r),availability:r=>clients[sourceName()].availability(r)};
+const useMockValio=()=>process.env.VALIO_MOCK==='true'||!process.env.VALIO_API_KEY;
+const clients={
+  demo:new ValioClient({mock:true,inventoryPool:pool}),
+  get real(){return new ValioClient({mock:useMockValio(),inventoryPool:pool});}
+};
+const client={get mock(){return sourceName()==='demo'||useMockValio();},price:r=>clients[sourceName()].price(r),availability:r=>clients[sourceName()].availability(r)};
 app.use(express.json({limit:'1mb'}));
 app.use((req,res,next)=>req.get('X-API-Key')===(process.env.CORE_API_KEY||'local-demo-key')?next():res.status(401).json({detail:'Invalid API key'}));
 const portalSchema=`CREATE TABLE IF NOT EXISTS portal_orders(id uuid PRIMARY KEY,user_id text NOT NULL, body jsonb NOT NULL); CREATE TABLE IF NOT EXISTS portal_purchases(id uuid PRIMARY KEY)`;
-app.use((req,res,next)=>{const source=req.get('X-Data-Source')||'demo';if(!['demo','real'].includes(source))return res.status(422).json({error:'Invalid database source'});sourceContext.run(source,next);});
+app.use((req,res,next)=>{const source=req.get('X-Data-Source')||'real';if(!['demo','real'].includes(source))return res.status(422).json({error:'Invalid database source'});sourceContext.run(source,next);});
 const demo=new DemoStore();
 app.use((req,res,next)=>{
  if(sourceName()!=='demo')return next();
  try{
   const path=req.path;
-  if(req.method==='GET'&&path==='/internal/source')return res.json({source:'demo',realConfigured:Boolean(databaseUrls.real&&process.env.VALIO_API_KEY),storage:'memory'});
+  if(req.method==='GET'&&path==='/internal/source')return res.json({source:'demo',realConfigured:Boolean(databaseUrls.real),storage:'memory'});
+  if(req.method==='GET'&&path==='/internal/buyer-profile'){const approved=demo.list(req.query.user_id).filter(o=>o.status==='APPROVED');const totals=approved.map(o=>Number(o.total||0)).filter(n=>n>0);const maxOrderTotal=round3(totals.length?Math.max(...totals):0);const minOrderTotal=round3(totals.length?Math.min(...totals):0);return res.json({maxOrderTotal,minOrderTotal,spendCap:round3(Math.max(200,maxOrderTotal*1.5))});}
   if(req.method==='GET'&&path==='/internal/catalog-overview')return res.json(demo.overview());
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
   if(req.method==='POST'&&path==='/internal/suggestions')return res.json(closestProducts(req.body.q,demo.products));
@@ -29,53 +34,173 @@ app.use((req,res,next)=>{
   next();
  }catch(e){next(e);}
 });
-app.get('/internal/source',async(_req,res)=>{if(sourceName()==='real'&&!process.env.VALIO_API_KEY)throw Error('Configure VALIO_API_KEY for real availability and prices');await pool.query('SELECT id FROM products LIMIT 1');await pool.query(portalSchema);res.json({source:sourceName(),realConfigured:Boolean(databaseUrls.real&&process.env.VALIO_API_KEY)});});
+app.get('/internal/source',async(_req,res)=>{
+  const countRes=await pool.query('SELECT COUNT(*)::int AS count FROM products WHERE NOT deleted');
+  await pool.query(portalSchema);
+  res.json({source:sourceName(),realConfigured:Boolean(databaseUrls.real),productCount:countRes.rows[0]?.count??0,mocked:client.mock});
+});
 app.get('/api/ping',(_,res)=>res.json({ok:true}));
 for(const kind of ['price','availability']) app.post('/api/'+kind,async(req,res)=>res.json(await client[kind](productsRequest.parse(req.body))));
 for(const [kind,file] of Object.entries({products:'product_data.json','carbon-footprint':'valio_aimo_junction26_carbon_footprint.csv','delivery-reliability':'valio_aimo_junction26_delivery_reliability.csv'})) app.get(`/api/${kind}/download`,(_,res)=>res.sendFile(file,{root:process.cwd()}));
-app.post('/internal/setup',()=>{throw Error('Stock reset is only available in Demo mode');});
-// A small, stable catalog showcase, independent of order history.
-app.get('/internal/catalog-overview',async(_req,res)=>{
- const ids=['460025','460027','460131','460170','460189','460211','460239'];
- const products=(await pool.query(`SELECT p.id,p.name,p.sales_unit,p.raw->'substitutions' AS substitutions,i.quantity
- FROM products p LEFT JOIN inventory i ON i.product_id=p.id
- WHERE p.id=ANY($1) AND NOT p.deleted ORDER BY array_position($1::text[],p.id)`,[ids])).rows;
- const substituteIds=[...new Set(products.flatMap(p=>(p.substitutions||[]).filter(s=>s.product===p.id).map(s=>s.substituteProduct)))];
- const substitutes=(await pool.query(`SELECT p.id,p.name,p.sales_unit,i.quantity FROM products p
- LEFT JOIN inventory i ON i.product_id=p.id WHERE p.id=ANY($1) AND NOT p.deleted`,[substituteIds])).rows;
- if(!client.mock){const all=[...products,...substitutes];const availability=await client.availability({customer:String(_req.query.user_id||'demo-buyer'),requestedDate:new Date(Date.now()+86400000).toISOString().slice(0,10),products:[...new Set(all.map(p=>p.id))]});for(const p of all){const a=availability.products.find(a=>a.productId===p.id);const line=a?.scheduleLines?.[0];p.quantity=a?.logisticModel==='Stock'&&!a.salesBlock&&line&&!line.salesBlock?line.availableAmount:null; if(line)p.sales_unit=line.salesUnit;}}
- res.json({mocked:client.mock,products:products.map(p=>({...p,substitutions:(p.substitutions||[]).filter(s=>s.product===p.id).map(s=>substitutes.find(p=>p.id===s.substituteProduct)).filter(Boolean)}))});
+app.post('/internal/setup',async(req,res)=>{
+  const stock=req.body?.stock==='low'?1:1000;
+  await pool.query('UPDATE inventory SET quantity=$1',[stock]);
+  res.json({ok:true,stock:req.body?.stock||'normal'});
+});
+async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
+  const q=String(rawQuery||'').trim().toLowerCase();
+  if(!q)return [];
+  const policy=(await pool.query('SELECT excluded_allergens FROM buyer_risk_policies WHERE user_id=$1',[user])).rows[0];
+  const excludedAllergens=policy?.excluded_allergens||[];
+  const wordRegex=`\\m${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\\M`;
+  const rows=(await pool.query(`
+    WITH history AS (
+      SELECT product_id,
+        SUM(bought_count)::int AS bought_count,
+        SUM(human_approved_count)::int AS human_approved_count,
+        COALESCE(MAX(prior_max_qty), 0)::double precision AS prior_max_qty,
+        COALESCE(MIN(prior_min_qty), 0)::double precision AS prior_min_qty,
+        COALESCE(AVG(prior_avg_qty), 0)::double precision AS prior_avg_qty
+      FROM (
+        SELECT item->>'productId' AS product_id,
+          COUNT(*)::int AS bought_count,
+          COUNT(*) FILTER (
+            WHERE o.flag_reason IS NOT NULL
+              OR EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.status = 'PENDING_APPROVAL')
+          )::int AS human_approved_count,
+          MAX((item->>'quantity')::numeric) AS prior_max_qty,
+          MIN((item->>'quantity')::numeric) AS prior_min_qty,
+          AVG((item->>'quantity')::numeric) AS prior_avg_qty
+        FROM orders o, jsonb_array_elements(o.items) item
+        WHERE o.user_id = $1 AND o.status = 'APPROVED'
+        GROUP BY item->>'productId'
+        UNION ALL
+        SELECT item->>'productId' AS product_id,
+          COUNT(*)::int AS bought_count,
+          COUNT(*) FILTER (WHERE COALESCE((po.body->>'human_approved')::boolean, false))::int AS human_approved_count,
+          MAX((item->>'quantity')::numeric) AS prior_max_qty,
+          MIN((item->>'quantity')::numeric) AS prior_min_qty,
+          AVG((item->>'quantity')::numeric) AS prior_avg_qty
+        FROM portal_orders po, jsonb_array_elements(COALESCE(po.body->'items','[]'::jsonb)) item
+        WHERE po.user_id = $1 AND po.body->>'status' = 'APPROVED'
+        GROUP BY item->>'productId'
+      ) combined
+      GROUP BY product_id
+    ),
+    scored AS (
+      SELECT p.id, p.name, p.category, p.country_of_origin, p.sales_unit, p.allowed_lot_size,
+        ROUND(p.carbon_kg_co2_per_kg, 3) AS carbon_kg_co2_per_kg,
+        ROUND(p.delivery_reliability, 3) AS delivery_reliability,
+        p.raw->'units' AS units, p.raw->'substitutions' AS substitutions,
+        i.quantity AS stock_quantity,
+        CASE
+          WHEN lower(p.name) = $3 OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'names', '[]'::jsonb)) n
+            WHERE lower(n->>'value') = $3
+          ) THEN 4
+          WHEN starts_with(lower(p.name), $3) THEN 3
+          WHEN p.search_text ~ $4 THEN 2
+          WHEN position($3 in lower(p.name)) > 0 THEN 1
+          ELSE 0
+        END AS match_rank,
+        COALESCE((
+          SELECT array_agg(v->>'id')
+          FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'classifications', '[]'::jsonb)) c,
+               jsonb_array_elements(COALESCE(c->'values', '[]'::jsonb)) v
+          WHERE c->>'name' = 'allergen' AND v->>'unit' = 'CONTAINS'
+        ), '{}'::text[]) AS allergens,
+        COALESCE(h.bought_count, 0) AS bought_count,
+        COALESCE(h.human_approved_count, 0) AS human_approved_count,
+        COALESCE(h.prior_max_qty, 0)::double precision AS prior_max_qty,
+        COALESCE(h.prior_min_qty, 0)::double precision AS prior_min_qty,
+        COALESCE(h.prior_avg_qty, 0)::double precision AS prior_avg_qty
+      FROM products p
+      LEFT JOIN inventory i ON i.product_id = p.id
+      LEFT JOIN history h ON h.product_id = p.id
+      WHERE NOT p.deleted AND (p.id = $3 OR position($3 in p.search_text) > 0)
+    )
+    SELECT *, NOT (allergens && $2::text[]) AS allergen_safe
+    FROM scored
+    ORDER BY
+      match_rank DESC,
+      (NOT (allergens && $2::text[])) DESC,
+      human_approved_count DESC,
+      bought_count DESC,
+      COALESCE(stock_quantity, 0) DESC,
+      delivery_reliability DESC NULLS LAST,
+      id ASC
+    LIMIT $5`,[user,excludedAllergens,q,wordRegex,limit])).rows;
+  return rows.map(r=>({
+    ...r,
+    allowed_lot_size:round3(r.allowed_lot_size),
+    carbon_kg_co2_per_kg:round3(r.carbon_kg_co2_per_kg),
+    delivery_reliability:round3(r.delivery_reliability),
+    prior_max_qty:round3(r.prior_max_qty),
+    prior_min_qty:round3(r.prior_min_qty),
+    prior_avg_qty:round3(r.prior_avg_qty),
+    quantity:r.stock_quantity==null?null:round3(r.stock_quantity)
+  }));
+}
+app.get('/internal/buyer-profile',async(req,res)=>{
+  await pool.query(portalSchema);
+  const user=String(req.query.user_id||'demo-buyer');
+  const row=(await pool.query(`
+    SELECT
+      COALESCE(MAX(total_eur), 0)::double precision AS max_total,
+      COALESCE(MIN(total_eur) FILTER (WHERE total_eur > 0), 0)::double precision AS min_total
+    FROM (
+      SELECT (total_cents / 100.0) AS total_eur FROM orders WHERE user_id=$1 AND status='APPROVED'
+      UNION ALL
+      SELECT COALESCE((body->>'total')::numeric, 0) AS total_eur FROM portal_orders WHERE user_id=$1 AND body->>'status'='APPROVED'
+    ) t`,[user])).rows[0];
+  const maxOrderTotal=round3(row?.max_total||0);
+  const minOrderTotal=round3(row?.min_total||0);
+  res.json({maxOrderTotal,minOrderTotal,spendCap:round3(Math.max(200,maxOrderTotal*1.5))});
+});
+app.get('/internal/catalog-overview',async(req,res)=>{
+  await pool.query(portalSchema);
+  const q=String(req.query.q||'').trim();
+  if(!q)return res.json({mocked:client.mock,products:[]});
+  const products=await rankedSearch(q,String(req.query.user_id||'demo-buyer'),8);
+  res.json({mocked:client.mock,products});
 });
 app.post('/internal/suggestions',async(req,res)=>{
  const terms=searchTokens(String(req.body.q||'')).slice(0,20);
  if(!terms.length)return res.json([]);
  const patterns=terms.map(t=>'%'+t.slice(0,Math.max(3,t.length-2))+'%');
- const products=(await pool.query('SELECT * FROM products WHERE NOT deleted AND search_text ILIKE ANY($1::text[]) ORDER BY id LIMIT 500',[patterns])).rows;
+ const products=(await pool.query('SELECT id,name,search_text,category,sales_unit,allowed_lot_size,ROUND(carbon_kg_co2_per_kg,3) AS carbon_kg_co2_per_kg,ROUND(delivery_reliability,3) AS delivery_reliability,raw->\'units\' AS units FROM products WHERE NOT deleted AND search_text ILIKE ANY($1::text[]) ORDER BY delivery_reliability DESC NULLS LAST, id LIMIT 500',[patterns])).rows;
  res.json(closestProducts(req.body.q,products));
 });
 app.post('/internal/search',async(req,res)=>{
+ await pool.query(portalSchema);
  const q=String(req.body.q||'').trim(); if(!q) throw Error('Search required');
- res.json((await pool.query('SELECT * FROM products WHERE NOT deleted AND (id=$1 OR position(lower($1) in search_text)>0) ORDER BY id LIMIT 30',[q])).rows);
+ res.json(await rankedSearch(q,String(req.body.user_id||'demo-buyer'),15));
 });
 app.post('/internal/save',async(req,res)=>{
+ await pool.query(portalSchema);
  const o=req.body; await pool.query(`INSERT INTO portal_orders VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET body=EXCLUDED.body WHERE portal_orders.user_id=EXCLUDED.user_id AND portal_orders.body->>'status'='PENDING_APPROVAL'`,[o.id,o.user_id,o]);res.json(o);
 });
-app.get('/internal/orders',async(req,res)=>res.json((await pool.query('SELECT body FROM portal_orders WHERE user_id=$1',[req.query.user_id])).rows.map(r=>r.body)));
+app.get('/internal/orders',async(req,res)=>{
+ await pool.query(portalSchema);
+ res.json((await pool.query('SELECT body FROM portal_orders WHERE user_id=$1 ORDER BY (body->>\'created_at\') DESC NULLS LAST',[req.query.user_id])).rows.map(r=>r.body));
+});
 app.post('/internal/decision',async(req,res)=>res.json(await transaction(async db=>{
- const {id,user_id,action}=req.body;
+ await db.query(portalSchema);
+ const {id,user_id,action,human=false}=req.body;
  const row=(await db.query('SELECT body FROM portal_orders WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,user_id])).rows[0];
  if(!row) throw Error('Order not found'); const o=row.body;
  if(o.status!=='PENDING_APPROVAL') return o;
  if(action==='reject') o.status='REJECTED';
  else {
- if(o.incomplete) throw Error('Resolve substitutions or explicitly accept the available partial quantities first');
- if(!client.mock) throw Error('Live checkout is not provided by the Valio contract');
- for(const item of [...o.items].sort((a,b)=>a.productId.localeCompare(b.productId))){
- const r=await db.query('UPDATE inventory SET quantity=quantity-$2 WHERE product_id=$1 AND quantity>=$2',[item.productId,item.quantity]);if(!r.rowCount) throw Error('Stock changed; submit a fresh request');
+  if(o.incomplete) throw Error('Resolve substitutions or explicitly accept the available partial quantities first');
+  for(const item of [...o.items].sort((a,b)=>a.productId.localeCompare(b.productId))){
+   const r=await db.query('UPDATE inventory SET quantity=quantity-$2 WHERE product_id=$1 AND quantity>=$2',[item.productId,item.quantity]);
+   if(!r.rowCount&&client.mock) throw Error(`Insufficient stock for ${item.name||item.productId}`);
+  }
+  o.status='APPROVED';
+  if(human) o.human_approved=true;
  }
- o.status='APPROVED';
- }
- o.steps.push(o.status==='APPROVED'?'Purchase completed · inventory updated':'Order rejected');
+ o.steps.push(o.status==='APPROVED'?'Order approved · inventory updated':'Order rejected');
  await db.query('UPDATE portal_orders SET body=$2 WHERE id=$1',[id,o]);return o;
 })));
 app.use((e,req,res,next)=>res.status(422).json(req.path.startsWith('/api/')?{detail:[{loc:['body'],msg:e.message,type:'value_error'}]}:{error:e.message}));

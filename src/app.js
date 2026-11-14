@@ -2,7 +2,7 @@ import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { z, ZodError } from 'zod';
 import { pool } from './db.js';
-import { id, selectedRequest, orderRequest, assert } from './contracts.js';
+import { id, selectedRequest, orderRequest, assert, round3 } from './contracts.js';
 import { ValioClient } from './valio.js';
 import { createOrder, decideOrder, excludeOrderFromBaseline, setOrderRoutine, answerMandateQuestion } from './orders.js';
 const columns = 'id,name,category,country_of_origin,sales_unit,allowed_lot_size,carbon_kg_co2_per_kg,delivery_reliability';
@@ -38,16 +38,72 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
       max_carbon: z.coerce.number().min(0).optional(), limit: z.coerce.number().int().min(1).max(50).default(10)
     }).strict().parse(req.query);
     assert(q.q || q.product_id || q.category, 422, 'Provide q, product_id, or category to narrow the catalog');
-    const values = [], where = ['NOT deleted'];
+    const policy = (await pool.query('SELECT excluded_allergens FROM buyer_risk_policies WHERE user_id=$1', [req.user])).rows[0];
+    const excludedAllergens = policy?.excluded_allergens || [];
+    const values = [req.user, excludedAllergens], where = ['NOT p.deleted'];
     const filter = (sql,value) => { values.push(value); where.push(sql.replace('?', `$${values.length}`)); };
-    if (q.q) filter('position(? in search_text)>0', q.q.toLowerCase());
-    if (q.product_id) filter('id=?',q.product_id);
-    if (q.category) filter('category=?',q.category);
-    if (q.country) filter('country_of_origin=?',q.country);
-    if (q.min_reliability !== undefined) filter('delivery_reliability>=?',q.min_reliability);
-    if (q.max_carbon !== undefined) filter('carbon_kg_co2_per_kg<=?',q.max_carbon);
+    if (q.q) filter('position(? in p.search_text)>0', q.q.toLowerCase());
+    if (q.product_id) filter('p.id=?',q.product_id);
+    if (q.category) filter('p.category=?',q.category);
+    if (q.country) filter('p.country_of_origin=?',q.country);
+    if (q.min_reliability !== undefined) filter('p.delivery_reliability>=?',q.min_reliability);
+    if (q.max_carbon !== undefined) filter('p.carbon_kg_co2_per_kg<=?',q.max_carbon);
+    let matchExpr = '0';
+    if (q.q) {
+      const lower = q.q.toLowerCase();
+      const wordRegex = `\\m${lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\M`;
+      values.push(lower, wordRegex);
+      const iExact = values.length - 1, iWord = values.length;
+      matchExpr = `CASE
+        WHEN lower(p.name) = $${iExact} OR EXISTS (
+          SELECT 1 FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'names', '[]'::jsonb)) n
+          WHERE lower(n->>'value') = $${iExact}
+        ) THEN 4
+        WHEN starts_with(lower(p.name), $${iExact}) THEN 3
+        WHEN p.search_text ~ $${iWord} THEN 2
+        WHEN position($${iExact} in lower(p.name)) > 0 THEN 1
+        ELSE 0 END`;
+    }
     values.push(q.limit);
-    const products = (await pool.query(`SELECT ${columns},raw->'units' AS units FROM products WHERE ${where.join(' AND ')} ORDER BY id LIMIT $${values.length}`,values)).rows;
+    const limitParam = `$${values.length}`;
+    const products = (await pool.query(`
+      WITH history AS (
+        SELECT item->>'productId' AS product_id,
+          COUNT(*)::int AS bought_count,
+          COUNT(*) FILTER (
+            WHERE o.flag_reason IS NOT NULL
+              OR EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.status = 'PENDING_APPROVAL')
+          )::int AS human_approved_count
+        FROM orders o, jsonb_array_elements(o.items) item
+        WHERE o.user_id = $1 AND o.status = 'APPROVED'
+        GROUP BY item->>'productId'
+      ),
+      scored AS (
+        SELECT p.id, p.name, p.category, p.country_of_origin, p.sales_unit, p.allowed_lot_size,
+          ROUND(p.carbon_kg_co2_per_kg, 3) AS carbon_kg_co2_per_kg, ROUND(p.delivery_reliability, 3) AS delivery_reliability, p.raw->'units' AS units,
+          ${matchExpr} AS match_rank,
+          COALESCE((
+            SELECT array_agg(v->>'id')
+            FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'classifications', '[]'::jsonb)) c,
+                 jsonb_array_elements(COALESCE(c->'values', '[]'::jsonb)) v
+            WHERE c->>'name' = 'allergen' AND v->>'unit' = 'CONTAINS'
+          ), '{}'::text[]) AS allergens,
+          COALESCE(h.bought_count, 0) AS bought_count,
+          COALESCE(h.human_approved_count, 0) AS human_approved_count
+        FROM products p
+        LEFT JOIN history h ON h.product_id = p.id
+        WHERE ${where.join(' AND ')}
+      )
+      SELECT *, NOT (allergens && $2::text[]) AS allergen_safe
+      FROM scored
+      ORDER BY
+        match_rank DESC,
+        (NOT (allergens && $2::text[])) DESC,
+        human_approved_count DESC,
+        bought_count DESC,
+        delivery_reliability DESC NULLS LAST,
+        id ASC
+      LIMIT ${limitParam}`, values)).rows;
     const selectionId = randomUUID();
     const selection = (await pool.query('INSERT INTO selections(id,user_id,product_ids) VALUES ($1,$2,$3) RETURNING expires_at',
       [selectionId,req.user,products.map(p => p.id)])).rows[0];
@@ -87,9 +143,12 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
       const rawProduct = p.raw || {};
       const allergenClass = rawProduct.synkkaData?.classifications?.find(c => c.name === 'allergen');
       const allergens = (allergenClass?.values || []).filter(v => v.unit === 'CONTAINS').map(v => v.id);
-      return { ...p, productId, unit_price: priced ? unitPrice : null,
+      return { ...p, productId,
+        carbon_kg_co2_per_kg: round3(p.carbon_kg_co2_per_kg),
+        delivery_reliability: round3(p.delivery_reliability),
+        unit_price: priced ? round3(unitPrice) : null,
         logistic_model: stock.logisticModel, allergens,
-        availableAmount: line?.availableAmount ?? 0, availableDate: line?.availableDate ?? null,
+        availableAmount: round3(line?.availableAmount ?? 0), availableDate: line?.availableDate ?? null,
         orderable: Boolean(priced && stock.salesBlock === false && line && cutoffOk),
         price, availability: stock };
     });

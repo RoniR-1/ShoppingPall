@@ -5,6 +5,44 @@ describe('Gatekeeper',()=>{
  it('runtime threshold changes routing',()=>{const scorer={score:()=>({score:50,reason:'test'})};expect(route({},scorer,49).status).toBe('PENDING_APPROVAL');expect(route({},scorer,50).status).toBe('APPROVED');});
  it('shortfall always requires review',()=>expect(route({incomplete:true},{score:()=>({score:0,reason:'test'})},50).status).toBe('PENDING_APPROVAL'));
  it('demo flag is high risk',()=>expect(new SuspicionScorer().score({force_flag:true}).score).toBe(85));
+ it('auto-approves regular patterns without human interaction while flagging unfamiliar or spiked orders',()=>{
+  const regular=route({
+   lines:[{quantity:1,query:'apple'}],
+   items:[{productId:'460895',quantity:1,price:2.5,bought_count:2,human_approved_count:1,prior_max_qty:1,allergen_safe:true,reliability:1,carbon:0.165}],
+   total:2.5,
+   buyerHistory:{spendCap:200}
+  });
+  expect(regular.score).toBe(5);
+  expect(regular.status).toBe('APPROVED');
+
+  const firstTime=route({
+   lines:[{quantity:2,query:'milk'}],
+   items:[{productId:'100',quantity:2,price:3,bought_count:0,human_approved_count:0,prior_max_qty:0,allergen_safe:true,reliability:0.99,carbon:1.1}],
+   total:6,
+   buyerHistory:{spendCap:200}
+  });
+  expect(firstTime.score).toBeGreaterThan(25);
+  expect(firstTime.status).toBe('PENDING_APPROVAL');
+
+  const hugeSpike=route({
+   lines:[{quantity:20,query:'apple'}],
+   items:[{productId:'460895',quantity:20,price:25,bought_count:2,human_approved_count:1,prior_max_qty:1,prior_min_qty:1,allergen_safe:true,reliability:1,carbon:0.165}],
+   total:500,
+   buyerHistory:{spendCap:200,minOrderTotal:2.5}
+  },undefined,150);
+  expect(hugeSpike.score).toBeGreaterThan(150);
+  expect(hugeSpike.status).toBe('PENDING_APPROVAL');
+
+  const tooLittle=route({
+   lines:[{quantity:2,query:'apple'}],
+   items:[{productId:'460895',quantity:2,price:2.5,bought_count:3,human_approved_count:1,prior_max_qty:12,prior_min_qty:10,allergen_safe:true,reliability:1,carbon:0.165}],
+   total:5,
+   buyerHistory:{spendCap:200,minOrderTotal:25}
+  });
+  expect(tooLittle.score).toBeGreaterThan(25);
+  expect(tooLittle.reason).toContain('Unusually small quantity vs prior orders');
+  expect(tooLittle.status).toBe('PENDING_APPROVAL');
+ });
 });
 
 import {directLines,substitutionQuery} from '../src/web-demo/text.js';

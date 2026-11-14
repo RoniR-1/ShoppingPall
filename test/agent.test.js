@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recipeCart, ollamaJSON } from '../src/agent.js';
+import { recipeCart, ollamaJSON, rankCandidates } from '../src/agent.js';
 import { z } from 'zod';
 
 test('recipe reuses planned synonyms without an extra model call', async () => {
@@ -163,4 +163,49 @@ test('actual Ollama schema errors use the same readable validation message', asy
 test('invalid ingredient plans fail with a readable stage before searching', async () => {
   await assert.rejects(recipeCart('soup', async () => assert.fail('Must not search invalid plans'),
     async () => ({ ingredients: [] })), /Planning ingredients: Invalid model response/);
+});
+
+test('rankCandidates orders by keyword match, allergens, price, human-approved history, and stock/delivery', () => {
+  const ranked = rankCandidates([
+    { id: 'slow-stock', match_rank: 3, allergen_safe: true, unit_price: 2.0, human_approved_count: 1, bought_count: 2, in_stock: true, available_date: '2026-11-18' },
+    { id: 'fast-stock', match_rank: 3, allergen_safe: true, unit_price: 2.0, human_approved_count: 1, bought_count: 2, in_stock: true, available_date: '2026-11-16' },
+    { id: 'human-fav', match_rank: 3, allergen_safe: true, unit_price: 2.0, human_approved_count: 3, bought_count: 3, in_stock: true, available_date: '2026-11-17' },
+    { id: 'cheaper', match_rank: 3, allergen_safe: true, unit_price: 1.5, human_approved_count: 0, bought_count: 0, in_stock: true, available_date: '2026-11-18' },
+    { id: 'allergen-bad', match_rank: 3, allergen_safe: false, unit_price: 0.5, human_approved_count: 9, bought_count: 9, in_stock: true, available_date: '2026-11-16' },
+    { id: 'exact', match_rank: 4, allergen_safe: true, unit_price: 5.0, human_approved_count: 0, bought_count: 0, in_stock: false, available_date: null }
+  ]);
+  assert.deepEqual(ranked.map(p => p.id), ['exact', 'cheaper', 'human-fav', 'fast-stock', 'slow-stock', 'allergen-bad']);
+});
+
+test('recipeCart enriches and sorts candidates with live price and availability when requestedDate is set', async () => {
+  const prompts = [];
+  const replies = [{ ingredients: [{ query: 'apple' }] }, { items: [{ productId: 'cheap-fast', quantity: 1 }] }];
+  const cart = await recipeCart('2 kg apples', async (path, body) => {
+    if (path.startsWith('/catalog/search?')) {
+      return {
+        selection_id: 'sel-1',
+        products: [
+          { id: 'expensive', name: 'Apple A', match_rank: 3, allergen_safe: true },
+          { id: 'cheap-fast', name: 'Apple B', match_rank: 3, allergen_safe: true }
+        ]
+      };
+    }
+    if (path === '/api/price') {
+      assert.deepEqual(body.selection_ids, ['sel-1']);
+      return { products: [{ productId: 'expensive', error: false, priceWithTax: { value: 5.0 } }, { productId: 'cheap-fast', error: false, priceWithTax: { value: 2.0 } }] };
+    }
+    if (path === '/api/availability') {
+      return {
+        products: [
+          { productId: 'expensive', salesBlock: false, scheduleLines: [{ salesBlock: false, availableAmount: 10, availableDate: '2026-11-16' }] },
+          { productId: 'cheap-fast', salesBlock: false, scheduleLines: [{ salesBlock: false, availableAmount: 10, availableDate: '2026-11-16' }] }
+        ]
+      };
+    }
+    assert.fail(`Unexpected path ${path}`);
+  }, async prompt => { prompts.push(prompt); return replies.shift(); }, () => {}, { requestedDate: '2026-11-16' });
+  assert.equal(cart.items[0].productId, 'cheap-fast');
+  const cheapIndex = prompts[1].indexOf('"cheap-fast"');
+  const expensiveIndex = prompts[1].indexOf('"expensive"');
+  assert.ok(cheapIndex > 0 && cheapIndex < expensiveIndex, 'Cheaper candidate should appear before expensive candidate');
 });

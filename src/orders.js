@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { transaction } from './db.js';
-import { assert } from './contracts.js';
+import { assert, round3 } from './contracts.js';
 import { OrderScreeningService, OrderStatus } from './order-screening.js';
 const defaultScreening = new OrderScreeningService();
 export function buildOrderItems(requestItems, quote) {
@@ -41,17 +41,17 @@ export function buildOrderItems(requestItems, quote) {
 
 // Pure scoring function. History/policy are loaded at checkout so scores use committed orders only.
 export function scoreOrder(items, { policy, history, now = new Date(), evaluateElements = true }) {
-  const cartTotal = items.reduce((sum, i) => sum + i.unit_price * i.quantity, 0);
+  const cartTotal = round3(items.reduce((sum, i) => sum + i.unit_price * i.quantity, 0));
   const last10 = history.filter(o => o.routine === true && o.exclude_from_baseline !== true).slice(0, 10);
   const W10 = last10.map(o => Number(o.total_cents) / 100);
   const hardLimit = Number(policy.hard_spend_limit);
   const weeklyLimit = Number(policy.weekly_spend_limit);
   const baseline = W10.length ? Math.max(...W10) : 0.25 * hardLimit;
-  const spendCap = Math.min(hardLimit, 1.15 * baseline);
-  const penalties = { budgetOverrun: 0, quantitySpike: 0, allergenConflict: 0, weeklySpend: 0, substitution: 0, deliveryDelay: 0, newCategory: 0 };
+  const spendCap = round3(Math.min(hardLimit, 1.15 * baseline));
+  const penalties = { budgetOverrun: 0, quantitySpike: 0, quantityDrop: 0, allergenConflict: 0, weeklySpend: 0, substitution: 0, deliveryDelay: 0, newCategory: 0 };
   const discounts = { recurringStaple: 0, approvedPrecedent: 0 };
   const excludedAllergens = new Set(policy.excluded_allergens || []);
-  if (cartTotal > spendCap) penalties.budgetOverrun = 30 + 200 * ((cartTotal - spendCap) / spendCap);
+  if (cartTotal > spendCap) penalties.budgetOverrun = round3(30 + 200 * ((cartTotal - spendCap) / spendCap));
   if (history.filter(o => (now - new Date(o.created_at)) <= 7 * 86400000).reduce((s,o) => s + Number(o.total_cents)/100, 0) + cartTotal > weeklyLimit) penalties.weeklySpend = 45;
   const priorCategories = new Set(history.flatMap(o => (o.items || []).map(i => i.category)));
   for (const item of items) {
@@ -59,9 +59,11 @@ export function scoreOrder(items, { policy, history, now = new Date(), evaluateE
     const prior = last10.flatMap(o => (o.items || []).filter(i => i.productId === item.productId));
     if (prior.length) {
       const maxPrior = Math.max(...prior.map(i => Number(i.quantity)));
-      if (item.quantity > 1.2 * maxPrior) penalties.quantitySpike = Math.max(penalties.quantitySpike, 25 + 40 * (item.quantity / maxPrior - 1.2));
+      const minPrior = Math.min(...prior.map(i => Number(i.quantity)));
+      if (item.quantity > 1.2 * maxPrior) penalties.quantitySpike = round3(Math.max(penalties.quantitySpike, 25 + 40 * (item.quantity / maxPrior - 1.2)));
+      if (item.quantity < 0.5 * minPrior) penalties.quantityDrop = round3(Math.max(penalties.quantityDrop, 25 + 20 * (minPrior / Math.max(item.quantity, 0.001) - 2)));
       const count = last10.filter(o => (o.items || []).some(i => i.productId === item.productId)).length;
-      if (count >= 5 && item.quantity <= 1.2 * maxPrior) discounts.recurringStaple = Math.max(discounts.recurringStaple, 20);
+      if (count >= 5 && item.quantity <= 1.2 * maxPrior && item.quantity >= 0.5 * minPrior) discounts.recurringStaple = Math.max(discounts.recurringStaple, 20);
     }
     if (!priorCategories.has(item.category)) penalties.newCategory = Math.max(penalties.newCategory, 10);
     const substitutionPoints = item.substitutionRisk === 'unmapped' || item.substitutionRisk === 'ingredient_shift' ? 45 :
@@ -72,7 +74,7 @@ export function scoreOrder(items, { policy, history, now = new Date(), evaluateE
     if (!item.acceptedDeliveryDelay && dateDiff >= 2) penalties.deliveryDelay = Math.max(penalties.deliveryDelay, 65);
     else if (!item.acceptedDeliveryDelay && dateDiff >= 1) penalties.deliveryDelay = Math.max(penalties.deliveryDelay, 35);
   }
-  const score = Math.max(0, Object.values(penalties).reduce((a,b)=>a+b,0) - Object.values(discounts).reduce((a,b)=>a+b,0));
+  const score = round3(Math.max(0, Object.values(penalties).reduce((a,b)=>a+b,0) - Object.values(discounts).reduce((a,b)=>a+b,0)));
   const questions = buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLimit, history, last10, policy });
   const elementScores = evaluateElements ? items.map(item => {
     const element = scoreOrder([item], { policy, history, now, evaluateElements: false });
@@ -84,9 +86,10 @@ export function scoreOrder(items, { policy, history, now = new Date(), evaluateE
 }
 
 function buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLimit, history, last10, policy }) {
+  const excludedAllergens = new Set(policy.excluded_allergens || []);
   const questions = [];
   const add = (rule, productId, points, message, alternatives) => questions.push({
-    id: `${rule}:${productId || 'cart'}`, rule, product_id: productId || null, points, message, alternatives, answer: null
+    id: `${rule}:${productId || 'cart'}`, rule, product_id: productId || null, points: round3(points), message, alternatives, answer: null
   });
   if (penalties.substitution) for (const item of items.filter(i => i.substitutionRisk)) {
     const substitution = item.sub_name || 'the substitute';
@@ -103,8 +106,11 @@ function buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLi
       `${item.name || item.productId} will arrive on ${String(item.availableDate).slice(0,10)} instead of ${String(item.requestedDate).slice(0,10)}. Proceed anyway?`, ['accept_delay', 'remove_item', 'cancel']);
     const prior = last10.flatMap(o => (o.items || []).filter(i => i.productId === item.productId));
     const usualMax = prior.length ? Math.max(...prior.map(i => Number(i.quantity))) : null;
+    const usualMin = prior.length ? Math.min(...prior.map(i => Number(i.quantity))) : null;
     if (usualMax && item.quantity > 1.2 * usualMax) add('quantitySpike', item.productId, 25 + 40 * (item.quantity / usualMax - 1.2),
       `You are ordering ${item.quantity} units of ${item.name || item.productId} (usual max: ${usualMax}). Confirm this quantity?`, ['reduce_to_usual_max', 'remove_item', 'cancel']);
+    if (usualMin && item.quantity < 0.5 * usualMin) add('quantityDrop', item.productId, 25 + 20 * (usualMin / Math.max(item.quantity, 0.001) - 2),
+      `You are ordering ${item.quantity} units of ${item.name || item.productId} (usual min: ${usualMin}). Confirm this smaller quantity?`, ['increase_to_usual_min', 'remove_item', 'cancel']);
     if (!history.some(o => (o.items || []).some(prev => prev.category === item.category))) add('newCategory', item.productId, 10,
       `${item.name || item.productId} belongs to a new category (${item.category}). Approve adding it?`, ['remove_item', 'cancel']);
   }
@@ -202,6 +208,17 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
         assert(reduced > 0 && reduced < item.quantity, 409, 'No valid lower quantity is available for this lot size');
         item.quantity = reduced;
         item.line_total_cents = Math.round(Number(item.unit_price) * reduced * 100);
+      } else if (alternative === 'increase_to_usual_min') {
+        const prior = (await db.query("SELECT items FROM orders WHERE user_id=$1 AND status='APPROVED' AND routine=true AND exclude_from_baseline=false ORDER BY created_at DESC LIMIT 10", [user])).rows;
+        const quantities = prior.flatMap(o => o.items).filter(i => i.productId === question.product_id).map(i => Number(i.quantity));
+        assert(quantities.length, 409, 'No routine quantity precedent is available');
+        const item = order.items.find(i => i.productId === question.product_id);
+        const lot = Number(item.allowed_lot_size);
+        const usualMin = Math.min(...quantities);
+        const increased = Math.ceil(usualMin / lot) * lot;
+        assert(increased > item.quantity, 409, 'No valid higher quantity is available for this lot size');
+        item.quantity = increased;
+        item.line_total_cents = Math.round(Number(item.unit_price) * increased * 100);
       } else if (alternative === 'keep_original') {
         const current = order.items.find(i => i.productId === question.product_id);
         assert(current?.orig_product_id, 409, 'The original product is not available in the substitution mapping');
@@ -226,7 +243,7 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
       const risk = scoreOrder(order.items, { policy, history });
       const excluded = new Set(policy.excluded_allergens || []);
       if (order.items.some(i => (i.allergens || []).some(a => excluded.has(a)))) risk.penalties.allergenConflict = 60;
-      risk.score = Math.max(0, Object.values(risk.penalties).reduce((a,b)=>a+b,0) - Object.values(risk.discounts).reduce((a,b)=>a+b,0));
+      risk.score = round3(Math.max(0, Object.values(risk.penalties).reduce((a,b)=>a+b,0) - Object.values(risk.discounts).reduce((a,b)=>a+b,0)));
       risk.decision = risk.score < 30 && !risk.element_scores.some(e => e.score >= 30) ? 'AUTO_APPROVE' : 'REQUIRES_INTERVENTION';
       const previousAnswers = new Map((details.questions || []).filter(q => q.answer === 'yes').map(q => [q.id,q.answer]));
       risk.questions = risk.questions.map(q => ({ ...q, answer: previousAnswers.get(q.id) || null }));

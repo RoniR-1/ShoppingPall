@@ -159,12 +159,41 @@ test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
       assert.equal((await api('/orders',orderBody())).status,409);
     });
     await t.test('agent adapter searches before constructing a model-selected cart',async () => {
-      let modelCalls=0;
-      const cart=await recipeCart('salmon soup',async path => (await api(path)).body,async () => {
+      let modelCalls=0, firstId;
+      const cart=await recipeCart('salmon soup',async path => {
+        const res = (await api(path)).body;
+        firstId ??= res.products?.[0]?.id;
+        return res;
+      },async () => {
         modelCalls++;
-        return modelCalls===1 ? {ingredients:[{query:'potato'}]} : {items:[{productId:'460000',quantity:1}]};
+        return modelCalls===1 ? {ingredients:[{query:'potato'}]} : {items:[{productId:firstId,quantity:1}]};
       });
-      assert.equal(cart.items[0].productId,'460000'); assert.equal(cart.selection_ids.length,1);
+      assert.equal(cart.items[0].productId,firstId); assert.equal(cart.selection_ids.length,1);
+    });
+    await t.test('catalog search prioritizes keyword match, allergen safety, and human-approved history',async () => {
+      const rankUser = `rank-${randomUUID()}`;
+      try {
+        const initial = await api('/catalog/search?q=apple&limit=5', undefined, rankUser);
+        assert.equal(initial.status, 200);
+        assert.ok(initial.body.products.length >= 2);
+        const target = initial.body.products[initial.body.products.length - 1];
+        const qRes = await api('/quotes', { requestedDate: '2026-11-16', products: [target.id], selection_ids: [initial.body.selection_id] }, rankUser);
+        assert.equal(qRes.status, 201);
+        const lot = Number(target.allowed_lot_size);
+        const qty = Number((Math.ceil(1 / lot) * lot).toFixed(8));
+        const flagged = await api('/orders', { quote_id: qRes.body.id, items: [{ productId: target.id, quantity: qty }], force_flag: true }, rankUser);
+        assert.equal(flagged.status, 201);
+        assert.equal((await api(`/orders/${flagged.body.id}/approve`, {}, rankUser)).status, 200);
+        const afterApproval = await api('/catalog/search?q=apple&limit=5', undefined, rankUser);
+        const boosted = afterApproval.body.products.find(p => p.id === target.id);
+        assert.equal(boosted.bought_count, 1);
+        assert.equal(boosted.human_approved_count, 1);
+      } finally {
+        await pool.query('DELETE FROM order_events WHERE user_id=$1', [rankUser]);
+        await pool.query('DELETE FROM orders WHERE user_id=$1', [rankUser]);
+        await pool.query('DELETE FROM quotes WHERE user_id=$1', [rankUser]);
+        await pool.query('DELETE FROM selections WHERE user_id=$1', [rankUser]);
+      }
     });
   } finally {
     await new Promise(resolve => server.close(resolve));

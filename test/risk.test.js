@@ -34,6 +34,11 @@ test('risk scoring diagnostics', async t => {
     console.log(`[risk-debug] spike cart: quantity_spike=${spike.penalties.quantitySpike}, decision=${spike.decision}`);
     assert.ok(Math.abs(spike.penalties.quantitySpike - 29) < 1e-9);
     assert.equal(spike.decision, 'AUTO_APPROVE');
+
+    const drop = scoreOrder([{ ...baseItem, quantity: 2 }], { policy, history });
+    assert.ok(drop.penalties.quantityDrop >= 25);
+    assert.equal(drop.decision, 'REQUIRES_INTERVENTION');
+    assert.ok(drop.questions.some(q => q.rule === 'quantityDrop'));
   });
 
   await t.test('triggered risks produce deterministic questions ordered by risk points', t => {

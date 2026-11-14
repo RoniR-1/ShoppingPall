@@ -2,6 +2,7 @@ import { parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { recipeCart } from './agent.js';
+import { round3 } from './contracts.js';
 const help = `Usage:
   npm run cli -- agent --user-id CUSTOMER --preset normal-order
   npm run cli -- agent --user-id CUSTOMER --preset suspicious-order
@@ -10,12 +11,14 @@ const help = `Usage:
   npm run cli -- approve ORDER_UUID --user-id CUSTOMER
   npm run cli -- reject ORDER_UUID --user-id CUSTOMER
 Options: --date YYYY-MM-DD (default tomorrow), --force-flag, --idempotency-key KEY
-Recipe mode uses local Ollama; model-created carts always require human approval in this demo.`;
+Recipe mode uses local Ollama and is evaluated by the risk-scoring engine (pass --force-flag to force human approval).`;
 function showOrder(order) {
-  console.log(`\n${order.id}  ${order.status}  ${order.mocked ? '[MOCK PRICES/STOCK]' : '[LIVE QUOTE]'}\n${order.flag_reason || 'No demo flag'}\nDelivery: ${String(order.requested_date).slice(0,10)}`);
-  console.table(order.items.map(i => ({ product: i.productId, name: i.name, quantity: i.quantity, unit: i.sales_unit,
-    price: i.unit_price, lineTotal: i.line_total_cents / 100, 'CO2 kg/kg': i.carbon_kg_co2_per_kg ?? 'unknown',
-    reliability: i.delivery_reliability ?? 'unknown' })));
+  const risk = order.risk_score == null ? '' : `  Risk: ${round3(order.risk_score)}`;
+  console.log(`\n${order.id}  ${order.status}  ${order.mocked ? '[MOCK PRICES/STOCK]' : '[LIVE QUOTE]'}${risk}\n${order.flag_reason || 'No demo flag'}\nDelivery: ${String(order.requested_date).slice(0,10)}`);
+  console.table(order.items.map(i => ({ product: i.productId, name: i.name, quantity: round3(i.quantity), unit: i.sales_unit,
+    price: round3(i.unit_price), lineTotal: round3(i.line_total_cents / 100),
+    'CO2 kg/kg': i.carbon_kg_co2_per_kg == null ? 'unknown' : round3(i.carbon_kg_co2_per_kg),
+    reliability: i.delivery_reliability == null ? 'unknown' : round3(i.delivery_reliability) })));
   console.log(`Total including tax: ${(Number(order.total_cents) / 100).toFixed(2)} ${order.currency}`);
 }
 try {
@@ -39,6 +42,7 @@ try {
   if (command === 'agent') {
     if (Boolean(flags.preset) === Boolean(flags.recipe)) throw new Error('Choose exactly one of --preset or --recipe');
     let cart;
+    const requestedDate = flags.date || new Date(Date.now() + 86400000).toISOString().slice(0,10);
     if (flags.preset) {
       if (!['normal-order','suspicious-order'].includes(flags.preset)) throw new Error('Unknown preset');
       cart = { items: [], selection_ids: [] };
@@ -52,13 +56,12 @@ try {
       }
     } else {
       console.log('Planning recipe with local Ollama, then searching the static catalog…');
-      cart = await recipeCart(flags.recipe,api,undefined,message => console.log(message));
+      cart = await recipeCart(flags.recipe,api,undefined,message => console.log(message),{ requestedDate });
     }
-    const requestedDate = flags.date || new Date(Date.now() + 86400000).toISOString().slice(0,10);
     const quote = await api('/quotes', { requestedDate, products: cart.items.map(i => i.productId), selection_ids: cart.selection_ids });
     const key = flags['idempotency-key'] || randomUUID();
     const payload = { quote_id: quote.id, items: cart.items,
-      force_flag: Boolean(flags['force-flag'] || flags.preset === 'suspicious-order' || flags.recipe) };
+      force_flag: Boolean(flags['force-flag'] || flags.preset === 'suspicious-order') };
     // Print exact submission before sending so a network failure can be retried with the same key/body.
     console.log(`Submission: ${JSON.stringify({ idempotency_key: key, payload })}`);
     const order = await api('/orders',payload,{ 'Idempotency-Key': key });
