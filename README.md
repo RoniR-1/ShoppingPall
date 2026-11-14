@@ -110,3 +110,62 @@ npm test
 Tests use real PostgreSQL and a temporary HTTP listener with mocked Valio responses. They cover joined data, selection enforcement, user scoping, quote expiry, lot sizes, payload tampering, idempotent concurrent submission, conflicting decisions, rejection, demo bulk flags, model adapter sequencing, upstream authentication, response failures, and API limits. Tests remove only their own generated data. Live Valio and an actual Ollama inference require the external services and are not part of the automated suite.
 
 Source layout: `src/app.js` routes/search/quotes, `src/orders.js` checkout/state transitions, `src/valio.js` upstream adapter, `src/agent.js` local model adapter, `src/cli.js` agent and human interface, `scripts/seed.js` import.
+
+## Standalone procurement workflow
+
+The repository's ES-module Node stack is also used by the standalone procurement
+module in `src/procurement/`. It does not use PostgreSQL or the demo mock switch.
+Configure `VALIO_BASE_URL` and `VALIO_API_KEY`, then run:
+
+```sh
+node --env-file-if-exists=.env src/procurement/cli.js order.json
+node --test test/procurement.test.js
+```
+
+Example order.json:
+
+```json
+{
+  "customer": "customer-123",
+  "requestedDate": "2026-11-16",
+  "lines": [
+    {
+      "id": "milk",
+      "quantity": 4,
+      "salesUnit": "ST",
+      "required": { "countryOfOrigin": "fi" },
+      "preferred": { "id": "YOUR_PRODUCT_CODE" }
+    }
+  ]
+}
+```
+
+Use actual catalog sales-unit codes and quantities in those units. Constraints
+are exact catalog field equality checks (dotted paths supported); an array means
+one of the listed values. Put every mandatory requirement in `required`.
+Only `preferred` constraints may be relaxed. No package conversions or dietary
+inferences are performed. Catalog substitution rules are followed one hop from
+the original candidates and must retain all required constraints.
+
+`ProcurementClient` validates live requests and responses against root
+`openapi.json`. `Catalog` caches each downloaded dataset once per instance,
+including optional reference CSV downloads through `download(kind)`. Reference
+metrics are available to callers; they are not automatically joined as product
+constraints. Redirected downloads do not forward credentials across origins.
+
+`ProcurementSession.run(lines)` stops at the first intervention. Inspect
+`pendingIntervention`; for a no-match case, explicitly approve suggested IDs
+with `process(originalLine, { approvedProductIds: [...] })` on the same session.
+Repeat calls for completed line IDs are idempotent; changed line contents are
+rejected. Partial allocations remain in the basket when a shortfall occurs.
+The host must retain the session while awaiting approval. CLI state is printed
+as JSON, is not durable, and is not automatically resumed across processes.
+
+Allocations are internal only: they neither submit nor reserve a Valio order.
+Remaining quantities are session-local deductions from availability snapshots.
+Terminal stock is unknown and cannot be allocated under the confirmed-stock
+policy. Blocked, delayed, unit-mismatched, and expired-cutoff products are
+excluded. A cutoff without an explicit timezone is rejected conservatively.
+No automatic stock refresh is performed within a session. Selection follows
+catalog order and lot-size increments; it does not claim global cost or packing
+optimality. Availability snapshots cannot guarantee supplier stock at checkout.
