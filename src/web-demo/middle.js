@@ -120,20 +120,25 @@ function snapToLot(qty,lot){
   return round3(steps*validLot);
 }
 
-async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={},actionId=null){
+async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={},actionId=null,meta={}){
   if(typeof pinned==='string'){actionId=pinned;pinned={};}
+  const parserModel=process.env.LUNA_API_KEY?(process.env.LUNA_MODEL||'gemini-2.5-flash'):'local-rule-parser';
   const o={
     id:actionId||randomUUID(),
     context,
     agent_type:context?.agent?.type||'custom',
     user_id:user,
     created_at:new Date().toISOString(),
+    raw_prompt:meta.rawPrompt||lines.map(l=>l.requested||`${l.quantity} ${l.query}`).join(', '),
+    parser_model:parserModel,
     lines,
     force_flag,
     demo_unavailable,
     approved,
     items:[],
     issues:[],
+    line_traces:[],
+    audit_trail:Array.isArray(meta.auditTrail)?[...meta.auditTrail]:[],
     steps:['Parsed request with Gemini'],
     incomplete:false,
     status:'PENDING_APPROVAL'
@@ -146,9 +151,10 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     const line=lines[index];
     const queries=[normalizeQuery(line.query),...(line.alternatives||[]).map(normalizeQuery)].filter(Boolean);
     let candidates=[];
+    let matchedQuery=queries[0]||line.query;
     for(const q of [...new Set(queries)]){
       candidates=await core('/internal/search',{q,user_id:user});
-      if(candidates.length)break;
+      if(candidates.length){matchedQuery=q;break;}
     }
     let suggested=false;
     const chosenId=approved[index]||pinned[index];
@@ -176,7 +182,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       suggested=false;
     }
     if(!candidates.length){
-      lineOptions.push({index,line,suggested,options:[]});
+      lineOptions.push({index,line,matchedQuery,suggested,options:[]});
       continue;
     }
     const ids=candidates.map(p=>p.id);
@@ -209,7 +215,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       };
     });
     const ranked=rankCandidates(enriched);
-    lineOptions.push({index,line,suggested,options:ranked});
+    lineOptions.push({index,line,matchedQuery,suggested,options:ranked});
   }
 
   let aiSelections=new Map();
@@ -257,8 +263,22 @@ Rules:
     }
   }
 
-  for(const {index,line,suggested,options} of lineOptions){
+  for(const {index,line,matchedQuery,suggested,options} of lineOptions){
     if(!options.length){
+      o.line_traces.push({
+        lineIndex:index,
+        requested:line.requested||`${line.quantity} × ${line.query}`,
+        query:line.query,
+        alternatives:line.alternatives||[],
+        matchedQuery:matchedQuery||line.query,
+        totalCandidates:0,
+        selectionMode:'no-match',
+        selectedProductId:null,
+        selectedName:null,
+        selectedQty:round3(line.quantity),
+        selectedUnit:null,
+        topCandidates:[]
+      });
       o.issues.push({index,reason:'No catalog match',shortfall:round3(line.quantity),options:[]});
       continue;
     }
@@ -272,6 +292,42 @@ Rules:
     const targetQty=aiPick&&orderedOptions[0]?.productId===aiPick.productId
       ?snapToLot(aiPick.quantity,orderedOptions[0].lot)
       :snapToLot(line.quantity,orderedOptions[0].lot);
+
+    o.line_traces.push({
+      lineIndex:index,
+      requested:line.requested||`${line.quantity} × ${line.query}`,
+      query:line.query,
+      alternatives:line.alternatives||[],
+      matchedQuery:matchedQuery||line.query,
+      totalCandidates:options.length,
+      selectionMode:approved[index]
+        ?'human-substitution'
+        :pinned[index]
+          ?'human-pinned'
+          :(aiPick&&orderedOptions[0]?.productId===aiPick.productId)
+            ?'gemini-selection'
+            :suggested
+              ?'fallback-suggestions'
+              :'top-ranked',
+      selectedProductId:orderedOptions[0]?.productId||null,
+      selectedName:orderedOptions[0]?.name||null,
+      selectedQty:targetQty,
+      selectedUnit:orderedOptions[0]?.unit||null,
+      topCandidates:orderedOptions.slice(0,3).map(c=>({
+        productId:c.productId,
+        name:c.name,
+        unit:c.unit,
+        lot:c.lot,
+        price:c.price,
+        available:c.available,
+        allergen_safe:c.allergen_safe!==false,
+        bought_count:c.bought_count||0,
+        human_approved_count:c.human_approved_count||0,
+        reliability:c.reliability,
+        carbon:c.carbon,
+        match_rank:c.match_rank??null
+      }))
+    });
 
     let remaining=targetQty;
     if(!suggested){
@@ -343,12 +399,18 @@ Rules:
   const buyerHistory=await core('/internal/buyer-profile?user_id='+encodeURIComponent(user));
   const buyerCfg=await core('/internal/buyer-config?user_id='+encodeURIComponent(user));
   const threshold=round3(buyerCfg.threshold);
+  o.buyer_baseline=buyerHistory;
   Object.assign(o,route({...o,buyerHistory},undefined,threshold));
   o.score=round3(o.score);
   o.steps.push(`Risk score: ${o.score} / ${threshold} (${o.reason})`);
 
   const auto=o.status==='APPROVED';
   o.status='PENDING_APPROVAL';
+  if(auto){
+    o.audit_trail.push({at:new Date().toISOString(),actor:'gatekeeper',text:`Auto-approved: risk score ${o.score} is within buyer "${user}" threshold of ${threshold}.`});
+  }else{
+    o.audit_trail.push({at:new Date().toISOString(),actor:'gatekeeper',text:`Queued for human review: risk score ${o.score} exceeds threshold ${threshold} (${o.reason}).`});
+  }
   await core('/internal/save',o);
   if(auto)return core('/internal/decision',{id:o.id,user_id:user,action:'approve',human:false});
   o.steps.push('Paused for human approval');
@@ -431,7 +493,7 @@ app.post('/portal/requests',async(req,res)=>{
     demo_unavailable:z.boolean().default(false)
   }).passthrough().parse(req.body);
   const lines=await parseRequestLines(b.text);
-  res.json(await plan(lines,b.user_id,b.force_flag,{},b.demo_unavailable));
+  res.json(await plan(lines,b.user_id,b.force_flag,{},b.demo_unavailable,null,{},null,{rawPrompt:b.text}));
 });
 app.post('/portal/orders/:id/:action',async(req,res)=>{
   const {user_id,choices,quantities,removeLines,acceptPartial}=z.object({
@@ -447,6 +509,9 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
   if(!['approve','reject','substitute'].includes(req.params.action))throw Error('Invalid action');
   if(o.status!=='PENDING_APPROVAL')throw Error('Order has already been decided');
 
+  const priorTrail=Array.isArray(o.audit_trail)?[...o.audit_trail]:[];
+  const nowIso=()=>new Date().toISOString();
+
   const hasLineEdits=Object.keys(choices).length>0||Object.keys(quantities).length>0||removeLines.length>0;
   if((req.params.action==='approve'||req.params.action==='substitute')&&hasLineEdits){
     const removeSet=new Set(removeLines);
@@ -454,18 +519,22 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
     const nextApproved={};
     const nextPinned={};
     (o.lines||[]).forEach((line,oldIdx)=>{
-      if(removeSet.has(oldIdx))return;
+      const existingItem=(o.items||[]).find(i=>i.lineIndex===oldIdx);
+      if(removeSet.has(oldIdx)){
+        priorTrail.push({at:nowIso(),actor:user_id,text:`Removed item "${existingItem?.name||line.query}" from the order.`});
+        return;
+      }
       const newIdx=nextLines.length;
       const updatedLine={...line};
       if(quantities[oldIdx]!==undefined){
         const newQty=round3(quantities[oldIdx]);
+        priorTrail.push({at:nowIso(),actor:user_id,text:`Adjusted quantity for "${existingItem?.name||line.query}" from ${existingItem?.quantity??line.quantity} to ${newQty}.`});
         updatedLine.quantity=newQty;
         updatedLine.manualQuantity=true;
         updatedLine.requested=`${newQty} × ${line.query}`;
       }
-      const existingItem=(o.items||[]).find(i=>i.lineIndex===oldIdx);
       if(choices[oldIdx]){
-        // Buyer manually selected this product from the review UI; pin it without re-flagging it as an unexpected swap.
+        priorTrail.push({at:nowIso(),actor:user_id,text:`Swapped item "${existingItem?.name||line.query}" to product #${choices[oldIdx]}.`});
         nextPinned[newIdx]=choices[oldIdx];
       }else if(o.approved?.[oldIdx]){
         nextApproved[newIdx]=o.approved[oldIdx];
@@ -476,14 +545,23 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
     });
 
     if(!nextLines.length){
+      o.audit_trail=[...priorTrail,{at:nowIso(),actor:user_id,text:'All items removed — order cancelled.'}];
+      await core('/internal/save',o);
       return res.json(await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true}));
     }
 
     const keepForceFlag=req.params.action==='substitute'?Boolean(o.force_flag):false;
-    const replacement=await plan(nextLines,user_id,keepForceFlag,nextApproved,o.demo_unavailable,o.context||null,nextPinned);
+    const replacement=await plan(nextLines,user_id,keepForceFlag,nextApproved,o.demo_unavailable,o.context||null,nextPinned,null,{
+      rawPrompt:o.raw_prompt,
+      auditTrail:priorTrail
+    });
+    o.superseded_by=replacement.id;
+    await core('/internal/save',o);
     await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
     const safeToAutoFinalize=req.params.action==='approve'&&!replacement.incomplete&&replacement.items.every(i=>i.allergen_safe!==false);
     if(safeToAutoFinalize&&replacement.status!=='APPROVED'){
+      replacement.audit_trail=[...(replacement.audit_trail||[]),{at:nowIso(),actor:user_id,text:`Approved order after applying substitution.`}];
+      await core('/internal/save',replacement);
       return res.json(await core('/internal/decision',{id:replacement.id,user_id,action:'approve',human:true}));
     }
     return res.json(replacement);
@@ -492,8 +570,15 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
     if(!acceptPartial||!o.items.length)throw Error('Select substitutions or accept the available partial order');
     o.incomplete=false;
     o.steps.push('Human accepted partial quantities');
-    await core('/internal/save',o);
+    priorTrail.push({at:nowIso(),actor:user_id,text:'Accepted available partial quantities.'});
   }
+  priorTrail.push({
+    at:nowIso(),
+    actor:user_id,
+    text:req.params.action==='approve'?`Approved order (${o.items?.length||0} item${(o.items?.length||0)===1?'':'s'}, €${Number(o.total||0).toFixed(2)}).`:'Cancelled/rejected order.'
+  });
+  o.audit_trail=priorTrail;
+  await core('/internal/save',o);
   res.json(await core('/internal/decision',{id:o.id,user_id,action:req.params.action,human:true}));
 });
 app.use((e,_req,res,_next)=>{

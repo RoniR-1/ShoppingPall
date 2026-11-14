@@ -470,6 +470,83 @@ button:disabled {
   margin-bottom: 0;
 }
 
+.order-card.is-inspected {
+  border-color: var(--border-strong);
+  box-shadow: inset 3px 0 0 var(--border-strong);
+}
+
+.order-head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.llm-trace-report {
+  font-size: 11.5px;
+  line-height: 1.42;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.llm-trace-report p {
+  margin: 0;
+}
+
+.trace-prose-list,
+.trace-checks-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.trace-checks-list {
+  list-style: none;
+  padding-left: 2px;
+  gap: 2px;
+}
+
+.trace-check {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 1px 5px;
+}
+
+.trace-check.pass {
+  color: var(--approve-text);
+  background: rgb(225 236 217 / 50%);
+}
+
+.trace-check.flag {
+  color: var(--warn-text);
+  background: rgb(247 228 182 / 65%);
+  font-weight: 500;
+}
+
+.trace-cand.is-winner {
+  background: var(--surface-alt);
+  padding: 0 4px;
+  border: 1px solid var(--border);
+}
+
+.trace-conclusion {
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+.trace-audit {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  padding: 4px 7px;
+}
+
 .order-head {
   display: flex;
   justify-content: space-between;
