@@ -3,6 +3,31 @@ import { transaction } from './db.js';
 import { assert, round3 } from './contracts.js';
 import { OrderScreeningService, OrderStatus } from './order-screening.js';
 const defaultScreening = new OrderScreeningService();
+function assertCutoffs(items) {
+  for (const item of items) {
+    const cutoff = item.availability?.closingTime;
+    assert(cutoff == null || (typeof cutoff === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/i.test(cutoff) && Number.isFinite(Date.parse(cutoff)) && Date.parse(cutoff) > Date.now()),
+      409, `Order cutoff passed or is ambiguous for ${item.productId}; reject and request a new quote`);
+  }
+}
+async function lockBuyer(db, user) {
+  await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [user]);
+}
+async function assertSubstitutionPolicy(db, user, items) {
+  const policy = (await db.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1', [user])).rows[0] ||
+    { hard_spend_limit:1000, weekly_spend_limit:5000, blocked_categories:[], excluded_allergens:[] };
+  for (const item of items) assert(!(policy.blocked_categories || []).includes(item.category), 422, `Category ${item.category} is blocked for this buyer`);
+  if (!items.some(i => i.orig_product_id)) return;
+  const excluded = new Set(policy.excluded_allergens || []);
+  for (const item of items) {
+    assert(!(policy.blocked_categories || []).includes(item.category), 422, `Category ${item.category} is blocked for this buyer`);
+    assert(!(item.allergens || []).some(a => excluded.has(a)), 422, `Product ${item.productId} conflicts with an excluded allergen`);
+  }
+  const total = items.reduce((sum, item) => sum + Number(item.line_total_cents), 0);
+  assert(total <= Number(policy.hard_spend_limit) * 100, 422, 'Substitution exceeds the buyer hard spend limit');
+  const weekly = (await db.query("SELECT COALESCE(SUM(total_cents),0) AS total FROM orders WHERE user_id=$1 AND status='APPROVED' AND created_at >= now()-interval '7 days'", [user])).rows[0];
+  assert(total + Number(weekly.total) <= Number(policy.weekly_spend_limit) * 100, 422, 'Substitution exceeds the buyer weekly spend limit');
+}
 export function buildOrderItems(requestItems, quote) {
   return requestItems.map(item => {
     const p = quote.items.find(p => p.productId === item.productId);
@@ -30,7 +55,7 @@ export function buildOrderItems(requestItems, quote) {
         changed(originalRaw.unitConversions, substituteRaw.unitConversions);
       const nutritionShift = changed(originalRaw.nutritionalContent, substituteRaw.nutritionalContent);
       const substitutionRisk = !mapped ? 'unmapped' : ingredientShift ? 'ingredient_shift' :
-        packShift || nutritionShift ? 'mapped_pack_or_nutrition_shift' : null;
+        packShift || nutritionShift ? 'mapped_pack_or_nutrition_shift' : 'mapped';
       substitution = { substitutionRisk, orig_product_id: original.productId, orig_name: original.name,
         orig_available: Boolean(original.orderable && original.availableAmount >= item.quantity),
         sub_name: p.name, substitution_mapped: mapped };
@@ -67,7 +92,7 @@ export function scoreOrder(items, { policy, history, now = new Date(), evaluateE
     }
     if (!priorCategories.has(item.category)) penalties.newCategory = Math.max(penalties.newCategory, 10);
     const substitutionPoints = item.substitutionRisk === 'unmapped' || item.substitutionRisk === 'ingredient_shift' ? 45 :
-      item.substitutionRisk === 'mapped_pack_or_nutrition_shift' ? 30 : 0;
+      item.substitutionRisk === 'mapped_pack_or_nutrition_shift' || item.substitutionRisk === 'mapped' ? 30 : 0;
     penalties.substitution = Math.max(penalties.substitution, substitutionPoints);
     if (item.approvedPrecedent === true) discounts.approvedPrecedent = Math.max(discounts.approvedPrecedent, 20);
     const availDay = String(item.availableDate || '').slice(0, 10);
@@ -96,7 +121,7 @@ function buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLi
   if (penalties.substitution) for (const item of items.filter(i => i.substitutionRisk)) {
     const substitution = item.sub_name || 'the substitute';
     const original = item.orig_name || item.name || item.productId;
-    add('substitution', item.productId, item.substitutionRisk === 'mapped_pack_or_nutrition_shift' ? 30 : 45,
+    add('substitution', item.productId, item.substitutionRisk === 'mapped_pack_or_nutrition_shift' || item.substitutionRisk === 'mapped' ? 30 : 45,
       `Are you alright with ${substitution} instead of ${original}?`, item.orig_product_id && item.orig_available ? ['keep_original', 'cancel'] : ['cancel']);
   }
   if (penalties.allergenConflict) for (const item of items) for (const allergen of (item.allergens || []).filter(a => excludedAllergens.has(a))) {
@@ -128,6 +153,7 @@ export async function createOrder(user, key, input, screening = defaultScreening
   const request = { ...input, items: [...input.items].sort((a, b) => a.productId.localeCompare(b.productId)) };
   const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
   return transaction(async db => {
+    await lockBuyer(db, user);
     // Serialize retries for the same customer/key, including simultaneous first submissions.
     await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify([user, key])]);
     const existing = (await db.query('SELECT * FROM orders WHERE user_id=$1 AND idempotency_key=$2', [user, key])).rows[0];
@@ -136,15 +162,21 @@ export async function createOrder(user, key, input, screening = defaultScreening
     assert(quote, 409, 'Quote missing, expired, or belongs to another user');
     assert(!(await db.query('SELECT 1 FROM quote_locks WHERE quote_id=$1', [quote.id])).rowCount, 409, 'Quote is locked by another pending mandate');
     const items = buildOrderItems(request.items, quote);
+    assertCutoffs(items);
     const total = items.reduce((sum, i) => sum + i.line_total_cents, 0);
     assert(Number.isSafeInteger(total), 422, 'Order total too large');
+    await assertSubstitutionPolicy(db, user, items);
     const policy = (await db.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1', [user])).rows[0] ||
       { hard_spend_limit: 1000, weekly_spend_limit: 5000, blocked_categories: [], excluded_allergens: [] };
     const history = (await db.query("SELECT items,total_cents,created_at,routine,exclude_from_baseline FROM orders WHERE user_id=$1 AND status='APPROVED' ORDER BY created_at DESC", [user])).rows;
     for (const item of items) assert(!policy.blocked_categories.includes(item.category), 422, `Category ${item.category} is blocked for this buyer`);
     const scoredItems = items.map(i => ({ ...i, requestedDate: quote.requested_date }));
     const risk = scoreOrder(scoredItems, { policy, history });
-    const reason = input.force_flag ? 'Demo: force_flag requested' : risk.decision === 'REQUIRES_INTERVENTION' ? `Risk score ${risk.score.toFixed(2)} requires human sign-off` : null;
+    let screeningResult;
+    try { screeningResult = screening.evaluate({ user, items: scoredItems, total_cents: total, quote_id: quote.id }); }
+    catch (error) { assert(false, 503, `Order screening failed; retry after the screening service is fixed: ${error.message}`); }
+    assert(screeningResult && [OrderStatus.APPROVED, OrderStatus.PENDING_REVIEW].includes(screeningResult.status), 503, 'Order screening returned an invalid decision');
+    const reason = input.force_flag ? 'Demo: force_flag requested' : items.some(i => i.orig_product_id) ? 'Substitution requires human sign-off' : risk.questions.some(q => q.rule === 'deliveryDelay') ? 'Delivery delay requires human sign-off' : screeningResult.status === OrderStatus.PENDING_REVIEW ? 'Order screening requires human sign-off' : risk.decision === 'REQUIRES_INTERVENTION' ? `Risk score ${risk.score.toFixed(2)} requires human sign-off` : null;
     const status = reason ? 'PENDING_APPROVAL' : 'APPROVED';
     const routine = status === 'APPROVED' && !input.force_flag && risk.decision === 'AUTO_APPROVE';
     const result = (await db.query(`INSERT INTO orders (id,user_id,quote_id,idempotency_key,request_hash,status,flag_reason,items,currency,total_cents,mocked,requested_date,risk_score,risk_details,routine,decided_at)
@@ -173,6 +205,7 @@ export async function setOrderRoutine(user, orderId, routine) {
 }
 export async function answerMandateQuestion(user, orderId, { questionId, answer, alternative }) {
   return transaction(async db => {
+    await lockBuyer(db, user);
     const order = (await db.query('SELECT * FROM orders WHERE id=$1 AND user_id=$2 FOR UPDATE', [orderId,user])).rows[0];
     assert(order, 404, 'Order not found');
     assert(order.status === 'PENDING_APPROVAL', 409, 'Order is no longer awaiting a mandate decision');
@@ -221,6 +254,7 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
         const usualMin = Math.min(...quantities);
         const increased = Math.ceil(usualMin / lot) * lot;
         assert(increased > item.quantity, 409, 'No valid higher quantity is available for this lot size');
+        assert(item.orderable && Number(item.availableAmount) >= increased, 409, 'Quoted stock cannot cover the increased quantity; reject and request a new quote');
         item.quantity = increased;
         item.line_total_cents = Math.round(Number(item.unit_price) * increased * 100);
       } else if (alternative === 'keep_original') {
@@ -231,6 +265,9 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
         const quoteItems = typeof quote.items === 'string' ? JSON.parse(quote.items) : quote.items;
         const original = quoteItems.find(i => i.productId === current.orig_product_id);
         assert(original?.orderable && original.availableAmount >= current.quantity, 409, 'The original product is not available in this quote');
+        const currentPolicy = (await db.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1', [user])).rows[0];
+        assert(!(currentPolicy?.blocked_categories || []).includes(original.category), 409, 'The original product category is blocked');
+        assert(!(original.allergens || []).some(a => (currentPolicy?.excluded_allergens || []).includes(a)), 409, 'The original product conflicts with an excluded allergen');
         const lot = Number(original.allowed_lot_size);
         assert(Math.abs(current.quantity / lot - Math.round(current.quantity / lot)) < 1e-7, 409, 'The original product does not support this quantity');
         const restored = { ...original, quantity: current.quantity,
@@ -244,19 +281,28 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
       const totalCents = order.items.reduce((sum,i) => sum + Number(i.line_total_cents),0);
       const policy = (await db.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1', [user])).rows[0] ||
         { hard_spend_limit: 1000, weekly_spend_limit: 5000, blocked_categories: [], excluded_allergens: [] };
+      for (const item of order.items) assert(!(policy.blocked_categories || []).includes(item.category), 409, `Category ${item.category} is blocked for this buyer; remove it or reject the order`);
       const history = (await db.query("SELECT items,total_cents,created_at,routine,exclude_from_baseline FROM orders WHERE user_id=$1 AND status='APPROVED' ORDER BY created_at DESC", [user])).rows;
       const risk = scoreOrder(order.items, { policy, history });
       const excluded = new Set(policy.excluded_allergens || []);
       if (order.items.some(i => (i.allergens || []).some(a => excluded.has(a)))) risk.penalties.allergenConflict = 60;
       risk.score = round3(Math.max(0, Object.values(risk.penalties).reduce((a,b)=>a+b,0) - Object.values(risk.discounts).reduce((a,b)=>a+b,0)));
       risk.decision = risk.score < 30 && !risk.element_scores.some(e => e.score >= 30) ? 'AUTO_APPROVE' : 'REQUIRES_INTERVENTION';
-      const previousAnswers = new Map((details.questions || []).filter(q => q.answer === 'yes').map(q => [q.id,q.answer]));
-      risk.questions = risk.questions.map(q => ({ ...q, answer: previousAnswers.get(q.id) || null }));
+      const previousAnswers = new Map((details.questions || []).filter(q => q.answer === 'yes').map(q => [q.id,q]));
+      risk.questions = risk.questions.map(q => {
+        const previous = previousAnswers.get(q.id);
+        const unchanged = previous && previous.message === q.message && previous.points === q.points && JSON.stringify(previous.alternatives) === JSON.stringify(q.alternatives);
+        return { ...q, answer: unchanged ? 'yes' : null };
+      });
       details = risk;
       const allAnswered = details.questions.every(q => q.answer !== null);
-      const status = risk.decision === 'AUTO_APPROVE' || allAnswered ? 'APPROVED' : 'PENDING_APPROVAL';
-      if (status === 'APPROVED') assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount,
-        409, 'Quote expired; reject this order and submit a new quote');
+      const status = allAnswered ? 'APPROVED' : 'PENDING_APPROVAL';
+      if (status === 'APPROVED') {
+        assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount,
+          409, 'Quote expired; reject this order and submit a new quote');
+        assertCutoffs(order.items);
+        await assertSubstitutionPolicy(db, user, order.items);
+      }
       const updated = (await db.query('UPDATE orders SET items=$1,total_cents=$2,status=$3,decided_at=CASE WHEN $3=\'APPROVED\' THEN now() ELSE NULL END,routine=CASE WHEN $3=\'APPROVED\' THEN true ELSE routine END,risk_details=$4,risk_score=$5 WHERE id=$6 RETURNING *',
         [JSON.stringify(order.items),totalCents,status,JSON.stringify(details),risk.score,orderId])).rows[0];
       if (status === 'APPROVED') await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,status]);
@@ -265,8 +311,12 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
     }
     const allAnswered = details.questions.every(q => q.answer !== null);
     const status = allAnswered ? 'APPROVED' : 'PENDING_APPROVAL';
-    if (status === 'APPROVED') assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount,
-      409, 'Quote expired; reject this order and submit a new quote');
+    if (status === 'APPROVED') {
+      assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount,
+        409, 'Quote expired; reject this order and submit a new quote');
+      assertCutoffs(order.items);
+      await assertSubstitutionPolicy(db, user, order.items);
+    }
     const updated = (await db.query('UPDATE orders SET status=$1,decided_at=CASE WHEN $1=\'APPROVED\' THEN now() ELSE NULL END,routine=CASE WHEN $1=\'APPROVED\' THEN true ELSE routine END,risk_details=$2 WHERE id=$3 RETURNING *',
       [status,JSON.stringify(details),orderId])).rows[0];
     if (status === 'APPROVED') await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,status]);
@@ -276,6 +326,7 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
 }
 export async function decideOrder(user, orderId, decision) {
   return transaction(async db => {
+    await lockBuyer(db, user);
     const order = (await db.query('SELECT * FROM orders WHERE id=$1 AND user_id=$2 FOR UPDATE', [orderId,user])).rows[0];
     assert(order, 404, 'Order not found');
     if (order.status === decision) return order;
@@ -283,6 +334,8 @@ export async function decideOrder(user, orderId, decision) {
     if (decision === 'APPROVED') {
       const fresh = (await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount;
       assert(fresh, 409, 'Quote expired; reject this order and submit a new quote for review');
+      assertCutoffs(order.items);
+      await assertSubstitutionPolicy(db, user, order.items);
     }
     const updated = (await db.query('UPDATE orders SET status=$1,decided_at=now(),routine=CASE WHEN $1=\'APPROVED\' THEN true ELSE routine END WHERE id=$2 RETURNING *', [decision,orderId])).rows[0];
     await db.query('DELETE FROM quote_locks WHERE order_id=$1', [orderId]);
