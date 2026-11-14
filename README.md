@@ -20,7 +20,17 @@ npm run seed &&
 npm start
 ```
 
-Only Docker needs sudo; run npm as your regular user. `--wait` waits for PostgreSQL's health check before seeding, and `&&` stops the sequence if a step fails. `ECONNREFUSED 127.0.0.1:5432` means the database is not accepting connections; resolve the Docker startup error first. The Node `url.parse()` deprecation warning does not cause this failure.
+Only Docker needs sudo; run npm as your regular user. `--wait` waits for PostgreSQL's health check before seeding, and `&&` stops the sequence if a step fails. `ECONNREFUSED 127.0.0.1:5432` means the database is not accepting connections; resolve the Docker startup error first.
+
+If npm prints `DEP0169` (`url.parse()`) or a retired audit endpoint notice, update the npm CLI. These warnings can come from older npm dependencies rather than application code. npm 12.2.2 requires Node 22.22.2+, 24.15.0+, or 26+:
+
+```sh
+npm install --global npm@12.2.2 --prefix "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+hash -r
+npm --version
+npm audit
+```
 
 In another terminal:
 
@@ -226,7 +236,7 @@ separation or move database ownership out of the orchestration process.
 ## Three-tier web procurement portal
 
 Run `npm install`, configure `.env` using `.env.example`, then `npm run seed`
-and `npm run web`. Open http://127.0.0.1:3001. Keep `VALIO_MOCK=true` for
+and `npm run web`. Open http://127.0.0.1:3001/user-agent-demo. Keep `VALIO_MOCK=true` for
 local simulated checkout. The existing `.env` is preserved, including credentials.
 
 The portal is served on FRONTEND_PORT (3001), proxies only to MIDDLE_LAYER_PORT

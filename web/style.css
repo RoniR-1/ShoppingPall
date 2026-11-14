@@ -451,3 +451,28 @@ pre {
     align-items: stretch;
   }
 }
+
+/* Shared navigation and managed-agent layout. */
+.nav-link { color: var(--text); font-size: 12px; text-underline-offset: 3px; }
+.managed-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.managed-heading h1 { margin: 0; font-size: 17px; }
+.managed-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; align-items: start; }
+.managed-grid > *, .managed-form label { min-width: 0; }
+.managed-page p { margin: 0 0 12px; }
+.managed-page small { color: var(--muted); }
+.managed-page h2 { font-size: 13px; margin: 20px 0 10px; }
+.managed-form label { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; color: var(--muted); font-size: 12px; }
+.managed-form input, .managed-form select { width: 100%; min-width: 0; }
+.managed-form button { margin: 0 6px 8px 0; }
+.managed-page #error:empty, .managed-page #rule-draft:empty { display: none; }
+.managed-page #error { color: var(--reject-text); background: var(--reject-bg); border: 1px solid currentColor; padding: 10px; }
+.managed-page #preview:not(:empty), .managed-page #reply:not(:empty) { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.managed-page #activity details { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.managed-page #activity summary { cursor: pointer; overflow-wrap: anywhere; }
+.managed-page pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.managed-page .actions { flex-wrap: wrap; }
+@media (max-width: 700px) {
+  .managed-grid { grid-template-columns: 1fr; }
+  .topbar { flex-wrap: wrap; }
+  .managed-heading { flex-wrap: wrap; }
+}
