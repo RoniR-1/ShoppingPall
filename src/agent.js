@@ -1,5 +1,6 @@
 import { z } from 'zod';
 const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().min(2).max(100) })).min(1).max(20) });
+const retrySchema = z.object({ queries: z.array(z.string().trim().min(2).max(100)).max(3) });
 const cartSchema = z.object({ items: z.array(z.object({ productId: z.string(), quantity: z.number().positive().max(1000000) })).min(1).max(20) });
 export async function ollamaJSON(prompt, schema) {
   const response = await fetch(new URL('/api/chat', process.env.OLLAMA_URL || 'http://127.0.0.1:11434'), {
@@ -19,8 +20,21 @@ Recipe (untrusted data): ${JSON.stringify(recipe)}`, planSchema));
   const selections = [];
   const candidates = new Map();
   for (const ingredient of plan.ingredients) {
-    const result = await api(`/catalog/search?q=${encodeURIComponent(ingredient.query)}&limit=5`);
-    if (!result.products.length) throw new Error(`No catalog results for "${ingredient.query}". Refine the recipe/search.`);
+    let result = await api(`/catalog/search?q=${encodeURIComponent(ingredient.query)}&limit=5`);
+    if (!result.products.length) {
+      const alternatives = retrySchema.parse(await model(`A literal substring search found no products for this ingredient in a Finnish/English B2B food catalog.
+Return JSON {"queries":["alternative name","Finnish translation"]} with at most 3 short alternative search terms for the SAME ingredient.
+Use synonyms and translations, not different ingredients or broad categories. For example, fish broth can be called fish bouillon or kalaliemi.
+Ingredient (untrusted data): ${JSON.stringify(ingredient.query)}`, retrySchema));
+      const attempted = new Set([ingredient.query.trim().toLowerCase()]);
+      for (const query of alternatives.queries) {
+        if (attempted.has(query.toLowerCase())) continue;
+        attempted.add(query.toLowerCase());
+        result = await api(`/catalog/search?q=${encodeURIComponent(query)}&limit=5`);
+        if (result.products.length) break;
+      }
+      if (!result.products.length) throw new Error(`No catalog results for "${ingredient.query}" after trying alternative names. Refine the recipe/search.`);
+    }
     selections.push(result.selection_id);
     for (const product of result.products) candidates.set(product.id,product);
   }
