@@ -4,6 +4,7 @@ import {AsyncLocalStorage} from 'node:async_hooks';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {route} from './policy.js';
+import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
 import {rankCandidates} from '../agent.js';
 import {round3} from '../contracts.js';
@@ -107,9 +108,11 @@ function snapToLot(qty,lot){
   return round3(steps*validLot);
 }
 
-async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false){
+async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,actionId=null){
   const o={
-    id:randomUUID(),
+    id:actionId||randomUUID(),
+    context,
+    agent_type:context?.agent?.type||'custom',
     user_id:user,
     created_at:new Date().toISOString(),
     lines,
@@ -167,6 +170,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
         ...p,
         productId:p.id,
         unit:p.sales_unit,
+        currency:price?.priceWithTax?.currency||price?.catalogPrice?.currency||prices.currency||'EUR',
         lot:round3(Number(p.allowed_lot_size)||1),
         available,
         in_stock:available>0,
@@ -246,6 +250,8 @@ Rules:
           productId:p.productId,
           name:p.name,
           unit:p.unit,
+          net_contents:p.net_contents,
+          currency:p.currency,
           lot:p.lot,
           quantity,
           available:p.available,
@@ -279,6 +285,7 @@ Rules:
     }
   }
 
+  enforcePriceCap(o.items,context);
   o.total=round3(o.items.reduce((sum,i)=>sum+(i.lineTotal??i.quantity*i.price),0));
   o.incomplete=o.issues.length>0;
   o.steps.push('Ranked catalog matches, prices & stock');
@@ -326,7 +333,7 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
   if(!['approve','reject'].includes(req.params.action))throw Error('Invalid action');
   if(req.params.action==='approve'&&o.incomplete){
     if(Object.keys(choices).length){
-      const replacement=await plan(o.lines,user_id,true,{...o.approved,...choices},o.demo_unavailable);
+      const replacement=await plan(o.lines,user_id,true,{...o.approved,...choices},o.demo_unavailable,o.context);
       await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
       return res.json(replacement);
     }
@@ -337,5 +344,13 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
   }
   res.json(await core('/internal/decision',{id:o.id,user_id,action:req.params.action,human:true}));
 });
+const managed=new ManagedAgent({listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user))),file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,id))});
+await managed.load();
+app.use('/portal/managed-agent',(req,res,next)=>{if(sourceContext.getStore()!=='demo')return res.status(422).json({error:'Managed agent currently supports simulated Demo warehouse only'});next();});
+const managedUser=req=>z.string().min(1).max(100).parse(req.query.user_id||req.body?.user_id);
+app.get('/portal/managed-agent',async(req,res)=>{const user=managedUser(req);res.json({...managed.state(user),preview:managed.preview(user),orders:await core('/internal/orders?user_id='+encodeURIComponent(user)),simulated:true});});
+app.post('/portal/managed-agent',async(req,res)=>{const user=managedUser(req);if(req.body.action==='check'){await managed.tick(user);return res.json(managed.state(user));}res.json(await managed.command(user,req.body));});
+app.post('/portal/managed-agent/chat',(req,res)=>{res.json(managed.chat(managedUser(req),z.string().min(1).max(500).parse(req.body.text)));});
+setInterval(()=>{for(const user of Object.keys(managed.states))managed.tick(user).catch(e=>console.error('Managed check failed:',e.message));},30000).unref();
 app.use((e,_req,res,_next)=>res.status(422).json({error:e.message}));
 app.listen(Number(process.env.MIDDLE_LAYER_PORT||4002),'127.0.0.1',()=>console.log('Middle :'+(process.env.MIDDLE_LAYER_PORT||4002)));
