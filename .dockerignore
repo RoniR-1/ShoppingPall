@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+node_modules
+.local
+.codex
+.agents
+.aws
+*.log

@@ -5,33 +5,11 @@ Node 22+ / Express monolith, PostgreSQL catalog and approval queue, and a local 
 ## Run
 
 ```sh
-npm ci &&
-{ test -f .env || cp .env.example .env; } &&
-docker compose up -d --wait db &&
-npm run seed &&
+npm ci
+cp .env.example .env
+docker compose up -d db
+npm run seed
 npm start
-```
-
-If Docker reports `permission denied` for `/var/run/docker.sock`, run the following in your terminal (sudo may prompt for your password):
-
-```sh
-sudo docker compose up -d --wait db &&
-npm run seed &&
-npm start
-```
-
-Only Docker needs sudo; run npm as your regular user. `--wait` waits for PostgreSQL's health check before seeding, and `&&` stops the sequence if a step fails. `ECONNREFUSED 127.0.0.1:5432` means the database is not accepting connections; resolve the Docker startup error first.
-
-If an older `.env` has empty values, set `DATABASE_URL=postgresql://aimo:aimo@127.0.0.1:5432/aimo` and `VALIO_MOCK=true`. The database URL matches the local Compose credentials. An empty database URL previously caused `SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string`. Preserve any other credentials already in your `.env`.
-
-If npm prints `DEP0169` (`url.parse()`) or a retired audit endpoint notice, update the npm CLI. These warnings can come from older npm dependencies rather than application code. npm 12.2.2 requires Node 22.22.2+, 24.15.0+, or 26+:
-
-```sh
-npm install --global npm@12.2.2 --prefix "$HOME/.local"
-export PATH="$HOME/.local/bin:$PATH"
-hash -r
-npm --version
-npm audit
 ```
 
 In another terminal:
@@ -44,7 +22,7 @@ npm run cli -- approvals --user-id customer-123
 
 The first preset is automatically `APPROVED`; the second is `PENDING_APPROVAL`. Enter `a` or `r` in the approval console, or use `approve ORDER_UUID` / `reject ORDER_UUID` with `--user-id`. `approvals --list-only` prints without prompting. Both presets select products `460000` and `460001` from the local catalog, with at least one sales unit rounded up to a valid lot size. In live mode these products might be unavailable; deterministic demos use `VALIO_MOCK=true`.
 
-The Compose database persists in the `aimo-data` volume. Source datasets are challenge-only, as stated in the supplied schema.
+The workspace used during implementation has an ignored `.env` pointing to a temporary PostgreSQL instance at `127.0.0.1:55432`, database `aimo`, role `roni`. For a durable installation use the Compose volume and `.env.example` above. Source datasets are challenge-only, as stated in the supplied schema.
 
 ## Recipe agent
 
@@ -238,7 +216,7 @@ separation or move database ownership out of the orchestration process.
 ## Three-tier web procurement portal
 
 Run `npm install`, configure `.env` using `.env.example`, then `npm run seed`
-and `npm run web`. Open http://127.0.0.1:3001/user-agent-demo. Keep `VALIO_MOCK=true` for
+and `npm run web`. Open http://127.0.0.1:3001. Keep `VALIO_MOCK=true` for
 local simulated checkout. The existing `.env` is preserved, including credentials.
 
 The portal is served on FRONTEND_PORT (3001), proxies only to MIDDLE_LAYER_PORT
@@ -285,10 +263,9 @@ PostgreSQL. `DEMO_DATABASE_URL` is no longer used.
 
 ### Managed inventory agent (local simulated MVP)
 
-Open `/managed-agent` on the portal after `npm run web`. The Demo warehouse is
-always connected and monitoring while the server runs, including saved warehouses.
-Enter and save a product rule with minimum/target quantities. The middle process
-checks every 30 seconds; use “Check now” beside the page title for an immediate check.
+Open `/managed-agent` on the portal after `npm run web`. Connect the Demo
+warehouse, enter a product and minimum/target/on-hand quantities, review the
+preview, and enable monitoring. The middle process checks every 30 seconds.
 Chat supports `keep at least 10 milk` and fills a proposed rule for explicit
 review/save. Customer warehouse quantities are independent of supplier stock.
 
@@ -302,7 +279,8 @@ State is persisted atomically in `.local/managed-agent.json` (override with
 `MANAGED_STATE_FILE`). Only one middle process may own this file. An episode is
 persisted before dispatch: uncertain results are held as RECONCILING and are
 never automatically retried. An episode remains suppressed until a later check
-observes warehouse stock above the minimum. Demo orders and supplier
+observes warehouse stock above the minimum. Pausing/disconnecting stops future
+checks; it does not cancel already-created orders. Demo orders and supplier
 stock remain in the core's process memory and reset when core restarts.
 
 This is not the production architecture described in the design: no real
@@ -315,19 +293,3 @@ Real-data mode rejects managed-agent endpoints. All purchase outcomes are
 explicitly simulated. Warehouse snapshots are manually entered demo inputs.
 
 Focused checks: `node --test test/managed-agent.test.js`.
-
-Managed price caps now store currency, quantity, and a product-specific price
-unit. Unit conversions use `baseUnit` and `units[].sizeInBaseUnits` relative to
-`salesUnit`, following the supplied product schema; unknown conversions are
-rejected. Existing demo fixtures expose only ST, so their unit menu intentionally
-contains ST only. No technical-code translations or package sizes are invented.
-Currency choices are EUR, USD, GBP, SEK, NOK and DKK. A cap with a different
-currency from the quote blocks dispatch: currency conversion is not configured.
-
-Simulated approved replenishments now receive the ordered quantities into the
-customer warehouse exactly once and close the shortage episode. The worker also
-reconciles approvals made after submission and prior simulated placements. A new
-low-stock snapshot can then trigger a new replenishment; pending or uncertain
-orders remain held to prevent duplicates. This receipt is a demo simulation,
-not evidence of real supplier delivery. The activity panel displays events since
-page load while preserving the full persisted audit history.
