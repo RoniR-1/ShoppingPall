@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { recipeCart, lunaJSON, rankCandidates } from '../src/agent.js';
 import { z } from 'zod';
-import { parseBudget, stripBudget, parseDeliveryDeadline, stripOrderConstraints, parseSustainability } from '../src/contracts.js';
+import { parseBudget, stripBudget, parseDeliveryDeadline, stripOrderConstraints, parseSustainability, parseOriginPreference } from '../src/contracts.js';
 
 test('recipe reuses planned synonyms without an extra model call', async () => {
   const replies = [
@@ -31,7 +31,7 @@ test('Luna requests bounded JSON and includes the validation schema', async () =
     assert.equal(url, 'https://luna.example/v1/chat/completions');
     assert.equal(options.headers.Authorization, 'Bearer test-key');
     assert.equal(body.model, 'test-model');
-    assert.equal(body.max_tokens, 1024);
+    assert.equal(body.max_tokens, 8192);
     assert.deepEqual(body.response_format, { type: 'json_object' });
     assert.match(body.messages[0].content, /"ok":\{"type":"boolean"/);
     return lunaReply({ ok: true });
@@ -377,6 +377,69 @@ test('recipeCart sends CO2 data and a sustainability constraint to the model onl
   assert.match(sustainable, /"carbon_kg_co2_per_kg":0.4/);
   const plain = await run('2 kg apples');
   assert.doesNotMatch(plain, /carbon_kg_co2_per_kg/);
+});
+
+test('parseOriginPreference reads strict and preferred origins without touching product names', () => {
+  for (const [text, expected] of [
+    ['I want 50 apples sustainability, 10 euros budget, English only', { countries: ['gb'], strict: true }],
+    ['2 kg apples, Finnish only', { countries: ['fi'], strict: true }],
+    ['10 eggs, only from Finland', { countries: ['fi'], strict: true }],
+    ['1 cheese, Finnish or Swedish only', { countries: ['fi', 'se'], strict: true }],
+    ['10 eggs, must be from Finland', { countries: ['fi'], strict: true }],
+    ['prefer Finnish, 2 kg potato', { countries: ['fi'], strict: false }],
+    ['2 kg apples from Spain if possible', { countries: ['es'], strict: false }],
+    ['10 eggs, Finnish origin', { countries: ['fi'], strict: false }],
+    ['2 kg French fries', null], ['1 Greek yoghurt', null], ['answer in English only: 2 kg apples', null], ['10 eggs from us', null]
+  ]) assert.deepEqual(parseOriginPreference(text), expected, text);
+  assert.equal(stripOrderConstraints('I want 50 apples sustainability, 10 euros budget, English only'), 'I want 50 apples');
+  assert.equal(stripOrderConstraints('2 kg French fries, Finnish only'), '2 kg French fries');
+});
+
+test('rankCandidates puts a requested origin right after keyword match and allergen safety', () => {
+  const candidates = [
+    { id: 'weak-fi', match_rank: 2, allergen_safe: true, unit_price: 1, country_of_origin: 'fi' },
+    { id: 'exact-fr-cheap-green-fast', match_rank: 4, allergen_safe: true, unit_price: 1, carbon_kg_co2_per_kg: 0.1, deliverable_by_date: true, country_of_origin: 'fr' },
+    { id: 'exact-fi-pricey-late', match_rank: 4, allergen_safe: true, unit_price: 5, carbon_kg_co2_per_kg: 2, deliverable_by_date: false, country_of_origin: 'FI' },
+    { id: 'exact-fi-unsafe', match_rank: 4, allergen_safe: false, unit_price: 1, country_of_origin: 'fi' }
+  ];
+  const ids = options => rankCandidates(candidates, options).map(p => p.id);
+  assert.deepEqual(ids({ origins: ['fi'], sustainability: true, deliveryRequested: true, budget: true }),
+    ['exact-fi-pricey-late', 'exact-fr-cheap-green-fast', 'exact-fi-unsafe', 'weak-fi']);
+  assert.deepEqual(ids({ sustainability: true, deliveryRequested: true, budget: true }),
+    ['exact-fr-cheap-green-fast', 'exact-fi-pricey-late', 'exact-fi-unsafe', 'weak-fi']);
+});
+
+const originApi = async path => {
+  if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products: [
+    { id: 'fr-apple', name: 'Apple', match_rank: 4, allergen_safe: true, country_of_origin: 'fr' },
+    { id: 'fi-apple', name: 'Apple', match_rank: 4, allergen_safe: true, country_of_origin: 'fi' }
+  ] };
+  assert.fail(`Unexpected path ${path}`);
+};
+
+test('recipeCart corrects a cart that breaks a strict origin requirement', async () => {
+  const prompts = [];
+  const replies = [{ ingredients: [{ query: 'apple' }] }, { items: [{ productId: 'fr-apple', quantity: 1 }] }, { items: [{ productId: 'fi-apple', quantity: 1 }] }];
+  const cart = await recipeCart('2 kg apples, Finnish only', originApi, async prompt => { prompts.push(prompt); return replies.shift(); });
+  assert.deepEqual(cart.items, [{ productId: 'fi-apple', quantity: 1 }]);
+  assert.equal(cart.requiresApproval, undefined);
+  assert.ok(prompts[1].indexOf('"fi-apple"') < prompts[1].indexOf('"fr-apple"'));
+  assert.match(prompts[1], /accepts ONLY products whose country_of_origin is fi \(Finland\)/);
+  assert.match(prompts[2], /fr-apple is from France, but the request allows only Finland/);
+});
+
+test('recipeCart sends a strict-origin cart for human approval when no matching origin is chosen', async () => {
+  const replies = [{ ingredients: [{ query: 'apple' }] }, { items: [{ productId: 'fr-apple', quantity: 1 }] }, { items: [{ productId: 'fr-apple', quantity: 1 }] }];
+  const cart = await recipeCart('2 kg apples, English only', originApi, async () => replies.shift());
+  assert.equal(cart.requiresApproval, true);
+  assert.match(cart.approvalReason, /^Origin requirement not met after correction: fr-apple is from France, but the request allows only the United Kingdom/);
+});
+
+test('recipeCart only ranks by a preferred origin and does not enforce it', async () => {
+  const replies = [{ ingredients: [{ query: 'apple' }] }, { items: [{ productId: 'fr-apple', quantity: 1 }] }];
+  const cart = await recipeCart('2 kg apples, prefer Finnish', originApi, async () => replies.shift());
+  assert.deepEqual(cart.items, [{ productId: 'fr-apple', quantity: 1 }]);
+  assert.equal(cart.requiresApproval, undefined);
 });
 
 test('recipeCart enriches and sorts candidates with live price and availability when requestedDate is set', async () => {

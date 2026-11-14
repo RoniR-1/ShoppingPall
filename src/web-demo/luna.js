@@ -14,6 +14,11 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
   if (!Number.isSafeInteger(timeout) || timeout <= 0) {
     throw aiError('LUNA_TIMEOUT_MS must be a positive integer', 503, 'AI_NOT_CONFIGURED');
   }
+  // Thinking models count hidden reasoning against max_tokens, so leave room beyond the short JSON answer.
+  const maxTokens = Number(env.LUNA_MAX_TOKENS || 8192);
+  if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) {
+    throw aiError('LUNA_MAX_TOKENS must be a positive integer', 503, 'AI_NOT_CONFIGURED');
+  }
 
   let response;
   try {
@@ -23,7 +28,7 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
       body: JSON.stringify({
         model: env.LUNA_MODEL || 'gemini-2.5-flash',
         temperature: 0,
-        max_tokens: 1024,
+        max_tokens: maxTokens,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }

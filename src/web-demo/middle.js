@@ -6,8 +6,8 @@ import {z} from 'zod';
 import {route} from './policy.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
 import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
-import {rankCandidates} from '../agent.js';
-import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints} from '../contracts.js';
+import {rankCandidates,originMatches} from '../agent.js';
+import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,parseOriginPreference,countryName,stripOrderConstraints} from '../contracts.js';
 import {callGeminiJSON} from './luna.js';
 import {allocateAvailable} from './quote-check.js';
 
@@ -101,6 +101,9 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
   // A stated window ("delivered in 3 days") is kept as an absolute date so re-plans after human edits keep the same deadline.
   const deliveryDeadline=meta.deliveryDeadline||parseDeliveryDeadline(meta.rawPrompt);
   const sustainability=parseSustainability(meta.rawPrompt);
+  // {countries:['fi'],strict} — strict ("Finnish only") never auto-orders another origin; a preference only ranks.
+  const origin=parseOriginPreference(meta.rawPrompt);
+  const originLabel=origin?origin.countries.map(countryName).join(' or '):'';
   const parserModel=process.env.LUNA_API_KEY?(process.env.LUNA_MODEL||'gemini-2.5-flash'):'local-rule-parser';
   const o={
     id:actionId||randomUUID(),
@@ -112,6 +115,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     raw_prompt:meta.rawPrompt||lines.map(l=>l.requested||`${l.quantity} ${l.query}`).join(', '),
     delivery_deadline:deliveryDeadline||null,
     prefers_low_carbon:sustainability,
+    origin_preference:origin,
     parser_model:parserModel,
     lines,
     force_flag,
@@ -203,8 +207,10 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
         ...(deliveryDeadline?{deliverable_by_date:available>0}:{})
       };
     });
-    const ranked=rankCandidates(enriched,{budget:budget!=null,deliveryRequested:Boolean(deliveryDeadline),sustainability});
-    lineOptions.push({index,line,matchedQuery,suggested,options:ranked});
+    const ranked=rankCandidates(enriched,{budget:budget!=null,deliveryRequested:Boolean(deliveryDeadline),sustainability,origins:origin?.countries});
+    // Strict origin: other origins are only offered to the reviewer, never auto-ordered. A human-chosen product is kept.
+    const allowed=origin?.strict?ranked.filter(p=>originMatches(p,origin.countries)||p.productId===chosenId):ranked;
+    lineOptions.push({index,line,matchedQuery,suggested,options:allowed,originBlocked:allowed.length?null:ranked.slice(0,8)});
   }
 
   let aiSelections=new Map();
@@ -231,6 +237,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
             available:c.available,
             ...(deliveryDeadline?{deliverable_by_deadline:c.deliverable_by_date}:{}),
             ...(sustainability?{carbon_kg_co2_per_kg:c.carbon??null}:{}),
+            ...(origin?{country_of_origin:c.country_of_origin??null}:{}),
             allergen_safe:c.allergen_safe,
             human_approved_count:c.human_approved_count||0,
             bought_count:c.bought_count||0
@@ -242,12 +249,12 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
 Return ONLY valid JSON:
 {"selections":[{"lineIndex":0,"productId":"...","quantity":2}]}
 Rules:
-1. Candidates are already sorted best-first by keyword match, allergen safety, ${deliveryDeadline?'deliverability by the requested deadline, ':''}${sustainability?'lowest CO2 per kg, ':''}price, human-approved/purchase history, and stock.
+1. Candidates are already sorted best-first by keyword match, allergen safety, ${origin?'requested country of origin, ':''}${deliveryDeadline?'deliverability by the requested deadline, ':''}${sustainability?'lowest CO2 per kg, ':''}price, human-approved/purchase history, and stock.
 2. Pick ONLY ONE productId per lineIndex from that line's candidates.
 3. Convert the buyer's requested amount into the chosen product's sales_unit using its name and "units" (sizeInBaseUnits):
    - If the buyer asks for "2kg apples" or "12 apples" (~2 kg), prefer a product sold in "KG" (with quantity: 2) or a "2KG BAG" sold in "ST" (with quantity: 1)—do NOT pick a 13 kg crate ("KI") unless a crate/bulk box was requested.
 4. "quantity" MUST be a positive multiple of allowed_lot_size.
-${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer candidates with deliverable_by_deadline true; never pick a worse keyword match just to meet the deadline.\n`:''}${sustainability?`5b. The buyer wants sustainable choices. Prefer the lowest carbon_kg_co2_per_kg (kg CO2-eq per kg; null = unknown); never pick a worse keyword match just to lower CO2.\n`:''}5. ${budget==null?'No total budget was specified.':`The buyer specified a TOTAL budget of EUR ${budget.toFixed(2)} for the whole order. Choose the lowest-cost suitable candidates across all lines while preserving requested quantities. Do not pretend an over-budget cart is within budget; the system will send it for human approval.`}`;
+${origin?`5o. The buyer ${origin.strict?'accepts ONLY':'prefers'} products whose country_of_origin is ${origin.countries.join(' or ')} (${originLabel}).${origin.strict?' Every candidate shown already matches.':' Prefer those; never pick a worse keyword match just to match the origin.'}\n`:''}${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer candidates with deliverable_by_deadline true; never pick a worse keyword match just to meet the deadline.\n`:''}${sustainability?`5b. The buyer wants sustainable choices. Prefer the lowest carbon_kg_co2_per_kg (kg CO2-eq per kg; null = unknown); never pick a worse keyword match just to lower CO2.\n`:''}5. ${budget==null?'No total budget was specified.':`The buyer specified a TOTAL budget of EUR ${budget.toFixed(2)} for the whole order. Choose the lowest-cost suitable candidates across all lines while preserving requested quantities. Do not pretend an over-budget cart is within budget; the system will send it for human approval.`}`;
   // Rough cart cost for a set of picks, mirroring the allocation below (suggested lines are never auto-ordered).
   const estimate=selections=>lineOptions.reduce((sum,entry)=>{
     if(sum==null||entry.suggested||!entry.options.length)return sum;
@@ -256,7 +263,8 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
     const forcedId=approved[entry.index]||pinned[entry.index];
     const chosen=option||entry.options.find(o=>o.productId===forcedId)||entry.options.find(o=>o.price!=null);
     if(!chosen||chosen.price==null)return null;
-    return sum+chosen.price*snapToLot(option?sel.quantity:entry.line.quantity,chosen.lot);
+    return sum+chosen.price*Number(option?sel.quantity:entry.line.quantity);
+
   },0);
   const validSelections=picked=>{
     const selections=new Map();
@@ -282,8 +290,29 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
 
   }
 
-  for(const {index,line,matchedQuery,suggested,options} of lineOptions){
+  for(const {index,line,matchedQuery,suggested,options,originBlocked} of lineOptions){
     if(!options.length){
+      if(originBlocked?.length){
+        // Matches exist, but none from the required origin: send the line to human review with the other origins offered.
+        o.line_traces.push({
+          lineIndex:index,
+          requested:line.requested||`${line.quantity} × ${line.query}`,
+          query:line.query,
+          alternatives:line.alternatives||[],
+          matchedQuery:matchedQuery||line.query,
+          totalCandidates:originBlocked.length,
+          selectionMode:'origin-blocked',
+          selectedProductId:null,
+          selectedName:null,
+          selectedQty:round3(line.quantity),
+          selectedUnit:null,
+          topCandidates:originBlocked.slice(0,3).map(c=>({productId:c.productId,name:c.name,unit:c.unit,lot:c.lot,price:c.price,available:c.available,
+            allergen_safe:c.allergen_safe!==false,country_of_origin:c.country_of_origin??null,carbon:c.carbon,match_rank:c.match_rank??null}))
+        });
+        o.issues.push({index,reason:`No product from ${originLabel} available`,shortfall:round3(line.quantity),options:originBlocked});
+        o.steps.push(`"${line.requested||line.query}": no product from ${originLabel}; sent for human review.`);
+        continue;
+      }
       o.line_traces.push({
         lineIndex:index,
         requested:line.requested||`${line.quantity} × ${line.query}`,
@@ -344,6 +373,7 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
         human_approved_count:c.human_approved_count||0,
         reliability:c.reliability,
         carbon:c.carbon,
+        country_of_origin:c.country_of_origin??null,
         match_rank:c.match_rank??null
       }))
     });
