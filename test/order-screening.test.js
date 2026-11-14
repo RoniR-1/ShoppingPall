@@ -47,3 +47,8 @@ test('placeholder approves and invalid scores fail closed', () => {
   assert.throws(() => new OrderScreeningService({ scorer: {} }), /scorer/);
   show('Output', { placeholder, invalidScores: 'all rejected', invalidScorer: 'rejected' });
 });
+
+test('scorer exceptions propagate instead of approving', () => {
+  const service = new OrderScreeningService({ scorer: { score() { throw new Error('scorer unavailable'); } } });
+  assert.throws(() => service.evaluate({}), /scorer unavailable/);
+});

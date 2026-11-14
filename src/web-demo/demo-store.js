@@ -1,3 +1,4 @@
+import {assertQuoteCutoffs} from './quote-check.js';
 // Explicit synthetic net contents per demo sales unit, not Valio product facts.
 export const demoContents={
  'demo-beer':{litres:0.33},'demo-dark-beer':{litres:0.33},
@@ -58,6 +59,7 @@ export class DemoStore {
  }
  overview(){const row=p=>({...p,quantity:this.stock.get(p.id)});return {mocked:true,products:this.products.map(p=>({...row(p),substitutions:p.raw.substitutions.map(s=>row(this.products.find(p=>p.id===s.substituteProduct)))}))};}
  save(o){const prior=this.orders.get(o.id);if(prior&&(prior.user_id!==o.user_id||prior.status!=='PENDING_APPROVAL'))throw Error('Order cannot be replaced');if(o.user_id&&!this.buyers.has(o.user_id))this.buyers.set(o.user_id,this.#normThreshold(process.env.SUSPICION_THRESHOLD??25));this.orders.set(o.id,structuredClone(o));return o;}
+ replace({id,user_id,replacement}){const old=this.orders.get(id);if(!old||old.user_id!==user_id||old.status!=='PENDING_APPROVAL')throw Error('Original order is no longer pending');if(!replacement||replacement.user_id!==user_id||replacement.status!=='PENDING_APPROVAL'||this.orders.has(replacement.id))throw Error('Invalid replacement proposal');const prior=structuredClone(old);prior.status='REJECTED';prior.superseded_by=replacement.id;prior.steps.push('Order replaced by a new proposal');this.orders.set(id,prior);this.orders.set(replacement.id,structuredClone(replacement));return structuredClone(replacement);}
  list(user){return structuredClone([...this.orders.values()].filter(o=>o.user_id===user));}
  decide({id,user_id,action,human=false}){
   const o=this.orders.get(id);if(!o||o.user_id!==user_id)throw Error('Order not found');
@@ -65,6 +67,10 @@ export class DemoStore {
   if(o.status!=='PENDING_APPROVAL')return structuredClone(o);
   if(action==='approve'){
    if(o.incomplete||!o.items.length)throw Error('Resolve missing items first');
+   assertQuoteCutoffs(o.items);
+   if(!o.quote_expires_at||!Number.isFinite(Date.parse(o.quote_expires_at))||Date.parse(o.quote_expires_at)<=Date.now())throw Error('Quote expired or missing; submit a new request for a fresh quote');
+   if(o.items.some(i=>i.allergen_safe===false))throw Error('Product conflicts with excluded allergens; select a safe alternative');
+   if(!human&&(o.context?.agent?.type!=='managed'||o.context?.confidence?.method!=='deterministic_threshold'||o.items.some(i=>i.substitution)))throw Error('Human approval is required for generated or substituted carts');
    const totals=new Map();for(const i of o.items){if(!Number.isFinite(i.quantity)||i.quantity<=0)throw Error('Invalid quantity');totals.set(i.productId,(totals.get(i.productId)||0)+i.quantity);}
    for(const [id,quantity]of totals)if(!this.stock.has(id)||this.stock.get(id)<quantity)throw Error('Stock changed; submit a fresh request');
    for(const [id,quantity]of totals)this.stock.set(id,this.stock.get(id)-quantity);

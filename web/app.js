@@ -218,7 +218,7 @@ function renderQuestionsHtml(o, interactive = true) {
       ` : ''}
       <div class="sub-actions">
         ${canSubstitute ? `
-          <button type="button" class="primary-btn small-btn" data-action="approve">Use substitute &amp; approve</button>
+          <button type="button" class="primary-btn small-btn" data-action="approve">Quote substitute for review</button>
           <button type="button" class="ghost-btn small-btn" data-action="substitute">Swap &amp; re-evaluate</button>
         ` : ''}
         ${q.productId != null ? `
@@ -252,7 +252,7 @@ function renderPlainCard(o, interactive = true) {
             ${canSubstitute ? `<select data-line="${lineIdx}">
               <option value="">sub…</option>
               ${q.alternatives.map(p => `<option value="${esc(p.productId)}">#${esc(p.productId)} (${esc(p.unit)}) ${fmtMoney(p.price)} [${fmtNum(p.available)}]</option>`).join('')}
-            </select> <button type="button" data-action="approve">use &amp; ok</button> <button type="button" data-action="substitute">swap</button> ` : ''}
+            </select> <button type="button" data-action="approve">quote for review</button> <button type="button" data-action="substitute">swap</button> ` : ''}
             ${q.productId != null ? `<button type="button" data-action="remove-line" data-line="${lineIdx}">drop item</button> ` : ''}
             <button type="button" data-action="reject">cancel</button>
           </div>

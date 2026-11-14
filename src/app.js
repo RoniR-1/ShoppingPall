@@ -136,20 +136,22 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
       const priceCurrency = price.priceWithTax?.currency ?? price.catalogPrice?.currency;
       const priced = price.error === false && price.quantity === 1 && Number.isFinite(unitPrice) && unitPrice >= 0 && priceCurrency === prices.currency;
       const lines = Array.isArray(stock.scheduleLines) ? stock.scheduleLines : [];
-      const line = lines.find(l => l.salesBlock === false && Number.isFinite(l.availableAmount) && l.availableAmount > 0 &&
-        typeof l.availableDate === 'string' &&
-        (valio.mock || l.salesUnit === p.sales_unit));
-      const cutoffOk = stock.closingTime == null || (Number.isFinite(Date.parse(stock.closingTime)) && Date.parse(stock.closingTime) > Date.now());
+      const line = lines.filter(l => l.salesBlock === false && Number.isFinite(l.availableAmount) && l.availableAmount > 0 &&
+        typeof l.availableDate === 'string' && /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/i.test(l.availableDate) &&
+        Number.isFinite(Date.parse(l.availableDate)) && new Date(l.availableDate.slice(0,10)).toISOString().slice(0,10) === l.availableDate.slice(0,10) &&
+        (valio.mock || l.salesUnit === p.sales_unit)).sort((a,b) => a.availableDate.localeCompare(b.availableDate))[0];
+      // A timestamp without an offset depends on the server's local timezone.
+      const cutoffOk = stock.closingTime == null || (typeof stock.closingTime === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/i.test(stock.closingTime) && Number.isFinite(Date.parse(stock.closingTime)) && Date.parse(stock.closingTime) > Date.now());
       const rawProduct = p.raw || {};
       const allergenClass = rawProduct.synkkaData?.classifications?.find(c => c.name === 'allergen');
       const allergens = (allergenClass?.values || []).filter(v => v.unit === 'CONTAINS').map(v => v.id);
       return { ...p, productId,
         carbon_kg_co2_per_kg: round3(p.carbon_kg_co2_per_kg),
         delivery_reliability: round3(p.delivery_reliability),
-        unit_price: priced ? round3(unitPrice) : null,
+        unit_price: priced ? unitPrice : null,
         logistic_model: stock.logisticModel, allergens,
-        availableAmount: round3(line?.availableAmount ?? 0), availableDate: line?.availableDate ?? null,
-        orderable: Boolean(priced && stock.salesBlock === false && line && cutoffOk),
+        availableAmount: line?.availableAmount ?? 0, availableDate: line?.availableDate ?? null,
+        orderable: Boolean(priced && stock.salesBlock === false && stock.logisticModel === 'Stock' && line && cutoffOk),
         price, availability: stock };
     });
     const quote = (await pool.query(`INSERT INTO quotes(id,user_id,requested_date,currency,items,mocked)
@@ -198,7 +200,11 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
     const isInventoryConflict = typeof error?.message === 'string' && error.message.startsWith('Insufficient local inventory');
     const status = error instanceof ZodError ? 422 : isInventoryConflict ? 409 : error.status || 500;
     if (status >= 500) console.error(error.message);
-    res.status(status).json({ error: error instanceof ZodError ? 'Invalid request' : status === 500 ? 'Internal server error' : error.message,
+    const code = error instanceof ZodError ? 'INVALID_REQUEST' : isInventoryConflict ? 'INSUFFICIENT_INVENTORY' :
+      status === 409 && /quote/i.test(error.message) ? 'QUOTE_CONFLICT' : status === 429 ? 'UPSTREAM_RATE_LIMITED' :
+      status === 502 ? 'UPSTREAM_UNAVAILABLE' : status === 503 ? 'SERVICE_UNAVAILABLE' :
+      status === 422 ? 'REQUEST_NOT_FULFILLABLE' : status === 404 ? 'NOT_FOUND' : status === 409 ? 'CONFLICT' : 'INTERNAL_ERROR';
+    res.status(status).json({ code, error: error instanceof ZodError ? 'Invalid request' : status === 500 ? 'Internal server error' : error.message,
       ...(error instanceof ZodError ? { issues: error.issues } : {}) });
   });
   return app;

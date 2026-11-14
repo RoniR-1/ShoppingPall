@@ -17,7 +17,7 @@ async function freePort(){
 test('managed portal serves its page, drafts rules, enforces caps and reconciles approvals',async t=>{
   const dir=await mkdtemp(join(tmpdir(),'managed-portal-'));
   const ports=await Promise.all([freePort(),freePort(),freePort()]);
-  const env={...process.env,FRONTEND_PORT:String(ports[0]),MIDDLE_LAYER_PORT:String(ports[1]),BACKEND_PORT:String(ports[2]),MANAGED_STATE_FILE:join(dir,'state.json'),LUNA_API_KEY:'',SUSPICION_THRESHOLD:'0'};
+  const env={...process.env,PORT:String(ports[0]),HOST:'127.0.0.1',FRONTEND_PORT:String(ports[0]),MIDDLE_LAYER_PORT:String(ports[1]),BACKEND_PORT:String(ports[2]),MANAGED_STATE_FILE:join(dir,'state.json'),LUNA_API_KEY:'',SUSPICION_THRESHOLD:'0'};
   const children=[];
   t.after(async()=>{
     await Promise.all(children.map(child=>new Promise(resolve=>{if(child.exitCode!==null||child.signalCode)return resolve();child.once('exit',resolve);child.kill();})));
@@ -29,7 +29,8 @@ test('managed portal serves its page, drafts rules, enforces caps and reconciles
     await new Promise((resolve,reject)=>{
       let output='';
       const timeout=setTimeout(()=>reject(Error(`Startup timed out: ${name}: ${output}`)),10000);
-      child.stdout.once('data',()=>{clearTimeout(timeout);resolve();});
+      const ready={core:'Core :',middle:'Middle :',frontend:'Portal http://'}[name];
+      child.stdout.on('data',chunk=>{output+=chunk;if(output.includes(ready)){clearTimeout(timeout);resolve();}});
       child.stderr.on('data',chunk=>{output+=chunk;});
       child.once('exit',code=>{clearTimeout(timeout);reject(Error(`${name} exited ${code}: ${output}`));});
     });
@@ -77,7 +78,7 @@ test('managed portal serves its page, drafts rules, enforces caps and reconciles
   assert.equal(current.inventory.find(p=>p.id==='demo-eggs').on_hand,20);
   assert.equal(current.orders.length,1);
   // A per-kg cap must use the quote's net contents before any order is saved.
-  await command('capped',{action:'rule',rule:{query:'Potato salad',minimum:1,target:2,on_hand:0,max_price:5,price_quantity:1,price_unit:'KGM'}});
+  await command('capped',{action:'rule',rule:{query:'Eggs',minimum:1,target:2,on_hand:0,max_price:5,price_quantity:1,price_unit:'KGM'}});
   await command('capped',{action:'check'});
   const capped=await state('capped');
   assert.equal(capped.orders.length,0);

@@ -1,12 +1,14 @@
 # Aimo agent approval demo
 
-Node 22+ / Express monolith, PostgreSQL catalog and approval queue, and a local Node CLI with an Ollama adapter. Checkout is simulated locally: no real order is sent to Valio because the supplied OpenAPI contract has no checkout endpoint.
+The reliability audit, failure-mode table, recovery procedures, and regression results are in [FMEA.md](FMEA.md).
+
+Node 22+ / Express monolith, PostgreSQL catalog and approval queue, and a Node CLI using the Luna OpenAI-compatible endpoint. Checkout is simulated locally: no real order is sent to Valio because the supplied OpenAPI contract has no checkout endpoint.
 
 ## Run
 
 ```sh
 npm ci
-cp .env.example .env
+# Create .env with DATABASE_URL, VALIO_MOCK and Luna settings described below
 docker compose up -d db
 npm run seed
 npm start
@@ -22,19 +24,19 @@ npm run cli -- approvals --user-id customer-123
 
 The first preset is automatically `APPROVED`; the second is `PENDING_APPROVAL`. Enter `a` or `r` in the approval console, or use `approve ORDER_UUID` / `reject ORDER_UUID` with `--user-id`. `approvals --list-only` prints without prompting. Both presets select products `460000` and `460001` from the local catalog, with at least one sales unit rounded up to a valid lot size. In live mode these products might be unavailable; deterministic demos use `VALIO_MOCK=true`.
 
-The workspace used during implementation has an ignored `.env` pointing to a temporary PostgreSQL instance at `127.0.0.1:55432`, database `aimo`, role `roni`. For a durable installation use the Compose volume and `.env.example` above. Source datasets are challenge-only, as stated in the supplied schema.
+The workspace used during implementation has an ignored `.env` pointing to a temporary PostgreSQL instance at `127.0.0.1:55432`, database `aimo`, role `roni`. For a durable installation use the Compose volume and set `DATABASE_URL=postgresql://aimo:aimo@127.0.0.1:5432/aimo` in `.env`. Source datasets are challenge-only, as stated in the supplied schema.
 
 ## Recipe agent
 
-Run Ollama locally and pull the smaller default model with `ollama pull qwen2.5:3b`. Set `OLLAMA_MODEL=qwen2.5:3b` in your existing `.env` (copying a new `.env.example` is unnecessary), then:
+Set `LUNA_BASE_URL` to your OpenAI-compatible API base URL and `LUNA_API_KEY` to its key in `.env`. Set `LUNA_MODEL` to the provider's model name (default `gemini-2.5-flash`) and optionally `LUNA_TIMEOUT_MS` to a positive timeout in milliseconds (default 60000). The CLI and portal use the same Luna configuration. Then run:
 
 ```sh
 npm run cli -- agent --user-id customer-123 --recipe "50 portions of creamy salmon soup" --date 2026-11-16
 ```
 
-`OLLAMA_URL` and `OLLAMA_MODEL` select the local provider/model. The adapter first asks for ingredient search terms and alternative names/Finnish translations together, searches the static catalog with five candidates per ingredient, then asks the model to select IDs and quantities using the returned package/unit information. If an ingredient has no results, it tries up to three alternatives; an additional model call is needed only if the plan omitted alternatives. Only selected IDs are accepted. Missing search results after these retries, invalid model JSON, invalid quantities, or unavailable stock stop submission. Generated recipe carts always require approval; quantity conversion and ingredient suitability are not guaranteed by the model. Technical unit codes are not fully documented in the source data.
+The Luna adapter first asks for ingredient search terms and alternative names/Finnish translations together, searches the static catalog with five candidates per ingredient, then asks the model to select IDs and quantities using the returned package/unit information. If an ingredient has no results, it tries up to three alternatives; an additional model call is needed only if the plan omitted alternatives. Only selected IDs are accepted. Missing search results after these retries, invalid model JSON, invalid quantities, or unavailable stock stop submission. Generated recipe carts always require approval; quantity conversion and ingredient suitability are not guaranteed by the model. Technical unit codes are not fully documented in the source data.
 
-The CLI prints each stage and model-call durations. Requests use a JSON schema, request thinking off, and cap generation at 1,024 tokens; truncated responses fail explicitly. `OLLAMA_TIMEOUT_MS` controls the per-call timeout (default 180,000 ms). Run `ollama ps` while generating to check the `PROCESSOR` column: `100% CPU` means your GPU is not being used. An 8B reasoning model such as `deepseek-r1:8b` can be slow on CPU, and some reasoning models cannot disable thinking. For quick adapter checks without model inference or PostgreSQL, run `node --test test/agent.test.js`.
+The CLI prints each stage and model-call durations. Requests use the OpenAI-compatible JSON object format, include the expected schema in the prompt, and cap generation at 1,024 tokens; truncated responses fail explicitly. Invalid configuration, transport errors, rate limits, and invalid responses stop the request without a provider retry or fallback. For adapter checks without live inference or PostgreSQL, run `node --test test/agent.test.js`.
 
 Repeated ingredient names are merged and catalog searches are cached within a recipe run. Before requesting a quote, the agent checks quantity limits, selected product IDs, duplicate product IDs, and lot sizes. An invalid cart gets one model correction attempt with validation feedback; a second failure stops with a readable error and no quote or order request. Quantities are never silently clamped or rounded. These checks do not establish recipe suitability or accurate portion-to-package conversion; human review is still required.
 
@@ -113,7 +115,7 @@ With PostgreSQL running and seeded:
 npm test
 ```
 
-Tests use real PostgreSQL and a temporary HTTP listener with mocked Valio responses. They cover joined data, selection enforcement, user scoping, quote expiry, lot sizes, payload tampering, idempotent concurrent submission, conflicting decisions, rejection, demo bulk flags, model adapter sequencing, upstream authentication, response failures, and API limits. Tests remove only their own generated data. Live Valio and an actual Ollama inference require the external services and are not part of the automated suite.
+Tests use real PostgreSQL and a temporary HTTP listener with mocked Valio responses. They cover joined data, selection enforcement, user scoping, quote expiry, lot sizes, payload tampering, idempotent concurrent submission, conflicting decisions, rejection, demo bulk flags, model adapter sequencing, upstream authentication, response failures, and API limits. Tests remove only their own generated data. Live Valio and actual Luna inference require the external services and are not part of the automated suite.
 
 Source layout: `src/app.js` routes/search/quotes, `src/orders.js` checkout/state transitions, `src/valio.js` upstream adapter, `src/agent.js` local model adapter, `src/cli.js` agent and human interface, `scripts/seed.js` import.
 
@@ -164,6 +166,10 @@ constraints. Redirected downloads do not forward credentials across origins.
 with `process(originalLine, { approvedProductIds: [...] })` on the same session.
 Repeat calls for completed line IDs are idempotent; changed line contents are
 rejected. Partial allocations remain in the basket when a shortfall occurs.
+Direct catalog substitutes also require explicit selection from the proposed
+IDs. Resolve a pending partial allocation with
+`session.resolveShortfall(lineId, 'accept')` or `'reject'`; rejection releases
+the session-local stock. These operations do not quote or purchase products.
 The host must retain the session while awaiting approval. CLI state is printed
 as JSON, is not durable, and is not automatically resumed across processes.
 
@@ -215,7 +221,7 @@ separation or move database ownership out of the orchestration process.
 
 ## Three-tier web procurement portal
 
-Run `npm install`, configure `.env` using `.env.example`, then `npm run seed`
+Run `npm install`, configure `.env` using the settings above, then `npm run seed`
 and `npm run web`. Open http://127.0.0.1:3001. Keep `VALIO_MOCK=true` for
 local simulated checkout. The existing `.env` is preserved, including credentials.
 

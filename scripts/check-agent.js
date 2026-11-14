@@ -1,4 +1,13 @@
 import 'dotenv/config';
-const endpoint=process.env.LUNA_BASE_URL.trim().replace(/\/+$/,'')+'/chat/completions';
-const response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${process.env.LUNA_API_KEY}`},body:JSON.stringify({model:process.env.LUNA_MODEL,messages:[{role:'user',content:'Return JSON only: {"lines":[{"query":"milk","quantity":1}]}'}],response_format:{type:'json_object'}}),signal:AbortSignal.timeout(60000)});
-const body=await response.text();console.log(JSON.stringify({endpoint,status:response.status,body:body.replaceAll(process.env.LUNA_API_KEY||'__missing__','[redacted]').slice(0,4000)}));
+import { callGeminiJSON } from '../src/web-demo/luna.js';
+
+try {
+  const result = await callGeminiJSON(
+    'Return a JSON object.',
+    'Return {"lines":[{"query":"milk","quantity":1}]}.'
+  );
+  console.log(JSON.stringify({ ok: true, result }));
+} catch (error) {
+  console.error(JSON.stringify({ ok: false, code: error.code || 'AI_ERROR', error: error.message }));
+  process.exitCode = 1;
+}
