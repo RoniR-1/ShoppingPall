@@ -4,127 +4,176 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>shopping pal</title>
-  <link rel="stylesheet" href="/style.css">
+  <link id="theme-css" rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="topbar-left">
+    <div class="topbar-left" data-chrome>
       <a class="brand" href="/user-agent-demo">shopping pal</a>
       <span id="source-status" class="status-tag">postgres · 17,546 items</span>
     </div>
     <div class="topbar-right">
-      <a class="nav-link" href="/managed-agent">Managed agent</a>
-      <span class="buyer-tag">buyer: <strong id="buyer-label">demo-buyer</strong></span>
-      <button id="toggle" class="ghost-btn small-btn" type="button">Settings</button>
+      <a class="nav-link" href="/managed-agent" data-chrome>Managed agent</a>
+      <label class="checkbox-label"><input type="checkbox" id="plain-mode"><span>Plain</span></label>
+      <span class="buyer-tag" data-chrome>buyer: <strong id="buyer-label">demo-buyer</strong></span>
+      <button id="toggle" class="ghost-btn small-btn" type="button" data-chrome>Settings</button>
     </div>
   </header>
 
-  <section id="setup" class="settings-popover" hidden>
-    <div class="settings-grid">
-      <label>
-        <span>Buyer ID</span>
-        <input id="user" value="demo-buyer" aria-label="Buyer ID">
-      </label>
-      <label>
-        <span>Risk threshold</span>
-        <input id="threshold" type="number" min="0" step="any" value="25">
-      </label>
-      <label>
-        <span>Data source</span>
-        <select id="source">
-          <option value="real" selected>PostgreSQL (17,546 items)</option>
-          <option value="demo">In-memory demo (7 items)</option>
-        </select>
-      </label>
-      <label>
-        <span>Stock mode</span>
-        <select id="stock">
-          <option value="normal">Normal stock</option>
-          <option value="low">Low stock</option>
-        </select>
-      </label>
-    </div>
-    <div class="settings-actions">
-      <button id="reset" class="ghost-btn small-btn" type="button">Reset stock</button>
-      <button id="save" class="primary-btn small-btn" type="button">Apply threshold</button>
+  <section id="setup" class="settings-view" hidden>
+    <div class="settings-inner">
+      <div class="settings-header">
+        <div class="settings-title-group">
+          <span class="settings-tag">SETTINGS</span>
+          <h2>Buyer Profiles &amp; Thresholds</h2>
+        </div>
+        <button id="back-workspace" class="ghost-btn small-btn" type="button">← Back to orders</button>
+      </div>
+
+      <div id="settings-feedback" class="settings-feedback" role="status" hidden>
+        <span id="settings-feedback-text"></span>
+        <button id="settings-feedback-close" class="error-close" type="button" aria-label="Dismiss message">×</button>
+      </div>
+
+      <div class="settings-layout">
+        <section class="panel settings-panel">
+          <div class="settings-row">
+            <label class="grow">
+              <span>Active buyer</span>
+              <select id="user" aria-label="Active buyer">
+                <option value="demo-buyer">demo-buyer</option>
+              </select>
+            </label>
+            <label class="num-field">
+              <span>Threshold</span>
+              <input id="threshold" type="number" min="0" step="any" value="25">
+            </label>
+            <button id="save" class="primary-btn small-btn" type="button">Save</button>
+          </div>
+
+          <hr class="settings-divider">
+
+          <div class="settings-row">
+            <label class="grow">
+              <span>Create new buyer</span>
+              <input id="new-buyer-id" type="text" placeholder="e.g. buyer-eu-north" autocomplete="off">
+            </label>
+            <label class="num-field">
+              <span>Threshold</span>
+              <input id="new-buyer-threshold" type="number" min="0" step="any" value="25">
+            </label>
+            <button id="create-buyer-btn" class="primary-btn small-btn" type="button">+ Create</button>
+          </div>
+
+          <hr class="settings-divider">
+
+          <div class="table-wrap">
+            <table class="buyers-table">
+              <thead>
+                <tr>
+                  <th>Buyer</th>
+                  <th class="num">Threshold</th>
+                  <th class="num">Status</th>
+                </tr>
+              </thead>
+              <tbody id="buyers-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel settings-panel">
+          <div class="panel-bar">
+            <h2>Data Source</h2>
+          </div>
+          <div class="settings-stack">
+            <label>
+              <span>Catalog database</span>
+              <select id="source">
+                <option value="real" selected>PostgreSQL (17,546 items)</option>
+                <option value="demo">In-memory demo (7 items)</option>
+              </select>
+            </label>
+          </div>
+        </section>
+      </div>
     </div>
   </section>
 
-  <main class="container">
-    <section class="panel request-panel">
-      <div class="panel-bar">
-        <span>01 · Order input</span>
-        <span class="muted">Ctrl+Enter to submit</span>
-      </div>
-      <div class="prompt-wrap">
-        <span class="prompt-prefix">&gt;</span>
-        <textarea id="prompt" rows="2" placeholder="Enter query here"></textarea>
-      </div>
-      <div class="demo-prompt-controls">
-        <label for="demo-scenario">Guided demo scenario</label>
-        <div class="demo-prompt-actions">
-          <select id="demo-scenario" aria-label="Choose a demo scenario"><option value="">Loading scenarios…</option></select>
-          <button id="scenario-start" class="ghost-btn small-btn" type="button">Start</button>
-          <button id="scenario-next" class="ghost-btn small-btn" type="button" disabled>Next prompt</button>
+  <main id="workspace" class="container">
+    <div class="col">
+      <section class="panel request-panel">
+        <div class="panel-bar" data-chrome>
+          <span>01 · Order input</span>
+          <span class="muted">Ctrl+Enter to submit</span>
         </div>
-        <p id="scenario-help" class="muted" aria-live="polite">Start a scenario, submit each loaded prompt, and approve any baseline order before continuing.</p>
-      </div>
-      <div class="request-footer">
-        <label class="checkbox-label">
-          <input type="checkbox" id="force-flag">
-          <span>Require manual review (--force-flag)</span>
-        </label>
-        <button class="primary-btn" id="submit" type="button">Run order</button>
-      </div>
-    </section>
+        <div class="prompt-wrap">
+          <span class="prompt-prefix" data-chrome>&gt;</span>
+          <textarea id="prompt" rows="4" placeholder="Enter query here"></textarea>
+        </div>
+        <div id="input-error" class="input-error" role="alert" hidden>
+          <span id="input-error-text"></span>
+          <button id="input-error-close" class="ghost-btn small-btn" type="button" aria-label="Dismiss error">×</button>
+        </div>
+        <div class="request-footer">
+          <label class="checkbox-label" data-chrome>
+            <input type="checkbox" id="force-flag">
+            <span>Require manual review (--force-flag)</span>
+          </label>
+          <button class="primary-btn" id="submit" type="button">Run order</button>
+        </div>
+      </section>
 
-    <section class="panel" id="execution" hidden>
-      <div class="panel-bar">
-        <span id="exec-title">Execution result</span>
-        <span id="exec-badge" class="badge"></span>
-      </div>
-      <div id="item-summary"></div>
-      <details class="trace-details">
-        <summary>+ Trace log &amp; raw JSON</summary>
-        <ol id="steps" class="steps-list"></ol>
-        <pre id="raw"></pre>
+      <section class="panel" id="execution" hidden>
+        <div class="panel-bar" data-chrome>
+          <span id="exec-title">Execution result</span>
+          <span id="exec-badge" class="badge"></span>
+        </div>
+        <div id="item-summary"></div>
+        <details class="trace-details" data-chrome>
+          <summary>+ Trace log &amp; raw JSON</summary>
+          <ol id="steps" class="steps-list"></ol>
+          <pre id="raw"></pre>
+        </details>
+      </section>
+
+      <details class="panel history-panel scenarios-panel" id="scenarios-wrap" data-chrome>
+        <summary class="panel-bar history-summary">
+          <span>Guided demo scenarios <span class="muted">(presets)</span></span>
+          <span class="muted toggle-hint">Show / hide</span>
+        </summary>
+        <div class="demo-prompt-controls">
+          <div class="demo-prompt-actions">
+            <select id="demo-scenario" aria-label="Choose a demo scenario"><option value="">Loading scenarios…</option></select>
+            <button id="scenario-start" class="ghost-btn small-btn" type="button">Start</button>
+            <button id="scenario-next" class="ghost-btn small-btn" type="button" disabled>Next prompt</button>
+          </div>
+          <p id="scenario-help" class="muted" aria-live="polite">Start a scenario, submit each loaded prompt, and approve any baseline order before continuing.</p>
+        </div>
       </details>
-    </section>
+    </div>
 
-    <section class="panel">
-      <div class="panel-bar">
-        <div>
-          <span>02 · Approval queue</span>
-          <span class="muted">(<span id="count">0</span> pending)</span>
+    <div class="col">
+      <section class="panel">
+        <div class="panel-bar" data-chrome>
+          <div>
+            <span>02 · Approval queue</span>
+            <span class="muted">(<span id="count">0</span> pending)</span>
+          </div>
+          <button id="refresh" class="ghost-btn small-btn" type="button">Refresh</button>
         </div>
-        <button id="refresh" class="ghost-btn small-btn" type="button">Refresh</button>
-      </div>
-      <div id="orders"></div>
-    </section>
+        <div id="orders"></div>
+      </section>
 
-    <details class="panel history-panel" id="history-wrap">
-      <summary class="panel-bar history-summary">
-        <span>03 · Order log <span class="muted">(<span id="history-count">0</span> processed)</span></span>
-        <span class="muted toggle-hint">Show / hide</span>
-      </summary>
-      <div id="history-orders"></div>
-    </details>
-
-    <section class="panel catalog-panel">
-      <div class="panel-bar">
-        <span>04 · Catalog lookup</span>
-      </div>
-      <div class="catalog-search-bar">
-        <span class="prompt-prefix">?</span>
-        <input id="catalog-query" type="search" placeholder="Enter query here" aria-label="Search catalog">
-        <button id="catalog-search-btn" class="ghost-btn small-btn" type="button">Search</button>
-        <button id="catalog-clear-btn" class="ghost-btn small-btn" type="button" hidden>Clear</button>
-      </div>
-      <div id="catalog-products" hidden></div>
-    </section>
+      <details class="panel history-panel" id="history-wrap" data-chrome>
+        <summary class="panel-bar history-summary">
+          <span>03 · Order log <span class="muted">(<span id="history-count">0</span> processed)</span></span>
+          <span class="muted toggle-hint">Show / hide</span>
+        </summary>
+        <div id="history-orders"></div>
+      </details>
+    </div>
   </main>
 
-  <div id="message" class="toast" role="status" aria-live="polite" hidden></div>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

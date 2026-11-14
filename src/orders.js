@@ -70,7 +70,9 @@ export function scoreOrder(items, { policy, history, now = new Date(), evaluateE
       item.substitutionRisk === 'mapped_pack_or_nutrition_shift' ? 30 : 0;
     penalties.substitution = Math.max(penalties.substitution, substitutionPoints);
     if (item.approvedPrecedent === true) discounts.approvedPrecedent = Math.max(discounts.approvedPrecedent, 20);
-    const dateDiff = Math.ceil((new Date(item.availableDate) - new Date(item.requestedDate)) / 86400000);
+    const availDay = String(item.availableDate || '').slice(0, 10);
+    const reqDay = String(item.requestedDate || '').slice(0, 10);
+    const dateDiff = availDay && reqDay ? Math.round((Date.parse(availDay) - Date.parse(reqDay)) / 86400000) : 0;
     if (!item.acceptedDeliveryDelay && dateDiff >= 2) penalties.deliveryDelay = Math.max(penalties.deliveryDelay, 65);
     else if (!item.acceptedDeliveryDelay && dateDiff >= 1) penalties.deliveryDelay = Math.max(penalties.deliveryDelay, 35);
   }
@@ -101,9 +103,11 @@ function buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLi
     add('allergenConflict', item.productId, 60, `${item.name || item.productId} contains ${allergen}. Keep this item in the order?`, ['remove_item', 'cancel']);
   }
   for (const item of items) {
-    const delay = Math.ceil((new Date(item.availableDate) - new Date(item.requestedDate)) / 86400000);
-    if (delay > 0) add('deliveryDelay', item.productId, delay >= 2 ? 65 : 35,
-      `${item.name || item.productId} will arrive on ${String(item.availableDate).slice(0,10)} instead of ${String(item.requestedDate).slice(0,10)}. Proceed anyway?`, ['accept_delay', 'remove_item', 'cancel']);
+    const availDay = String(item.availableDate || '').slice(0, 10);
+    const reqDay = String(item.requestedDate || '').slice(0, 10);
+    const delay = availDay && reqDay ? Math.round((Date.parse(availDay) - Date.parse(reqDay)) / 86400000) : 0;
+    if (!item.acceptedDeliveryDelay && delay > 0) add('deliveryDelay', item.productId, delay >= 2 ? 65 : 35,
+      `${item.name || item.productId} will arrive on ${availDay} instead of ${reqDay}. Proceed anyway?`, ['accept_delay', 'remove_item', 'cancel']);
     const prior = last10.flatMap(o => (o.items || []).filter(i => i.productId === item.productId));
     const usualMax = prior.length ? Math.max(...prior.map(i => Number(i.quantity))) : null;
     const usualMin = prior.length ? Math.min(...prior.map(i => Number(i.quantity))) : null;
@@ -222,6 +226,7 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
       } else if (alternative === 'keep_original') {
         const current = order.items.find(i => i.productId === question.product_id);
         assert(current?.orig_product_id, 409, 'The original product is not available in the substitution mapping');
+        assert(!order.items.some(i => i.productId === current.orig_product_id && i.productId !== current.productId), 409, 'The original product is already in this order');
         const quote = (await db.query('SELECT items FROM quotes WHERE id=$1', [order.quote_id])).rows[0];
         const quoteItems = typeof quote.items === 'string' ? JSON.parse(quote.items) : quote.items;
         const original = quoteItems.find(i => i.productId === current.orig_product_id);

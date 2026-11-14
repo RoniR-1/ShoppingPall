@@ -35,13 +35,15 @@ describe('Gatekeeper',()=>{
 
   const tooLittle=route({
    lines:[{quantity:2,query:'apple'}],
-   items:[{productId:'460895',quantity:2,price:2.5,bought_count:3,human_approved_count:1,prior_max_qty:12,prior_min_qty:10,allergen_safe:true,reliability:1,carbon:0.165}],
+   items:[{lineIndex:0,productId:'460895',name:'Apple Golden',quantity:2,price:2.5,bought_count:3,human_approved_count:1,prior_max_qty:12,prior_min_qty:10,allergen_safe:true,reliability:1,carbon:0.165,alternatives:[{productId:'460891',name:'Apple Red',unit:'BAG',price:2.1,available:50}]}],
    total:5,
    buyerHistory:{spendCap:200,minOrderTotal:25}
   });
   expect(tooLittle.score).toBeGreaterThan(25);
   expect(tooLittle.reason).toContain('Unusually small quantity vs prior orders');
   expect(tooLittle.status).toBe('PENDING_APPROVAL');
+  expect(tooLittle.questions.length).toBeGreaterThanOrEqual(1);
+  expect(tooLittle.questions[0].alternatives[0].productId).toBe('460891');
  });
 });
 
@@ -58,6 +60,87 @@ it('keeps concurrent database sources isolated',async()=>{
 import {DemoStore} from '../src/web-demo/demo-store.js';
 it('demo is ready with seven products without PostgreSQL',()=>{const d=new DemoStore();expect(d.overview().products).toHaveLength(7);expect(d.search('beer')).toHaveLength(2);expect(d.overview().products[0].substitutions).toHaveLength(1);});
 it('demo checkout is atomic and repeated approval does not debit twice',()=>{const d=new DemoStore();d.save({id:'a',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:2}]});d.decide({id:'a',user_id:'u',action:'approve'});d.decide({id:'a',user_id:'u',action:'approve'});expect(d.stock.get('demo-beer')).toBe(98);d.save({id:'b',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:1},{productId:'demo-eggs',quantity:101}]});expect(()=>d.decide({id:'b',user_id:'u',action:'approve'})).toThrow('Stock changed');expect(d.stock.get('demo-beer')).toBe(98);});
+it('keeps buyers and risk thresholds independent and rejects duplicate creation',()=>{
+ const d=new DemoStore();
+ expect(d.getBuyer('demo-buyer').threshold).toBe(25);
+ expect(d.getBuyer('ghost-buyer').threshold).toBe(25);
+ expect(d.listBuyers().map(b=>b.user_id)).toEqual(['demo-buyer']);
+ const alice=d.upsertBuyer('alice',12.3456,{createOnly:true});
+ expect(alice).toEqual({user_id:'alice',threshold:12.346});
+ expect(()=>d.upsertBuyer('alice',99,{createOnly:true})).toThrow('already exists');
+ d.upsertBuyer('bob',60,{createOnly:true});
+ d.upsertBuyer('alice',40);
+ expect(d.getBuyer('alice').threshold).toBe(40);
+ expect(d.getBuyer('bob').threshold).toBe(60);
+ expect(d.getBuyer('demo-buyer').threshold).toBe(25);
+ expect(d.listBuyers().map(b=>b.user_id)).toEqual(['demo-buyer','alice','bob']);
+});
+it('tracks per-buyer item history in DemoStore search and distinct question IDs on split lines',()=>{
+ const d=new DemoStore();
+ d.save({id:'o1',user_id:'alice',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:4}]});
+ d.decide({id:'o1',user_id:'alice',action:'approve',human:true});
+ const [lager]=d.search('lager beer','alice');
+ expect(lager.bought_count).toBe(1);
+ expect(lager.human_approved_count).toBe(1);
+ expect(lager.prior_max_qty).toBe(4);
+ expect(lager.prior_min_qty).toBe(4);
+ const split=new SuspicionScorer().score({
+  lines:[{quantity:10,query:'beer'}],
+  items:[
+   {lineIndex:0,productId:'demo-beer',name:'Lager beer',quantity:5,price:2.5},
+   {lineIndex:0,productId:'demo-dark-beer',name:'Dark beer',quantity:5,price:2.5}
+  ]
+ });
+ const ids=split.questions.map(q=>q.id);
+ expect(new Set(ids).size).toBe(ids.length);
+});
 
 import {closestProducts} from '../src/web-demo/matches.js';
 it('suggests chocolates and typos without unrelated food',()=>{const d=new DemoStore();expect(closestProducts('chocolates',d.products).map(p=>p.id)).toEqual(['demo-dark-chocolate','demo-milk-chocolate']);expect(closestProducts('choclate',d.products)).toHaveLength(2);expect(closestProducts('vegan chocolate',d.products)).toEqual([]);expect(closestProducts('salmon',d.products)).toEqual([]);});
+it('sets humane question metadata with manual quantity adjustment and disables substitutes on volume/quantity rules',()=>{
+ const s=new SuspicionScorer();
+ const spikeScore=s.score({
+  lines:[{quantity:12,query:'oat milk'}],
+  items:[{lineIndex:0,productId:'demo-oat-milk',name:'Oat milk',quantity:12,price:2,unit:'L',lot:1,bought_count:2,human_approved_count:1,prior_max_qty:4,prior_min_qty:4}]
+ });
+ const spikeQ=spikeScore.questions.find(q=>q.rule==='quantitySpike');
+ expect(spikeQ).toBeTruthy();
+ expect(spikeQ.allowQuantityEdit).toBe(true);
+ expect(spikeQ.allowSubstitution).toBe(false);
+ expect(spikeQ.currentQty).toBe(12);
+ expect(spikeQ.suggestedQty).toBe(4);
+ const dropScore=s.score({
+  lines:[{quantity:1,query:'oat milk'}],
+  items:[{lineIndex:0,productId:'demo-oat-milk',name:'Oat milk',quantity:1,price:2,unit:'L',lot:1,bought_count:2,human_approved_count:1,prior_max_qty:4,prior_min_qty:4}]
+ });
+ const dropQ=dropScore.questions.find(q=>q.rule==='quantityDrop');
+ expect(dropQ).toBeTruthy();
+ expect(dropQ.allowQuantityEdit).toBe(true);
+ expect(dropQ.allowSubstitution).toBe(false);
+ expect(dropQ.suggestedQty).toBe(4);
+ const unfamScore=s.score({
+  lines:[{quantity:5,query:'pears'}],
+  items:[{lineIndex:0,productId:'demo-pears',name:'Pears',quantity:5,price:2.5,unit:'BAG',lot:1,bought_count:0,human_approved_count:0}]
+ });
+ const unfamQ=unfamScore.questions.find(q=>q.rule==='unfamiliarItem');
+ expect(unfamQ).toBeTruthy();
+ expect(unfamQ.allowQuantityEdit).toBe(true);
+ expect(unfamQ.allowSubstitution).toBe(true);
+});
+it('does not flag generic requests like pear as substitutions and avoids duplicate unfamiliar+substitution questions',()=>{
+ const s=new SuspicionScorer();
+ const genericPear=s.score({
+  lines:[{quantity:50,query:'pear',requested:'50 × pear'}],
+  items:[{lineIndex:0,productId:'462574',name:'PEAR SUOMI KG',quantity:50,price:2.5,unit:'KG',lot:1,bought_count:1,human_approved_count:1,prior_max_qty:50,prior_min_qty:50,requested:'50 × pear',substitution:true}]
+ });
+ expect(genericPear.reason).not.toContain('Product substitution');
+ expect(genericPear.questions.some(q=>q.rule==='substitution')).toBe(false);
+
+ const specificBrand=s.score({
+  lines:[{quantity:4,query:'conference pear',requested:'4 conference pear'}],
+  items:[{lineIndex:0,productId:'462574',name:'PEAR SUOMI KG',quantity:4,price:2.5,unit:'KG',lot:1,bought_count:0,human_approved_count:0,requested:'4 conference pear'}]
+ });
+ expect(specificBrand.reason).toContain('Product substitution');
+ expect(specificBrand.questions).toHaveLength(1);
+ expect(specificBrand.questions[0].message).toContain('conference');
+});
