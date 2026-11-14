@@ -4,7 +4,7 @@ import { z, ZodError } from 'zod';
 import { pool } from './db.js';
 import { id, selectedRequest, orderRequest, assert } from './contracts.js';
 import { ValioClient } from './valio.js';
-import { createOrder, decideOrder } from './orders.js';
+import { createOrder, decideOrder, excludeOrderFromBaseline, setOrderRoutine, answerMandateQuestion } from './orders.js';
 const columns = 'id,name,category,country_of_origin,sales_unit,allowed_lot_size,carbon_kg_co2_per_kg,delivery_reliability';
 export function createApp({ valio = new ValioClient(), screening } = {}) {
   const app = express();
@@ -13,6 +13,25 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
   app.get('/health', async (_req,res) => { await pool.query('SELECT 1'); res.json({ ok: true, mocked: valio.mock }); });
   // Local demo identity only. Replace with verified session/token identity before deployment.
   app.use((req,_res,next) => { req.user = id.parse(req.get('X-User-Id')); next(); });
+  app.get('/risk-policy', async (req,res) => {
+    const row = (await pool.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1', [req.user])).rows[0];
+    res.json(row || { user_id:req.user, hard_spend_limit:1000, weekly_spend_limit:5000, blocked_categories:[], excluded_allergens:[], defaults:true });
+  });
+  app.put('/risk-policy', async (req,res) => {
+    const patch = z.object({
+      hard_spend_limit:z.number().finite().positive().optional(), weekly_spend_limit:z.number().finite().positive().optional(),
+      blocked_categories:z.array(id).max(500).optional(), excluded_allergens:z.array(id).max(500).optional()
+    }).strict().refine(v => Object.keys(v).length > 0, 'Provide at least one policy field').parse(req.body);
+    const old = (await pool.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1', [req.user])).rows[0] ||
+      { hard_spend_limit:1000, weekly_spend_limit:5000, blocked_categories:[], excluded_allergens:[] };
+    const next = { ...old, ...patch };
+    const row = (await pool.query(`INSERT INTO buyer_risk_policies(user_id,hard_spend_limit,weekly_spend_limit,blocked_categories,excluded_allergens)
+      VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id) DO UPDATE SET hard_spend_limit=EXCLUDED.hard_spend_limit,
+      weekly_spend_limit=EXCLUDED.weekly_spend_limit,blocked_categories=EXCLUDED.blocked_categories,
+      excluded_allergens=EXCLUDED.excluded_allergens RETURNING *`,
+      [req.user,next.hard_spend_limit,next.weekly_spend_limit,next.blocked_categories,next.excluded_allergens])).rows[0];
+    res.json(row);
+  });
   app.get('/catalog/search', async (req,res) => {
     const q = z.object({ q: z.string().trim().min(2).max(200).optional(), product_id: id.optional(), category: id.optional(),
       country: z.string().regex(/^[a-z]{2}$/).optional(), min_reliability: z.coerce.number().min(0).max(1).optional(),
@@ -49,7 +68,7 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
     const request = await selected(req);
     const [prices, availability, catalog] = await Promise.all([
       valio.price(request), valio.availability(request),
-      pool.query(`SELECT ${columns} FROM products WHERE id=ANY($1) AND NOT deleted`, [request.products])
+      pool.query(`SELECT ${columns},raw FROM products WHERE id=ANY($1) AND NOT deleted`, [request.products])
     ]);
     assert(typeof prices.currency === 'string' && prices.currency.length > 0, 502, 'Missing upstream currency');
     const items = request.products.map(productId => {
@@ -62,10 +81,14 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
       const priced = price.error === false && price.quantity === 1 && Number.isFinite(unitPrice) && unitPrice >= 0 && priceCurrency === prices.currency;
       const lines = Array.isArray(stock.scheduleLines) ? stock.scheduleLines : [];
       const line = lines.find(l => l.salesBlock === false && Number.isFinite(l.availableAmount) && l.availableAmount > 0 &&
-        typeof l.availableDate === 'string' && l.availableDate.slice(0,10) <= request.requestedDate &&
+        typeof l.availableDate === 'string' &&
         (valio.mock || l.salesUnit === p.sales_unit));
       const cutoffOk = stock.closingTime == null || (Number.isFinite(Date.parse(stock.closingTime)) && Date.parse(stock.closingTime) > Date.now());
+      const rawProduct = p.raw || {};
+      const allergenClass = rawProduct.synkkaData?.classifications?.find(c => c.name === 'allergen');
+      const allergens = (allergenClass?.values || []).filter(v => v.unit === 'CONTAINS').map(v => v.id);
       return { ...p, productId, unit_price: priced ? unitPrice : null,
+        logistic_model: stock.logisticModel, allergens,
         availableAmount: line?.availableAmount ?? 0, availableDate: line?.availableDate ?? null,
         orderable: Boolean(priced && stock.salesBlock === false && line && cutoffOk),
         price, availability: stock };
@@ -92,6 +115,19 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
     const orderId = z.string().uuid().parse(req.params.orderId);
     const order = (await pool.query('SELECT * FROM orders WHERE id=$1 AND user_id=$2', [orderId,req.user])).rows[0];
     assert(order,404,'Order not found'); res.json(order);
+  });
+  app.post('/orders/:orderId/baseline-exclusion', async (req,res) => {
+    const body = z.object({ exclude: z.boolean() }).strict().parse(req.body);
+    res.json(await excludeOrderFromBaseline(req.user,z.string().uuid().parse(req.params.orderId),body.exclude));
+  });
+  app.post('/orders/:orderId/routine', async (req,res) => {
+    const body = z.object({ routine:z.boolean() }).strict().parse(req.body);
+    res.json(await setOrderRoutine(req.user,z.string().uuid().parse(req.params.orderId),body.routine));
+  });
+  app.post('/orders/:orderId/mandate', async (req,res) => {
+    const body = z.object({ question_id: z.string().min(1), answer: z.enum(['yes','no']), alternative: z.string().optional() }).strict().parse(req.body);
+    res.json(await answerMandateQuestion(req.user,z.string().uuid().parse(req.params.orderId),
+      { questionId: body.question_id, answer: body.answer, alternative: body.alternative }));
   });
   for (const [action,status] of [['approve','APPROVED'],['reject','REJECTED']]) {
     app.post(`/orders/:orderId/${action}`, async (req,res) => {
