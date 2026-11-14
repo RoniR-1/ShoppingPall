@@ -116,7 +116,84 @@ export function stripSustainability(text) {
       return parts;
     }, { out: '', sep: ',' }).out.replace(/[\s.!]+$/, '');
 }
-// Removes order-wide constraints (budget, delivery window, sustainability) so only product lines remain for parsing.
+// Removes order-wide constraints (budget, delivery window, sustainability, origin) so only product lines remain for parsing.
 export function stripOrderConstraints(text) {
-  return stripSustainability(stripDelivery(stripBudget(text)));
+  return stripOrigin(stripSustainability(stripDelivery(stripBudget(text))));
+}
+// Country of origin requests. Codes match products.country_of_origin (ISO 3166-1 alpha-2, lower case).
+// Adjectives such as "French" or "Greek" only count in an explicit origin context ("French only", "prefer French",
+// "from France"), so product names like "French fries" or "Greek yoghurt" are left alone.
+const COUNTRIES = [
+  ['fi', 'Finland', 'finnish'], ['se', 'Sweden', 'swedish'], ['no', 'Norway', 'norwegian'], ['dk', 'Denmark', 'danish'],
+  ['ee', 'Estonia', 'estonian'], ['lv', 'Latvia', 'latvian'], ['lt', 'Lithuania', 'lithuanian'], ['de', 'Germany', 'german'],
+  ['fr', 'France', 'french'], ['it', 'Italy', 'italian'], ['es', 'Spain', 'spanish'], ['pt', 'Portugal', 'portuguese'],
+  ['nl', 'the Netherlands', 'netherlands', 'holland', 'dutch'], ['be', 'Belgium', 'belgian'], ['pl', 'Poland', 'polish'],
+  ['at', 'Austria', 'austrian'], ['ch', 'Switzerland', 'swiss'], ['cz', 'Czechia', 'czech republic', 'czech'],
+  ['sk', 'Slovakia', 'slovak', 'slovakian'], ['hu', 'Hungary', 'hungarian'], ['gr', 'Greece', 'greek'], ['ie', 'Ireland', 'irish'],
+  ['gb', 'the United Kingdom', 'united kingdom', 'uk', 'great britain', 'britain', 'british', 'england', 'english', 'scotland', 'scottish', 'wales', 'welsh'],
+  ['us', 'the United States', 'united states', 'usa', 'american'], ['ca', 'Canada', 'canadian'], ['mx', 'Mexico', 'mexican'],
+  ['br', 'Brazil', 'brazilian'], ['ar', 'Argentina', 'argentinian', 'argentine'], ['cl', 'Chile', 'chilean'], ['pe', 'Peru', 'peruvian'],
+  ['cn', 'China', 'chinese'], ['jp', 'Japan', 'japanese'], ['th', 'Thailand', 'thai'], ['vn', 'Vietnam', 'vietnamese'],
+  ['in', 'India', 'indian'], ['tr', 'Turkey', 'turkish'], ['ma', 'Morocco', 'moroccan'], ['za', 'South Africa', 'south african'],
+  ['nz', 'New Zealand', 'new zealand'], ['au', 'Australia', 'australian'], ['il', 'Israel', 'israeli'], ['eg', 'Egypt', 'egyptian'],
+  ['ro', 'Romania', 'romanian'], ['bg', 'Bulgaria', 'bulgarian'], ['hr', 'Croatia', 'croatian'], ['si', 'Slovenia', 'slovenian'],
+  ['cy', 'Cyprus', 'cypriot'], ['lu', 'Luxembourg'], ['ua', 'Ukraine', 'ukrainian'], ['is', 'Iceland', 'icelandic'],
+  ['ph', 'the Philippines', 'philippines', 'filipino'], ['id', 'Indonesia', 'indonesian'], ['my', 'Malaysia', 'malaysian'],
+  ['tw', 'Taiwan', 'taiwanese'], ['kr', 'South Korea', 'korea', 'korean'], ['lk', 'Sri Lanka', 'sri lankan'], ['sg', 'Singapore'],
+  ['pk', 'Pakistan', 'pakistani'], ['bd', 'Bangladesh'], ['ae', 'the United Arab Emirates', 'united arab emirates', 'uae'],
+  ['ke', 'Kenya', 'kenyan'], ['tn', 'Tunisia', 'tunisian'], ['mg', 'Madagascar'], ['ug', 'Uganda'], ['gh', 'Ghana', 'ghanaian'],
+  ['cr', 'Costa Rica', 'costa rican'], ['gt', 'Guatemala', 'guatemalan'], ['ec', 'Ecuador', 'ecuadorian'],
+  ['co', 'Colombia', 'colombian'], ['py', 'Paraguay'], ['jm', 'Jamaica', 'jamaican'], ['cu', 'Cuba', 'cuban'], ['do', 'the Dominican Republic', 'dominican republic']
+];
+const COUNTRY_BY_WORD = new Map(COUNTRIES.flatMap(([code, name, ...aliases]) =>
+  [name.replace(/^the\s+/i, ''), ...aliases].map(word => [word.toLowerCase(), code])));
+const COUNTRY_NAMES = new Map(COUNTRIES.map(([code, name]) => [code, name]));
+const COUNTRY_WORD = String.raw`(?:the\s+)?(?:${[...COUNTRY_BY_WORD.keys()].sort((a, b) => b.length - a.length).map(w => w.replace(/\s+/g, String.raw`\s+`)).join('|')})`;
+const COUNTRY_LIST = String.raw`(${COUNTRY_WORD}(?:\s*(?:,|\/|\bor\b|\band\b)\s*${COUNTRY_WORD})*)`;
+const ORIGIN_VERB = String.raw`(?:from|made\s+in|grown\s+in|produced\s+in|sourced\s+from|of)\s+`;
+const ORIGIN_NOUN = String.raw`(?:\s+(?:origin|products?|produce|goods|ones|items))?`;
+const ORIGIN_PATTERNS = [
+  // Strict: "English only", "only from Finland", "Finnish products only", "must be from Spain".
+  [new RegExp(String.raw`\b(?:only|exclusively|strictly)\s+(?:${ORIGIN_VERB})?${COUNTRY_LIST}${ORIGIN_NOUN}\b`, 'i'), true],
+  [new RegExp(String.raw`(?<!\bin\s)\b${COUNTRY_LIST}${ORIGIN_NOUN}\s+only\b`, 'i'), true],
+  [new RegExp(String.raw`\b(?:must|has\s+to|have\s+to|needs?\s+to)\s+be\s+(?:${ORIGIN_VERB})?${COUNTRY_LIST}${ORIGIN_NOUN}\b`, 'i'), true],
+  // Preference: "prefer Finnish", "from Finland if possible", "Finnish origin", "made in Italy".
+  [new RegExp(String.raw`\b(?:prefer(?:ably|red|ring)?|ideally)\s+(?:${ORIGIN_VERB})?${COUNTRY_LIST}${ORIGIN_NOUN}(?:\s+if\s+possible)?\b`, 'i'), false],
+  [new RegExp(String.raw`\b(?:from|made\s+in|grown\s+in|produced\s+in|sourced\s+from)\s+${COUNTRY_LIST}${ORIGIN_NOUN}(?:\s+if\s+possible)?\b`, 'i'), false],
+  [new RegExp(String.raw`\b${COUNTRY_LIST}\s+(?:origin|if\s+possible|preferred)\b`, 'i'), false]
+];
+function countriesIn(list) {
+  return [...new Set(list.toLowerCase().split(/\s*(?:,|\/|\bor\b|\band\b)\s*/)
+    .map(word => COUNTRY_BY_WORD.get(word.replace(/^the\s+/, '').replace(/\s+/g, ' ').trim())).filter(Boolean))];
+}
+function findOrigins(text) {
+  const source = String(text ?? '');
+  const found = [];
+  for (const [pattern, strict] of ORIGIN_PATTERNS) {
+    const global = new RegExp(pattern.source, 'gi');
+    for (const match of source.matchAll(global)) {
+      const countries = countriesIn(match[1]);
+      if (countries.length) found.push({ countries, strict, index: match.index, length: match[0].length });
+    }
+  }
+  // Keep non-overlapping matches, earliest and longest first.
+  found.sort((a, b) => a.index - b.index || b.length - a.length);
+  return found.filter((m, i) => found.slice(0, i).every(prev => prev.index + prev.length <= m.index || m.index + m.length <= prev.index));
+}
+// { countries: ['fi'], strict: true } for "Finnish only"; strict is false for a preference such as "prefer Finnish".
+export function parseOriginPreference(text) {
+  const found = findOrigins(text);
+  if (!found.length) return null;
+  return { countries: [...new Set(found.flatMap(m => m.countries))], strict: found.some(m => m.strict) };
+}
+export function countryName(code) {
+  // zy/zz/xs are not countries: the catalog uses them when origin varies or is unknown.
+  if (['zy', 'zz', 'xs'].includes(String(code ?? '').toLowerCase())) return 'unknown origin';
+  return COUNTRY_NAMES.get(String(code ?? '').toLowerCase()) ?? String(code ?? 'unknown').toUpperCase();
+}
+export function stripOrigin(text) {
+  let source = String(text ?? '');
+  // Strip from the end so earlier match positions stay valid.
+  for (const match of findOrigins(source).reverse()) source = stripClause(source, match);
+  return source;
 }
