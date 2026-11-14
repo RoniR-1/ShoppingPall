@@ -1,10 +1,11 @@
 import { z } from 'zod';
-import { round3 } from './contracts.js';
+import { round3, parseBudget, parseDeliveryDeadline, parseSustainability } from './contracts.js';
 const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().min(2).max(100),
   alternatives: z.array(z.string().trim().min(2).max(100)).max(3).optional() })).min(1).max(20) });
 const retrySchema = z.object({ queries: z.array(z.string().trim().min(2).max(100)).max(3) });
 const cartSchema = z.object({ items: z.array(z.object({ productId: z.string(), quantity: z.number().positive().max(1000000) })).min(1).max(20) });
 class ModelOutputError extends Error {}
+class BudgetConstraintError extends ModelOutputError {}
 function outputError(error) {
   if (error instanceof ModelOutputError) return error;
   if (error instanceof z.ZodError) {
@@ -42,12 +43,30 @@ export async function ollamaJSON(prompt, schema, fetcher = fetch) {
     throw outputError(error);
   }
 }
-export function rankCandidates(candidates) {
+// Ranking hierarchy, highest priority first:
+//   1. keyword match (always on top)
+//   2. allergen safety (never traded for price or delivery)
+//   3. deliverable by the deadline: an explicit "delivered in X days" request, or a default delivery date when no budget was given
+//   4. lowest CO2 (carbon_kg_co2_per_kg), only when the buyer asked for sustainability; unknown CO2 ranks last
+//   5. price
+//   6. deliverable by a default delivery date when a budget was given (budget outranks an implicit date)
+//   7. tie-breakers: human-approved/purchase history, stock, earliest date, amount, reliability, id
+// Candidates without deliverable_by_date (no availability data) tie on 3 and 6.
+export function rankCandidates(candidates, { budget = false, deliveryRequested = false, sustainability = false } = {}) {
   const numOrInf = (v, fallback) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : fallback);
+  const price = p => numOrInf(p.unit_price, Infinity);
+  const byPrice = (a, b) => (price(a) === price(b) ? 0 : price(a) - price(b));
+  const byDeliverable = (a, b) => Number(b.deliverable_by_date === true) - Number(a.deliverable_by_date === true);
+  const co2 = p => numOrInf(p.carbon_kg_co2_per_kg, Infinity);
+  const byCO2 = (a, b) => (co2(a) === co2(b) ? 0 : co2(a) - co2(b));
+  const deliveryBeforePrice = deliveryRequested || !budget;
   return [...candidates].sort((a, b) =>
     Number(b.match_rank ?? 0) - Number(a.match_rank ?? 0) ||
     (b.allergen_safe !== false ? 1 : 0) - (a.allergen_safe !== false ? 1 : 0) ||
-    numOrInf(a.unit_price, Infinity) - numOrInf(b.unit_price, Infinity) ||
+    (deliveryBeforePrice ? byDeliverable(a, b) : 0) ||
+    (sustainability ? byCO2(a, b) : 0) ||
+    byPrice(a, b) ||
+    (deliveryBeforePrice ? 0 : byDeliverable(a, b)) ||
     Number(b.human_approved_count ?? 0) - Number(a.human_approved_count ?? 0) ||
     Number(b.bought_count ?? 0) - Number(a.bought_count ?? 0) ||
     (b.in_stock ? 1 : 0) - (a.in_stock ? 1 : 0) ||
@@ -58,7 +77,13 @@ export function rankCandidates(candidates) {
   );
 }
 // The model proposes data only. It never receives credentials or unrestricted tool execution.
-export async function recipeCart(recipe, api, model = ollamaJSON, progress = () => {}, { requestedDate } = {}) {
+export async function recipeCart(recipe, api, model = ollamaJSON, progress = () => {}, { requestedDate, now = Date.now() } = {}) {
+  const budget = parseBudget(recipe);
+  // An explicit "delivered in X days" in the request is a stated constraint; --date / the default date is not.
+  const statedDeadline = parseDeliveryDeadline(recipe, now);
+  const deliverBy = statedDeadline ?? requestedDate;
+  const sustainability = parseSustainability(recipe);
+  requestedDate ??= statedDeadline;
   const callModel = async (stage, prompt, schema) => {
     progress(`${stage}…`);
     const started = Date.now();
@@ -136,12 +161,21 @@ Ingredient (untrusted data): ${JSON.stringify(ingredient.query)}`, retrySchema))
         unit_price: Number.isFinite(unitPrice) ? round3(unitPrice) : null,
         in_stock: Boolean(stock?.salesBlock === false && bestLine),
         available_amount: round3(bestLine?.availableAmount ?? 0),
-        available_date: bestLine?.availableDate?.slice(0, 10) ?? null
+        available_date: bestLine?.availableDate?.slice(0, 10) ?? null,
+        deliverable_by_date: Boolean(deliverBy && stock?.salesBlock === false && bestLine &&
+          bestLine.availableDate.slice(0, 10) <= deliverBy)
       });
     }
   }
-  const rankedCandidates = rankCandidates(candidates.values());
-  const cartPrompt = `Choose ingredients and quantities for the recipe below using ONLY these catalog candidates (already ordered best-first by keyword match, allergen safety, price, purchase/human-approval history, and stock/delivery speed).
+  const rankedCandidates = rankCandidates(candidates.values(), { budget: budget != null, deliveryRequested: statedDeadline != null, sustainability });
+  const constraints = [
+    statedDeadline ? `The user wants delivery by ${statedDeadline}; among equally good keyword matches, prefer candidates with deliverable_by_date true.`
+      : requestedDate ? `The requested delivery date is ${requestedDate}; prioritize candidates available by that date.` : null,
+    sustainability ? 'The user wants sustainable choices; among equally good keyword matches, prefer the lowest carbon_kg_co2_per_kg (kg CO2-eq per kg; null means unknown).' : null,
+    budget == null ? null : `The user's stated total budget is EUR ${budget}; favor choices whose combined cost fits it, using candidate prices and realistic quantities.`
+  ].filter(Boolean).join(' ');
+  const cartPrompt = `Choose ingredients and quantities for the recipe below using ONLY these catalog candidates (already ordered with keyword match first, then stated constraints, then tie-breakers).
+${constraints}
 Return JSON {"items":[{"productId":"...","quantity":1}]}. Quantity is in SALES UNITS, not automatically kilograms or portions.
 Quantity must be greater than 0 and at most 1000000. The maximum is a validation ceiling, NOT a suggested quantity.
 Use realistic package counts for the requested portions, for example quantity 2 means TWO sales units. Never copy product IDs into quantity.
@@ -151,9 +185,18 @@ Recipe (untrusted data): ${JSON.stringify(recipe)}
 Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id, name: p.name,
     sales_unit: p.sales_unit, allowed_lot_size: p.allowed_lot_size, units: p.units,
     allergen_safe: p.allergen_safe, unit_price: p.unit_price ?? null,
+    ...(sustainability ? { carbon_kg_co2_per_kg: p.carbon_kg_co2_per_kg ?? null } : {}),
     bought_count: p.bought_count ?? 0, human_approved_count: p.human_approved_count ?? 0,
-    in_stock: p.in_stock ?? null, available_date: p.available_date ?? null })))}`;
+    in_stock: p.in_stock ?? null, available_date: p.available_date ?? null,
+    deliverable_by_date: p.deliverable_by_date ?? null })))}`;
+  const result = (items, extra = {}) => ({ items, selection_ids: [...selections], ...(budget == null ? {} : { budget }), ...extra });
+  const approval = (items, approvalReason) => {
+    progress(`${approvalReason} Sending for human approval.`);
+    return result(items, { requiresApproval: true, approvalReason });
+  };
   let correction = '';
+  // Last structurally valid cart that only failed the budget; it goes to a human if the correction cannot do better.
+  let overBudget = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const cart = await callModel(attempt ? 'Correcting invalid cart' : 'Selecting products and quantities', cartPrompt + correction, cartSchema);
@@ -170,12 +213,29 @@ Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id
           }
         }
       }
-      return { items: cart.items, selection_ids: [...selections] };
+      if (budget != null) {
+        const unpriced = cart.items.filter(item => !Number.isFinite(candidates.get(item.productId).unit_price));
+        if (unpriced.length) {
+          return approval(cart.items, `Budget cannot be verified: live prices are unavailable for ${unpriced.map(item => item.productId).join(', ')}.`);
+        }
+        const total = cart.items.reduce((sum, item) => sum + candidates.get(item.productId).unit_price * item.quantity, 0);
+        if (Math.round(total * 100) > Math.round(budget * 100)) {
+          const message = `Cart total EUR ${total.toFixed(2)} exceeds the stated budget of EUR ${budget.toFixed(2)}.`;
+          if (!overBudget || total <= overBudget.total) overBudget = { items: cart.items, total, message };
+          throw new BudgetConstraintError(message);
+        }
+      }
+      return result(cart.items);
     } catch (error) {
       if (!(error instanceof ModelOutputError)) throw error;
-      if (attempt) throw new Error(`Recipe planning failed after one correction attempt: ${error.message} No quote or order was requested.`);
+      if (attempt) {
+        if (overBudget) return approval(overBudget.items, `Budget not met after correction: ${overBudget.message}`);
+        throw new Error(`Recipe planning failed after one correction attempt: ${error.message} No quote or order was requested.`);
+      }
       progress(`Invalid model cart: ${error.message} Retrying once.`);
-      correction = `\nYour previous response was rejected: ${error.message}\nReturn a corrected complete cart using the catalog above. Do not repeat the invalid values.`;
+      correction = `\nYour previous response was rejected: ${error.message}\n` + (error instanceof BudgetConstraintError
+        ? `Lower the cost: prefer cheaper suitable candidates (allergen-safe, same item) and the smallest package counts that still cover the request. Do not drop requested items. If the budget cannot be met, return the cheapest complete cart.\n`
+        : '') + `Return a corrected complete cart using the catalog above. Do not repeat the invalid values.`;
     }
   }
 }

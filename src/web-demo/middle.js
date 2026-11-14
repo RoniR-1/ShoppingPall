@@ -7,7 +7,7 @@ import {route} from './policy.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
 import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {rankCandidates} from '../agent.js';
-import {round3} from '../contracts.js';
+import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints} from '../contracts.js';
 
 const app=express();
 app.use(express.json({limit:'64kb'}));
@@ -87,7 +87,8 @@ async function callGeminiJSON(systemPrompt,userPrompt){
 }
 
 async function parseRequestLines(text){
-  const trimmed=String(text||'').trim();
+  // Budget and delivery window are applied by plan(); they must not become catalog search lines.
+  const trimmed=stripOrderConstraints(String(text||'').trim()).trim();
   if(!trimmed)throw Error('Try specifying products and quantities, or describe what you want to order.');
   if(!process.env.LUNA_API_KEY){
     return planLinesSchema.parse(directLines(trimmed).map(l=>({...l,requested:`${l.quantity} ${l.query}`})));
@@ -122,6 +123,10 @@ function snapToLot(qty,lot){
 
 async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={},actionId=null,meta={}){
   if(typeof pinned==='string'){actionId=pinned;pinned={};}
+  const budget=Number.isFinite(meta.budget)?meta.budget:parseBudget(meta.rawPrompt);
+  // A stated window ("delivered in 3 days") is kept as an absolute date so re-plans after human edits keep the same deadline.
+  const deliveryDeadline=meta.deliveryDeadline||parseDeliveryDeadline(meta.rawPrompt);
+  const sustainability=parseSustainability(meta.rawPrompt);
   const parserModel=process.env.LUNA_API_KEY?(process.env.LUNA_MODEL||'gemini-2.5-flash'):'local-rule-parser';
   const o={
     id:actionId||randomUUID(),
@@ -130,6 +135,8 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     user_id:user,
     created_at:new Date().toISOString(),
     raw_prompt:meta.rawPrompt||lines.map(l=>l.requested||`${l.quantity} ${l.query}`).join(', '),
+    delivery_deadline:deliveryDeadline||null,
+    prefers_low_carbon:sustainability,
     parser_model:parserModel,
     lines,
     force_flag,
@@ -144,7 +151,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     status:'PENDING_APPROVAL'
   };
   const used=new Map();
-  const date=new Date(Date.now()+86400000).toISOString().slice(0,10);
+  const date=deliveryDeadline||new Date(Date.now()+86400000).toISOString().slice(0,10);
   const lineOptions=[];
 
   for(let index=0;index<lines.length;index++){
@@ -211,10 +218,12 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
         price:unitPrice,
         unit_price:unitPrice,
         carbon:round3(p.carbon_kg_co2_per_kg),
-        reliability:round3(p.delivery_reliability)
+        reliability:round3(p.delivery_reliability),
+        // Only an explicit delivery window ranks by deliverability; otherwise keep the default ordering.
+        ...(deliveryDeadline?{deliverable_by_date:available>0}:{})
       };
     });
-    const ranked=rankCandidates(enriched);
+    const ranked=rankCandidates(enriched,{budget:budget!=null,deliveryRequested:Boolean(deliveryDeadline),sustainability});
     lineOptions.push({index,line,matchedQuery,suggested,options:ranked});
   }
 
@@ -231,6 +240,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
           lineIndex:entry.index,
           requested:entry.line.requested||`${entry.line.quantity} ${entry.line.query}`,
           requestedQuantity:entry.line.quantity,
+          totalBudgetEUR:budget,
           candidates:candidatePool.map(c=>({
             productId:c.productId,
             name:c.name,
@@ -239,25 +249,49 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
             units:c.units,
             unit_price:c.price,
             available:c.available,
+            ...(deliveryDeadline?{deliverable_by_deadline:c.deliverable_by_date}:{}),
+            ...(sustainability?{carbon_kg_co2_per_kg:c.carbon??null}:{}),
             allergen_safe:c.allergen_safe,
             human_approved_count:c.human_approved_count||0,
             bought_count:c.bought_count||0
           }))
         };
       });
-      const picked=selectionSchema.parse(await callGeminiJSON(
+      const selectionRules=
         `Select the single best catalog product and exact quantity in SALES UNITS for each requested line.
 Return ONLY valid JSON:
 {"selections":[{"lineIndex":0,"productId":"...","quantity":2}]}
 Rules:
-1. Candidates are already sorted best-first by keyword match, allergen safety, price, human-approved/purchase history, and stock.
+1. Candidates are already sorted best-first by keyword match, allergen safety, ${deliveryDeadline?'deliverability by the requested deadline, ':''}${sustainability?'lowest CO2 per kg, ':''}price, human-approved/purchase history, and stock.
 2. Pick ONLY ONE productId per lineIndex from that line's candidates.
 3. Convert the buyer's requested amount into the chosen product's sales_unit using its name and "units" (sizeInBaseUnits):
    - If the buyer asks for "2kg apples" or "12 apples" (~2 kg), prefer a product sold in "KG" (with quantity: 2) or a "2KG BAG" sold in "ST" (with quantity: 1)—do NOT pick a 13 kg crate ("KI") unless a crate/bulk box was requested.
-4. "quantity" MUST be a positive multiple of allowed_lot_size.`,
-        JSON.stringify(promptData)
-      ));
-      for(const sel of picked.selections)aiSelections.set(sel.lineIndex,sel);
+4. "quantity" MUST be a positive multiple of allowed_lot_size.
+${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer candidates with deliverable_by_deadline true; never pick a worse keyword match just to meet the deadline.\n`:''}${sustainability?`5b. The buyer wants sustainable choices. Prefer the lowest carbon_kg_co2_per_kg (kg CO2-eq per kg; null = unknown); never pick a worse keyword match just to lower CO2.\n`:''}5. ${budget==null?'No total budget was specified.':`The buyer specified a TOTAL budget of EUR ${budget.toFixed(2)} for the whole order. Choose the lowest-cost suitable candidates across all lines while preserving requested quantities. Do not pretend an over-budget cart is within budget; the system will send it for human approval.`}`;
+      // Rough cart cost for a set of picks, mirroring the allocation below (suggested lines are never auto-ordered).
+      const estimate=selections=>lineOptions.reduce((sum,entry)=>{
+        if(sum==null||entry.suggested||!entry.options.length)return sum;
+        const sel=selections.get(entry.index);
+        const option=entry.options.find(o=>o.productId===sel?.productId);
+        const forcedId=approved[entry.index]||pinned[entry.index];
+        const chosen=option||entry.options.find(o=>o.productId===forcedId)||entry.options.find(o=>o.price!=null);
+        if(!chosen||chosen.price==null)return null;
+        return sum+chosen.price*snapToLot(option?sel.quantity:entry.line.quantity,chosen.lot);
+      },0);
+      let feedback='';
+      let bestCost=Infinity;
+      for(let attempt=0;attempt<(budget==null?1:2);attempt++){
+        let picked;
+        try{picked=selectionSchema.parse(await callGeminiJSON(selectionRules+feedback,JSON.stringify(promptData)));}
+        catch(e){if(attempt)break;throw e;}
+        const selections=new Map(picked.selections.map(sel=>[sel.lineIndex,sel]));
+        const cost=budget==null?0:estimate(selections);
+        // Keep the cheaper of the first pick and the budget retry; unpriced picks cannot be compared.
+        if(attempt===0||(cost!=null&&cost<bestCost)){aiSelections=selections;bestCost=cost??Infinity;}
+        if(budget==null||cost==null||Math.round(cost*100)<=Math.round(budget*100))break;
+        o.steps.push(`Selection estimated at €${cost.toFixed(2)} exceeds the €${budget.toFixed(2)} budget; asking the model for cheaper options.`);
+        feedback=`\n6. Your previous selection costs about EUR ${cost.toFixed(2)}, which is over the EUR ${budget.toFixed(2)} budget. Choose cheaper suitable (allergen-safe, same item) candidates and the smallest quantities that still cover each requested line. Do not drop lines. If the budget cannot be met, return the cheapest complete selection.`;
+      }
     }catch{
       // Fallback to top ranked candidate if selection call fails
     }
@@ -393,6 +427,11 @@ Rules:
   }
 
   o.total=round3(o.items.reduce((sum,i)=>sum+(i.lineTotal??i.quantity*i.price),0));
+  if(budget!=null){
+    o.budget_limit=round3(budget);
+    o.budget_overrun=Math.round(o.total*100)>Math.round(budget*100);
+    if(o.budget_overrun)o.steps.push(`Total €${o.total.toFixed(2)} exceeds the stated €${budget.toFixed(2)} budget; human approval required.`);
+  }
   o.incomplete=o.issues.length>0;
   if(context)enforcePriceCap(o.items,context);
   o.steps.push('Ranked catalog matches, prices & stock');
@@ -493,7 +532,7 @@ app.post('/portal/requests',async(req,res)=>{
     demo_unavailable:z.boolean().default(false)
   }).passthrough().parse(req.body);
   const lines=await parseRequestLines(b.text);
-  res.json(await plan(lines,b.user_id,b.force_flag,{},b.demo_unavailable,null,{},null,{rawPrompt:b.text}));
+  res.json(await plan(lines,b.user_id,b.force_flag,{},b.demo_unavailable,null,{},null,{rawPrompt:b.text,budget:parseBudget(b.text)}));
 });
 app.post('/portal/orders/:id/:action',async(req,res)=>{
   const {user_id,choices,quantities,removeLines,acceptPartial}=z.object({
@@ -553,6 +592,7 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
     const keepForceFlag=req.params.action==='substitute'?Boolean(o.force_flag):false;
     const replacement=await plan(nextLines,user_id,keepForceFlag,nextApproved,o.demo_unavailable,o.context||null,nextPinned,null,{
       rawPrompt:o.raw_prompt,
+      deliveryDeadline:o.delivery_deadline,
       auditTrail:priorTrail
     });
     o.superseded_by=replacement.id;

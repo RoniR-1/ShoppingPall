@@ -144,7 +144,7 @@ export async function createOrder(user, key, input, screening = defaultScreening
     for (const item of items) assert(!policy.blocked_categories.includes(item.category), 422, `Category ${item.category} is blocked for this buyer`);
     const scoredItems = items.map(i => ({ ...i, requestedDate: quote.requested_date }));
     const risk = scoreOrder(scoredItems, { policy, history });
-    const reason = input.force_flag ? 'Demo: force_flag requested' : risk.decision === 'REQUIRES_INTERVENTION' ? `Risk score ${risk.score.toFixed(2)} requires human sign-off` : null;
+    const reason = input.force_flag ? (input.force_flag_reason || 'Demo: force_flag requested') : risk.decision === 'REQUIRES_INTERVENTION' ? `Risk score ${risk.score.toFixed(2)} requires human sign-off` : null;
     const status = reason ? 'PENDING_APPROVAL' : 'APPROVED';
     const routine = status === 'APPROVED' && !input.force_flag && risk.decision === 'AUTO_APPROVE';
     const result = (await db.query(`INSERT INTO orders (id,user_id,quote_id,idempotency_key,request_hash,status,flag_reason,items,currency,total_cents,mocked,requested_date,risk_score,risk_details,routine,decided_at)

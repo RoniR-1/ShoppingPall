@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { recipeCart, ollamaJSON, rankCandidates } from '../src/agent.js';
 import { z } from 'zod';
+import { parseBudget, stripBudget, parseDeliveryDeadline, stripOrderConstraints, parseSustainability } from '../src/contracts.js';
 
 test('recipe reuses planned synonyms without an extra model call', async () => {
   const replies = [
@@ -175,6 +176,200 @@ test('rankCandidates orders by keyword match, allergens, price, human-approved h
     { id: 'exact', match_rank: 4, allergen_safe: true, unit_price: 5.0, human_approved_count: 0, bought_count: 0, in_stock: false, available_date: null }
   ]);
   assert.deepEqual(ranked.map(p => p.id), ['exact', 'cheaper', 'human-fav', 'fast-stock', 'slow-stock', 'allergen-bad']);
+});
+
+test('recipeCart keeps word match first and prioritizes delivery by the requested date', async () => {
+  const prompts = [];
+  const replies = [
+    { ingredients: [{ query: 'apple' }] },
+    { items: [{ productId: 'exact-late', quantity: 6 }] },
+    { items: [{ productId: 'exact-late', quantity: 5 }] }
+  ];
+  const cart = await recipeCart('I want apples with a total budget of €10.', async (path) => {
+    if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products: [
+      { id: 'exact-late', name: 'Apple', match_rank: 4, allergen_safe: true },
+      { id: 'loose-early', name: 'Apple juice', match_rank: 3, allergen_safe: true }
+    ] };
+    if (path === '/api/price') return { products: [
+      { productId: 'exact-late', error: false, priceWithTax: { value: 2 } },
+      { productId: 'loose-early', error: false, priceWithTax: { value: 1 } }
+    ] };
+    if (path === '/api/availability') return { products: [
+      { productId: 'exact-late', salesBlock: false, scheduleLines: [{ salesBlock: false, availableAmount: 4, availableDate: '2026-11-20' }] },
+      { productId: 'loose-early', salesBlock: false, scheduleLines: [{ salesBlock: false, availableAmount: 4, availableDate: '2026-11-16' }] }
+    ] };
+    assert.fail(`Unexpected path ${path}`);
+  }, async prompt => { prompts.push(prompt); return replies.shift(); }, () => {}, { requestedDate: '2026-11-17' });
+  const prompt = prompts[1];
+  assert.ok(prompt.indexOf('exact-late') < prompt.indexOf('loose-early'), 'Higher word match remains first despite missing the requested date');
+  assert.match(prompt, /stated total budget is EUR 10/);
+  assert.match(prompt, /prioritize candidates available by that date/);
+  assert.match(prompt, /"deliverable_by_date":false/);
+  assert.match(prompt, /"deliverable_by_date":true/);
+  assert.equal(cart.items[0].quantity, 5, 'Over-budget quantity should trigger correction to the EUR 10 limit');
+  assert.match(prompts[2], /Cart total EUR 12\.00 exceeds the stated budget of EUR 10\.00/);
+});
+
+test('recipeCart sends an over-budget cart for required human approval when correction still exceeds the budget', async () => {
+  const replies = [
+    { ingredients: [{ query: 'eggs' }] },
+    { items: [{ productId: 'eggs', quantity: 6 }] },
+    { items: [{ productId: 'eggs', quantity: 6 }] }
+  ];
+  const cart = await recipeCart('10 eggs, total budget €10', async path => {
+    if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products: [
+      { id: 'eggs', name: 'Eggs', match_rank: 4, allergen_safe: true }
+    ] };
+    if (path === '/api/price') return { products: [
+      { productId: 'eggs', error: false, priceWithTax: { value: 2 } }
+    ] };
+    if (path === '/api/availability') return { products: [
+      { productId: 'eggs', salesBlock: false, scheduleLines: [{ salesBlock: false, availableAmount: 20, availableDate: '2026-11-16' }] }
+    ] };
+    assert.fail(`Unexpected path ${path}`);
+  }, async () => replies.shift(), () => {}, { requestedDate: '2026-11-16' });
+  assert.equal(cart.requiresApproval, true);
+  assert.equal(cart.items[0].quantity, 6);
+  assert.match(cart.approvalReason, /exceeds the stated budget of EUR 10\.00/);
+});
+
+test('parseBudget reads total budgets, ignores per-unit limits and handles thousands separators', () => {
+  for (const [text, expected] of [
+    ['I want apples with a total budget of €10.', 10], ['budget of 10€', 10], ['budget: 25 EUR', 25],
+    ['€1.000,50 budget', 1000.5], ['budget €1,000', 1000], ['under 40 euros', 40], ['no more than EUR 12,5', 12.5],
+    ['€10 budget: 10 eggs', 10], ['budget: 10 eggs', null], ['max €3 per kg of apples', null],
+    ['within €20/kg', null], ['12 apples under 5 kg', null], ['2 kg apples', null]
+  ]) assert.equal(parseBudget(text), expected, text);
+  assert.equal(stripBudget('10 eggs, total budget €10'), '10 eggs');
+  assert.equal(stripBudget('12 apples with a budget of €10'), '12 apples');
+  assert.equal(stripBudget('2 kg apples'), '2 kg apples');
+});
+
+const budgetApi = (products, prices) => async path => {
+  if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products };
+  if (path === '/api/price') return { products: Object.entries(prices).map(([productId, value]) => ({ productId, error: false, priceWithTax: { value } })) };
+  if (path === '/api/availability') return { products: products.map(p => ({ productId: p.id, salesBlock: false,
+    scheduleLines: [{ salesBlock: false, availableAmount: 50, availableDate: '2026-11-16' }] })) };
+  assert.fail(`Unexpected path ${path}`);
+};
+
+test('recipeCart with a budget never ranks allergen-unsafe products above safe ones', async () => {
+  const prompts = [];
+  const replies = [{ ingredients: [{ query: 'bread' }] }, { items: [{ productId: 'safe', quantity: 1 }] }];
+  await recipeCart('bread, budget €10', budgetApi([
+    { id: 'unsafe-cheap', name: 'Bread', match_rank: 4, allergen_safe: false },
+    { id: 'safe', name: 'Bread', match_rank: 4, allergen_safe: true }
+  ], { 'unsafe-cheap': 1, safe: 3 }), async prompt => { prompts.push(prompt); return replies.shift(); }, () => {}, { requestedDate: '2026-11-16' });
+  assert.ok(prompts[1].indexOf('"safe"') < prompts[1].indexOf('"unsafe-cheap"'));
+});
+
+test('recipeCart sends the over-budget cart for approval when the correction is invalid', async () => {
+  const replies = [
+    { ingredients: [{ query: 'eggs' }] },
+    { items: [{ productId: 'eggs', quantity: 6 }] },
+    { items: [{ productId: 'not-a-candidate', quantity: 1 }] }
+  ];
+  const cart = await recipeCart('10 eggs, total budget €10', budgetApi([{ id: 'eggs', name: 'Eggs', match_rank: 4, allergen_safe: true }], { eggs: 2 }),
+    async () => replies.shift(), () => {}, { requestedDate: '2026-11-16' });
+  assert.equal(cart.requiresApproval, true);
+  assert.equal(cart.budget, 10);
+  assert.deepEqual(cart.items, [{ productId: 'eggs', quantity: 6 }]);
+  assert.match(cart.approvalReason, /EUR 12\.00 exceeds the stated budget of EUR 10\.00/);
+});
+
+test('parseDeliveryDeadline turns a stated delivery window into a date and strips it from product lines', () => {
+  const now = Date.parse('2026-11-14T12:00:00Z');
+  for (const [text, expected] of [
+    ['10 eggs delivered in 3 days', '2026-11-17'], ['eggs, delivery within a week', '2026-11-21'],
+    ['10 eggs to be delivered in two days', '2026-11-16'], ['12 apples by tomorrow', '2026-11-15'], ['2 kg apples', null]
+  ]) assert.equal(parseDeliveryDeadline(text, now), expected, text);
+  assert.equal(stripOrderConstraints('10 eggs, delivered in 3 days, budget €20'), '10 eggs');
+});
+
+test('rankCandidates keeps keyword match on top and ranks deliverability by an explicit deadline above price', () => {
+  const candidates = [
+    { id: 'weak-fast-cheap', match_rank: 2, allergen_safe: true, unit_price: 1, deliverable_by_date: true },
+    { id: 'exact-late-cheap', match_rank: 4, allergen_safe: true, unit_price: 1, deliverable_by_date: false },
+    { id: 'exact-fast-pricey', match_rank: 4, allergen_safe: true, unit_price: 5, deliverable_by_date: true },
+    { id: 'exact-fast-unsafe', match_rank: 4, allergen_safe: false, unit_price: 0.5, deliverable_by_date: true }
+  ];
+  const ids = options => rankCandidates(candidates, options).map(p => p.id);
+  assert.deepEqual(ids({ deliveryRequested: true }), ['exact-fast-pricey', 'exact-late-cheap', 'exact-fast-unsafe', 'weak-fast-cheap']);
+  assert.deepEqual(ids({ deliveryRequested: true, budget: true }), ['exact-fast-pricey', 'exact-late-cheap', 'exact-fast-unsafe', 'weak-fast-cheap']);
+  // Without an explicit window, a stated budget keeps price above the default delivery date.
+  assert.deepEqual(ids({ budget: true }), ['exact-late-cheap', 'exact-fast-pricey', 'exact-fast-unsafe', 'weak-fast-cheap']);
+});
+
+test('recipeCart ranks by a "delivered in X days" request without overriding keyword match', async () => {
+  const prompts = [];
+  const replies = [{ ingredients: [{ query: 'apple' }] }, { items: [{ productId: 'exact-fast', quantity: 1 }] }];
+  const bodies = [];
+  const products = [
+    { id: 'loose-fast', name: 'Apple juice', match_rank: 3, allergen_safe: true },
+    { id: 'exact-late', name: 'Apple', match_rank: 4, allergen_safe: true },
+    { id: 'exact-fast', name: 'Apple', match_rank: 4, allergen_safe: true }
+  ];
+  const dates = { 'loose-fast': '2026-11-15', 'exact-late': '2026-11-25', 'exact-fast': '2026-11-16' };
+  const prices = { 'loose-fast': 1, 'exact-late': 2, 'exact-fast': 4 };
+  await recipeCart('2 kg apples, budget €20, delivered in 3 days', async (path, body) => {
+    if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products };
+    bodies.push(body);
+    if (path === '/api/price') return { products: products.map(p => ({ productId: p.id, error: false, priceWithTax: { value: prices[p.id] } })) };
+    if (path === '/api/availability') return { products: products.map(p => ({ productId: p.id, salesBlock: false,
+      scheduleLines: [{ salesBlock: false, availableAmount: 10, availableDate: dates[p.id] }] })) };
+    assert.fail(`Unexpected path ${path}`);
+  }, async prompt => { prompts.push(prompt); return replies.shift(); }, () => {}, { now: Date.parse('2026-11-14T12:00:00Z') });
+  assert.equal(bodies[0].requestedDate, '2026-11-17', 'Stated window is used as the delivery date when none is given');
+  const order = ['exact-fast', 'exact-late', 'loose-fast'].map(id => prompts[1].indexOf(`"${id}"`));
+  assert.ok(order[0] < order[1] && order[1] < order[2], 'match first, then deliverable before cheaper-but-late');
+  assert.match(prompts[1], /wants delivery by 2026-11-17/);
+});
+
+test('parseSustainability detects sustainability wording without treating "green" products as a preference', () => {
+  for (const [text, expected] of [
+    ['10 eggs, sustainable please', true], ['10 eco-friendly eggs', true], ['12 apples with the lowest CO2', true],
+    ['eggs with a low carbon footprint', true], ['2 kg green apples', false], ['2 kg apples', false]
+  ]) assert.equal(parseSustainability(text), expected, text);
+  assert.equal(stripOrderConstraints('10 eco-friendly eggs'), '10 eggs');
+  assert.equal(stripOrderConstraints('10 eggs, 2 kg apples, make it sustainable, budget €20, delivered in 3 days'), '10 eggs, 2 kg apples');
+  assert.equal(stripOrderConstraints('2 kg green apples'), '2 kg green apples');
+});
+
+test('rankCandidates ranks lowest CO2 under keyword match, allergens and deliverability, above price, only when requested', () => {
+  const candidates = [
+    { id: 'weak-green', match_rank: 2, allergen_safe: true, unit_price: 1, carbon_kg_co2_per_kg: 0.1, deliverable_by_date: true },
+    { id: 'exact-dirty-cheap', match_rank: 4, allergen_safe: true, unit_price: 1, carbon_kg_co2_per_kg: 3, deliverable_by_date: true },
+    { id: 'exact-green-pricey', match_rank: 4, allergen_safe: true, unit_price: 5, carbon_kg_co2_per_kg: 0.5, deliverable_by_date: true },
+    { id: 'exact-unknown-co2', match_rank: 4, allergen_safe: true, unit_price: 0.5, carbon_kg_co2_per_kg: null, deliverable_by_date: true },
+    { id: 'exact-greenest-late', match_rank: 4, allergen_safe: true, unit_price: 1, carbon_kg_co2_per_kg: 0.2, deliverable_by_date: false },
+    { id: 'exact-green-unsafe', match_rank: 4, allergen_safe: false, unit_price: 1, carbon_kg_co2_per_kg: 0.01, deliverable_by_date: true }
+  ];
+  const ids = options => rankCandidates(candidates, options).map(p => p.id);
+  assert.deepEqual(ids({ sustainability: true, deliveryRequested: true }),
+    ['exact-green-pricey', 'exact-dirty-cheap', 'exact-unknown-co2', 'exact-greenest-late', 'exact-green-unsafe', 'weak-green']);
+  assert.deepEqual(ids({ deliveryRequested: true }),
+    ['exact-unknown-co2', 'exact-dirty-cheap', 'exact-green-pricey', 'exact-greenest-late', 'exact-green-unsafe', 'weak-green']);
+});
+
+test('recipeCart sends CO2 data and a sustainability constraint to the model only when requested', async () => {
+  const run = async recipe => {
+    const prompts = [];
+    const replies = [{ ingredients: [{ query: 'apple' }] }, { items: [{ productId: 'green', quantity: 1 }] }];
+    await recipeCart(recipe, async path => {
+      if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products: [
+        { id: 'dirty', name: 'Apple', match_rank: 4, allergen_safe: true, carbon_kg_co2_per_kg: 2.3 },
+        { id: 'green', name: 'Apple', match_rank: 4, allergen_safe: true, carbon_kg_co2_per_kg: 0.4 }
+      ] };
+      assert.fail(`Unexpected path ${path}`);
+    }, async prompt => { prompts.push(prompt); return replies.shift(); });
+    return prompts[1];
+  };
+  const sustainable = await run('2 kg apples, sustainable please');
+  assert.ok(sustainable.indexOf('"green"') < sustainable.indexOf('"dirty"'));
+  assert.match(sustainable, /wants sustainable choices/);
+  assert.match(sustainable, /"carbon_kg_co2_per_kg":0.4/);
+  const plain = await run('2 kg apples');
+  assert.doesNotMatch(plain, /carbon_kg_co2_per_kg/);
 });
 
 test('recipeCart enriches and sorts candidates with live price and availability when requestedDate is set', async () => {
