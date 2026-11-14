@@ -1,6 +1,11 @@
 const $ = id => document.getElementById(id);
 let dataSource = 'real';
 let toastTimer = null;
+let promptScenarios = [];
+let guidedScenario = null;
+let guidedIndex = -1;
+let guidedOrderId = null;
+let guidedOrderStatus = null;
 
 const esc = s => String(s ?? '—').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtNum = v => {
@@ -182,6 +187,8 @@ async function handleOrderDecision(e) {
       acceptPartial: el.querySelector('.partial')?.checked || false
     });
     showExecution(updated);
+    if (guidedScenario && guidedOrderId === el.dataset.id) guidedOrderId = updated.id;
+    updateGuidedProgress(updated);
     await refresh();
   });
 }
@@ -202,9 +209,14 @@ async function submit() {
   const result = await api('/requests', {
     user_id: $('user').value,
     text,
-    force_flag: $('force-flag').checked
+    force_flag: $('force-flag').checked,
+    demo_unavailable: Boolean(guidedScenario?.steps[guidedIndex]?.demoUnavailable)
   });
   showExecution(result);
+  if (guidedScenario) {
+    guidedOrderId = result.id;
+    updateGuidedProgress(result);
+  }
   await refresh();
 }
 
@@ -291,5 +303,85 @@ $('catalog-clear-btn').onclick = () => {
   $('catalog-products').hidden = true;
   $('catalog-clear-btn').hidden = true;
 };
+
+async function loadDemoScenarios() {
+  try {
+    const response = await fetch('/demo-prompts.json');
+    if (!response.ok) throw Error('Could not load demo prompts');
+    promptScenarios = await response.json();
+    $('demo-scenario').innerHTML = promptScenarios.map(s => `<option value="${esc(s.id)}">${esc(s.label)}</option>`).join('');
+    $('demo-scenario').onchange = () => {
+      const selected = promptScenarios.find(s => s.id === $('demo-scenario').value);
+      if (selected) $('scenario-help').textContent = `${selected.description} ${selected.steps.length} prompt${selected.steps.length === 1 ? '' : 's'}.`;
+    };
+    $('demo-scenario').dispatchEvent(new Event('change'));
+  } catch (error) {
+    $('demo-scenario').innerHTML = '<option value="">Sample prompts unavailable</option>';
+    $('scenario-help').textContent = error.message;
+  }
+}
+
+function loadScenarioStep(index) {
+  guidedIndex = index;
+  guidedOrderId = null;
+  guidedOrderStatus = null;
+  const step = guidedScenario.steps[index];
+  $('prompt').value = step.prompt;
+  $('force-flag').checked = false;
+  $('scenario-next').disabled = true;
+  $('scenario-help').textContent = `Step ${index + 1} of ${guidedScenario.steps.length}: ${step.label}. Submit this prompt, then approve it if it enters the queue before continuing.`;
+  $('prompt').focus();
+}
+
+function updateGuidedProgress(order) {
+  if (!guidedScenario || !order || (guidedOrderId && order.id !== guidedOrderId)) return;
+  guidedOrderId = order.id;
+  guidedOrderStatus = order.status;
+  if (order.status === 'APPROVED') {
+    if (guidedIndex === guidedScenario.steps.length - 1) {
+      $('scenario-help').textContent = guidedScenario.completion || `Scenario complete. All ${guidedScenario.steps.length} prompts were entered in order.`;
+      $('scenario-next').disabled = false;
+    } else {
+      $('scenario-help').textContent = `Step ${guidedIndex + 1} approved. Continue to the next prompt when ready.`;
+      $('scenario-next').disabled = false;
+    }
+  } else if (order.status === 'REJECTED') {
+    $('scenario-help').textContent = `Step ${guidedIndex + 1} was rejected. Restart the scenario to try again.`;
+    $('scenario-next').disabled = true;
+  } else {
+    $('scenario-help').textContent = `Step ${guidedIndex + 1} needs human approval before the scenario can continue.`;
+    $('scenario-next').disabled = true;
+  }
+}
+
+$('scenario-start').onclick = () => run(async () => {
+  const scenario = promptScenarios.find(s => s.id === $('demo-scenario').value);
+  if (!scenario) throw Error('Choose a demo scenario first.');
+  dataSource = 'demo';
+  $('source').value = 'demo';
+  const cfg = await api('/config');
+  $('threshold').value = cfg.threshold;
+  $('user').value = `prompt-demo-${Date.now().toString(36)}`;
+  guidedScenario = scenario;
+  await api('/config', { threshold: Number($('threshold').value), stock: scenario.stock || 'normal' });
+  $('stock').value = scenario.stock || 'normal';
+  await refresh();
+  loadScenarioStep(0);
+  notify(`Started ${scenario.label} with a fresh demo buyer.`);
+});
+
+$('scenario-next').onclick = () => run(async () => {
+  if (!guidedScenario || guidedOrderStatus !== 'APPROVED') throw Error('Submit and approve the current prompt before continuing.');
+  if (guidedIndex >= guidedScenario.steps.length - 1) {
+    $('scenario-next').disabled = true;
+    $('scenario-help').textContent = guidedScenario.completion || 'Scenario complete.';
+    return;
+  }
+  await api('/config', { threshold: Number($('threshold').value), stock: guidedScenario.stock || 'normal' });
+  $('stock').value = guidedScenario.stock || 'normal';
+  loadScenarioStep(guidedIndex + 1);
+});
+
+loadDemoScenarios();
 
 run(refresh);
