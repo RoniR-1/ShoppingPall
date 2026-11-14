@@ -4,6 +4,7 @@ import {AsyncLocalStorage} from 'node:async_hooks';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {route} from './policy.js';
+import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
 const app=express();app.use(express.json({limit:'64kb'}));
 const sourceContext=new AsyncLocalStorage();
@@ -25,8 +26,8 @@ async function parse(text,mode){
  }
  return linesSchema.parse(directLines(text));
 }
-async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false){
- const o={id:randomUUID(),user_id:user,lines,force_flag,demo_unavailable,approved,items:[],issues:[],steps:['Parsed request'],incomplete:false,status:'PENDING_APPROVAL'};
+async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,actionId=null){
+ const o={id:actionId||randomUUID(),context,agent_type:context?.agent?.type||'custom',user_id:user,lines,force_flag,demo_unavailable,approved,items:[],issues:[],steps:['Parsed request'],incomplete:false,status:'PENDING_APPROVAL'};
  const used=new Map();const date=new Date(Date.now()+86400000).toISOString().slice(0,10);
  for(let index=0;index<lines.length;index++){
  const line=lines[index];let candidates=await core('/internal/search',{q:normalizeQuery(line.query)});let suggested=false;
@@ -37,11 +38,12 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
  if(!candidates.length){o.issues.push({index,reason:'No catalog match',shortfall:line.quantity,options:[]});continue;}
  const ids=candidates.map(p=>p.id), request={customer:user,requestedDate:date,products:ids};
  const [prices,stock]=await Promise.all([core('/api/price',request),core('/api/availability',request)]);
- const options=candidates.map(p=>{const price=prices.products.find(x=>x.productId===p.id),a=stock.products.find(x=>x.productId===p.id),s=a?.scheduleLines?.[0];const available=a&&!a.salesBlock&&a.logisticModel==='Stock'&&s&&(s.salesUnit==='MOCK'||s.salesUnit===p.sales_unit)&&!s.salesBlock&&s.availableDate.slice(0,10)<=date&&(!a.closingTime||Date.parse(a.closingTime)>Date.now())?s.availableAmount:0;return {productId:p.id,name:p.name,unit:p.sales_unit,lot:Number(p.allowed_lot_size),quantity:0,available,price:price?.error?null:price?.priceWithTax?.value??price?.catalogPrice?.valueWithTax,carbon:p.carbon_kg_co2_per_kg,reliability:p.delivery_reliability};});
+ const options=candidates.map(p=>{const price=prices.products.find(x=>x.productId===p.id),a=stock.products.find(x=>x.productId===p.id),s=a?.scheduleLines?.[0];const available=a&&!a.salesBlock&&a.logisticModel==='Stock'&&s&&(s.salesUnit==='MOCK'||s.salesUnit===p.sales_unit)&&!s.salesBlock&&s.availableDate.slice(0,10)<=date&&(!a.closingTime||Date.parse(a.closingTime)>Date.now())?s.availableAmount:0;return {productId:p.id,name:p.name,unit:p.sales_unit,net_contents:p.net_contents,currency:price?.priceWithTax?.currency||price?.catalogPrice?.currency||prices.currency||'EUR',lot:Number(p.allowed_lot_size),quantity:0,available,price:price?.error?null:price?.priceWithTax?.value??price?.catalogPrice?.valueWithTax,carbon:p.carbon_kg_co2_per_kg,reliability:p.delivery_reliability};});
  let remaining=line.quantity;
  if(!suggested)for(const p of options){if(p.price==null)continue;const quantity=Math.floor((Math.min(remaining,p.available-(used.get(p.productId)||0))+1e-9)/p.lot)*p.lot;if(quantity<=0)continue;o.items.push({...p,quantity,requested:line.query,substitution:Boolean(approved[index])});used.set(p.productId,(used.get(p.productId)||0)+quantity);remaining=Math.max(0,remaining-quantity);if(remaining<1e-8)break;}
  if(remaining>1e-8)o.issues.push({index,reason:suggested?'No exact match · choose a closest item':'Stock shortfall',shortfall:remaining,options});
  }
+ enforcePriceCap(o.items,context);
  o.incomplete=o.issues.length>0;o.steps.push('Checked catalog, prices & stock');Object.assign(o,route(o,undefined,threshold));o.steps.push(`Risk score: ${o.score} / ${threshold}`);if(sourceContext.getStore()==='real'){o.steps.push('Real data preview · supplier checkout unavailable');o.reason+=' · Real data preview; no purchase API';o.status='PENDING_APPROVAL';}
  const auto=o.status==='APPROVED';o.status='PENDING_APPROVAL';await core('/internal/save',o);
  if(auto)return core('/internal/decision',{id:o.id,user_id:user,action:'approve'});o.steps.push('Paused for human approval');return core('/internal/save',o);
@@ -61,5 +63,13 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
  }
  res.json(await core('/internal/decision',{id:o.id,user_id,action:req.params.action}));
 });
+const managed=new ManagedAgent({listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user))),file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,id))});
+await managed.load();
+app.use('/portal/managed-agent',(req,res,next)=>{if(sourceContext.getStore()!=='demo')return res.status(422).json({error:'Managed agent currently supports simulated Demo warehouse only'});next();});
+const managedUser=req=>z.string().min(1).max(100).parse(req.query.user_id||req.body?.user_id);
+app.get('/portal/managed-agent',async(req,res)=>{const user=managedUser(req);res.json({...managed.state(user),preview:managed.preview(user),orders:await core('/internal/orders?user_id='+encodeURIComponent(user)),simulated:true});});
+app.post('/portal/managed-agent',async(req,res)=>{const user=managedUser(req);if(req.body.action==='check'){await managed.tick(user);return res.json(managed.state(user));}res.json(await managed.command(user,req.body));});
+app.post('/portal/managed-agent/chat',(req,res)=>{res.json(managed.chat(managedUser(req),z.string().min(1).max(500).parse(req.body.text)));});
+setInterval(()=>{for(const user of Object.keys(managed.states))managed.tick(user).catch(e=>console.error('Managed check failed:',e.message));},30000).unref();
 app.use((e,req,res,next)=>res.status(422).json({error:e.message}));
 app.listen(Number(process.env.MIDDLE_LAYER_PORT||4002),'127.0.0.1',()=>console.log('Middle :'+(process.env.MIDDLE_LAYER_PORT||4002)));
