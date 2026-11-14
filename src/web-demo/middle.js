@@ -416,7 +416,8 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
     if(o.budget_overrun)o.steps.push(`Total €${o.total.toFixed(2)} exceeds the stated €${budget.toFixed(2)} budget; human approval required.`);
   }
   o.incomplete=o.issues.length>0;
-  if(context)enforcePriceCap(o.items,context);
+  let policyBreach=null;
+  if(context){try{enforcePriceCap(o.items,context);}catch(e){if(e.code!=='PRICE_CAP'||!meta.managedSimulation)throw e;policyBreach=e.message;o.policy_breach=policyBreach;}}
   o.steps.push('Ranked catalog matches, prices & stock');
   const buyerHistory=await core('/internal/buyer-profile?user_id='+encodeURIComponent(user));
   const buyerCfg=await core('/internal/buyer-config?user_id='+encodeURIComponent(user));
@@ -426,10 +427,13 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
   o.score=round3(o.score);
   o.steps.push(`Risk score: ${o.score} / ${threshold} (${o.reason})`);
 
-  const auto=!meta.auditTrail&&context?.agent?.type==='managed'&&context?.confidence?.method==='deterministic_threshold'&&o.status==='APPROVED'&&!o.incomplete&&o.items.every(i=>!i.substitution&&i.allergen_safe!==false);
+  const eligible=context?.agent?.type==='managed'&&context?.confidence?.method==='deterministic_threshold'&&!o.incomplete&&o.items.every(i=>!i.substitution&&i.allergen_safe!==false);
+  const auto=!meta.auditTrail&&eligible&&(meta.managedSimulation?(context.simulation?.governance==='autonomous'&&!policyBreach):o.status==='APPROVED');
+  if(policyBreach)o.reason=`Price cap review required: ${policyBreach}`;
+  else if(meta.managedSimulation&&context.simulation?.governance==='human')o.reason='Human-in-the-loop review required';
   o.status='PENDING_APPROVAL';
   if(auto){
-    o.audit_trail.push({at:new Date().toISOString(),actor:'gatekeeper',text:`Auto-approved: risk score ${o.score} is within buyer "${user}" threshold of ${threshold}.`});
+    o.audit_trail.push({at:new Date().toISOString(),actor:'gatekeeper',text:meta.managedSimulation?`Auto-approved under simulation governance after price-cap validation (risk score ${o.score}; buyer threshold ${threshold}).`:`Auto-approved: risk score ${o.score} is within buyer "${user}" threshold of ${threshold}.`});
   }else{
     o.audit_trail.push({at:new Date().toISOString(),actor:'gatekeeper',text:`Queued for human review: risk score ${o.score}, threshold ${threshold} (${o.reason}).`});
   }
@@ -442,7 +446,7 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
 
 const managedAgent=new ManagedAgent({
   file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',
-  submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,{},id)),
+  submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,{},id,{managedSimulation:Boolean(context.simulation)})),
   listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user)))
 });
 const managedReady=managedAgent.load();
@@ -453,6 +457,7 @@ async function managedStatePayload(user){
   return {...structuredClone(s),preview:managedAgent.preview(user),orders,simulated:true};
 }
 
+app.use((req,_res,next)=>{if(/^\/portal\/agent-managed-inventory(?=\/|\?|$)/.test(req.url))req.url=req.url.replace('/portal/agent-managed-inventory','/portal/managed-agent');next();});
 app.use('/portal/managed-agent',(req,res,next)=>{
   if(sourceContext.getStore()!=='demo')return res.status(422).json({error:'Managed agent currently supports simulated Demo warehouse only'});
   next();
@@ -466,7 +471,7 @@ app.post('/portal/managed-agent',async(req,res)=>{
   const b=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),action:z.string().min(1)}).passthrough().parse(req.body||{});
   await managedReady;
   if(b.action==='check')await managedAgent.tick(b.user_id);
-  else await managedAgent.command(b.user_id,b);
+  else {await managedAgent.command(b.user_id,b);if(['simulation','consume','demand_spike'].includes(b.action)||(managedAgent.state(b.user_id).simulation&&['snapshot','rule'].includes(b.action)))await managedAgent.tick(b.user_id);}
   res.json(await managedStatePayload(b.user_id));
 });
 app.post('/portal/managed-agent/chat',async(req,res)=>{
@@ -474,7 +479,9 @@ app.post('/portal/managed-agent/chat',async(req,res)=>{
   await managedReady;
   res.json(managedAgent.chat(b.user_id,b.text));
 });
-setInterval(()=>{for(const user of Object.keys(managedAgent.states))managedAgent.tick(user).catch(()=>{});},30000).unref();
+const simulationInFlight=new Set();
+setInterval(()=>{for(const [user,state] of Object.entries(managedAgent.states)){if(!state.simulation||simulationInFlight.has(user))continue;simulationInFlight.add(user);managedAgent.simulationStep(user).catch(()=>{}).finally(()=>simulationInFlight.delete(user));}},1000).unref();
+setInterval(()=>{for(const [user,state] of Object.entries(managedAgent.states))if(!state.simulation)managedAgent.tick(user).catch(()=>{});},30000).unref();
 
 app.get('/portal/catalog-overview',async(req,res)=>{
   const q=encodeURIComponent(String(req.query.q||''));
