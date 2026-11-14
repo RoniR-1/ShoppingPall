@@ -93,7 +93,7 @@ body {
 
 .settings-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
   gap: 12px;
 }
 
@@ -455,8 +455,9 @@ pre {
 /* Shared navigation and managed-agent layout. */
 .nav-link { color: var(--text); font-size: 12px; text-underline-offset: 3px; }
 .managed-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.managed-heading-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .managed-heading h1 { margin: 0; font-size: 17px; }
-.managed-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; align-items: start; }
+.managed-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; align-items: start; }
 .managed-grid > *, .managed-form label { min-width: 0; }
 .managed-page p { margin: 0 0 12px; }
 .managed-page small { color: var(--muted); }
@@ -476,3 +477,9 @@ pre {
   .topbar { flex-wrap: wrap; }
   .managed-heading { flex-wrap: wrap; }
 }
+
+.rule-save-action { margin-top: 12px; }
+.managed-page #preview { overflow-x: auto; }
+.agent-chat-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); margin: auto; color: var(--text); overflow-y: auto; }
+.agent-chat-dialog::backdrop { background: rgb(31 28 22 / 45%); }
+.agent-chat-dialog .panel-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
