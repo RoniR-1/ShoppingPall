@@ -1,8 +1,15 @@
+// Explicit synthetic net contents per demo sales unit, not Valio product facts.
+export const demoContents={
+ 'demo-beer':{litres:0.33},'demo-dark-beer':{litres:0.33},
+ 'demo-eggs':{kg:0.06},'demo-dark-chocolate':{kg:0.1},
+ 'demo-milk-chocolate':{kg:0.1},'demo-milk':{litres:1},
+ 'demo-potato-salad':{kg:0.4}
+};
 // Entirely local, process-memory demo. No credentials or database connection.
 export class DemoStore {
  constructor(){
   const fixtures=[['demo-beer','Lager beer','demo-dark-beer'],['demo-dark-beer','Dark beer','demo-beer'],['demo-eggs','Eggs',null],['demo-dark-chocolate','Dark chocolate','demo-milk-chocolate'],['demo-milk-chocolate','Milk chocolate','demo-dark-chocolate'],['demo-milk','Milk',null],['demo-potato-salad','Potato salad',null]];
-  this.products=fixtures.map(([id,name,sub])=>({id,name,search_text:name.toLowerCase(),sales_unit:'ST',allowed_lot_size:1,carbon_kg_co2_per_kg:null,delivery_reliability:null,raw:{substitutions:sub?[{product:id,substituteProduct:sub}]:[]}}));
+  this.products=fixtures.map(([id,name,sub])=>({id,name,net_contents:demoContents[id],search_text:name.toLowerCase(),sales_unit:'ST',allowed_lot_size:1,carbon_kg_co2_per_kg:null,delivery_reliability:null,raw:{substitutions:sub?[{product:id,substituteProduct:sub}]:[]}}));
   this.orders=new Map();this.reset('normal');
  }
  reset(stock){if(!['normal','low'].includes(stock))throw Error('Unknown stock preset');this.stock=new Map(this.products.map(p=>[p.id,stock==='low'?1:100]));}
