@@ -169,3 +169,22 @@ excluded. A cutoff without an explicit timezone is rejected conservatively.
 No automatic stock refresh is performed within a session. Selection follows
 catalog order and lot-size increments; it does not claim global cost or packing
 optimality. Availability snapshots cannot guarantee supplier stock at checkout.
+
+## Order screening
+
+`OrderScreeningService` in `src/order-screening.js` accepts an injected scorer
+with a synchronous `score(order)` method returning a safe integer. The supplied
+placeholder always returns zero; it is not a fraud detector. The default
+threshold is zero. Scores strictly greater than the threshold go to the existing
+`PENDING_APPROVAL` human review queue; other scores pass screening. Existing
+demo force and bulk flags can still independently require review. Invalid
+scores throw and prevent order creation.
+
+For a custom policy, construct `new OrderScreeningService({ scorer, threshold })`
+and pass it as `screening` to `createApp`. Call `setThreshold(integer)` to
+change the threshold for future evaluations. Existing orders and idempotent
+retries retain their original decision. The scorer receives validated order
+items, customer ID, quote ID, total in cents, currency and requested date.
+
+Run `node test/order-screening.test.js` to see the screening test cases, their
+inputs, and their results.

@@ -1,6 +1,8 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { transaction } from './db.js';
 import { assert } from './contracts.js';
+import { OrderScreeningService, OrderStatus } from './order-screening.js';
+const defaultScreening = new OrderScreeningService();
 export function buildOrderItems(requestItems, quote) {
   return requestItems.map(item => {
     const p = quote.items.find(p => p.productId === item.productId);
@@ -13,7 +15,7 @@ export function buildOrderItems(requestItems, quote) {
     return { ...p, quantity: item.quantity, line_total_cents };
   });
 }
-export async function createOrder(user, key, input) {
+export async function createOrder(user, key, input, screening = defaultScreening) {
   const request = { ...input, items: [...input.items].sort((a, b) => a.productId.localeCompare(b.productId)) };
   const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
   return transaction(async db => {
@@ -26,7 +28,8 @@ export async function createOrder(user, key, input) {
     const items = buildOrderItems(request.items, quote);
     const total = items.reduce((sum, i) => sum + i.line_total_cents, 0);
     assert(Number.isSafeInteger(total), 422, 'Order total too large');
-    const reason = input.force_flag ? 'Demo: force_flag requested' :
+    const screeningResult = screening.evaluate({ userId: user, quoteId: input.quote_id, items, totalCents: total, currency: quote.currency, requestedDate: quote.requested_date });
+    const reason = screeningResult.status === OrderStatus.PENDING_REVIEW ? `Suspicion score ${screeningResult.score} exceeds threshold ${screeningResult.threshold}` : input.force_flag ? 'Demo: force_flag requested' :
       items.length > 20 || items.reduce((n, i) => n + i.quantity, 0) > 20 ? 'Demo: more than 20 lines or total sales units' : null;
     const status = reason ? 'PENDING_APPROVAL' : 'APPROVED';
     const result = (await db.query(`INSERT INTO orders (id,user_id,quote_id,idempotency_key,request_hash,status,flag_reason,items,currency,total_cents,mocked,requested_date,decided_at)

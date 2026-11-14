@@ -6,7 +6,7 @@ import { id, selectedRequest, orderRequest, assert } from './contracts.js';
 import { ValioClient } from './valio.js';
 import { createOrder, decideOrder } from './orders.js';
 const columns = 'id,name,category,country_of_origin,sales_unit,allowed_lot_size,carbon_kg_co2_per_kg,delivery_reliability';
-export function createApp({ valio = new ValioClient() } = {}) {
+export function createApp({ valio = new ValioClient(), screening } = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '256kb' }));
@@ -81,7 +81,7 @@ export function createApp({ valio = new ValioClient() } = {}) {
       input.force_flag ||= flag === 'true';
     }
     const key = id.parse(req.get('Idempotency-Key'));
-    res.status(201).json(await createOrder(req.user,key,input));
+    res.status(201).json(await createOrder(req.user,key,input,screening));
   });
   app.get('/orders', async (req,res) => {
     const query = z.object({ status: z.enum(['PENDING_APPROVAL','APPROVED','REJECTED']).default('PENDING_APPROVAL'),
