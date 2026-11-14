@@ -12,6 +12,14 @@ CREATE TABLE IF NOT EXISTS products (
   raw jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS products_category_idx ON products(category);
+CREATE TABLE IF NOT EXISTS buyer_risk_policies (
+  user_id text PRIMARY KEY,
+  hard_spend_limit numeric NOT NULL CHECK (hard_spend_limit > 0),
+  weekly_spend_limit numeric NOT NULL CHECK (weekly_spend_limit > 0),
+  blocked_categories text[] NOT NULL DEFAULT '{}',
+  excluded_allergens text[] NOT NULL DEFAULT '{}'
+);
+ALTER TABLE buyer_risk_policies DROP COLUMN IF EXISTS deposit_rates;
 CREATE TABLE IF NOT EXISTS selections (
   id uuid PRIMARY KEY,
   user_id text NOT NULL,
@@ -35,6 +43,10 @@ CREATE TABLE IF NOT EXISTS orders (
   request_hash text NOT NULL,
   status text NOT NULL CHECK (status IN ('PENDING_APPROVAL', 'APPROVED', 'REJECTED')),
   flag_reason text,
+  risk_score numeric NOT NULL DEFAULT 0,
+  risk_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  routine boolean NOT NULL DEFAULT false,
+  exclude_from_baseline boolean NOT NULL DEFAULT false,
   items jsonb NOT NULL,
   currency text NOT NULL,
   total_cents bigint NOT NULL CHECK (total_cents >= 0),
@@ -44,6 +56,16 @@ CREATE TABLE IF NOT EXISTS orders (
   decided_at timestamptz,
   UNIQUE(user_id, idempotency_key)
 );
+CREATE TABLE IF NOT EXISTS quote_locks (
+  quote_id uuid PRIMARY KEY REFERENCES quotes(id) ON DELETE CASCADE,
+  order_id uuid NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+  locked_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS risk_score numeric NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS risk_details jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS routine boolean NOT NULL DEFAULT false;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS exclude_from_baseline boolean NOT NULL DEFAULT false;
+UPDATE orders SET routine=true WHERE status='APPROVED' AND risk_details='{}'::jsonb AND routine=false;
 CREATE INDEX IF NOT EXISTS orders_pending_idx ON orders(user_id, created_at) WHERE status = 'PENDING_APPROVAL';
 CREATE TABLE IF NOT EXISTS order_events (
   id bigserial PRIMARY KEY,

@@ -8,7 +8,7 @@ export const productsRequest = z.object({ customer: id, requestedDate: date,
 export const selectedRequest = z.object({ requestedDate: date, products: productsRequest.shape.products,
   selection_ids: z.array(z.string().uuid()).min(1).max(100) }).strict();
 export const orderRequest = z.object({ quote_id: z.string().uuid(), force_flag: z.boolean().default(false),
-  items: z.array(z.object({ productId: id, quantity: z.number().finite().positive().max(1000000) }).strict()).min(1).max(1000)
+  items: z.array(z.object({ productId: id, quantity: z.number().finite().positive().max(1000000), substitutedFrom: id.optional() }).strict()).min(1).max(1000)
     .refine(v => new Set(v.map(i => i.productId)).size === v.length, 'Duplicate order products') }).strict();
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }

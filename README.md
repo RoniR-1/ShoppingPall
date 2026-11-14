@@ -54,11 +54,15 @@ All endpoints except `/health` require `X-User-Id: CUSTOMER`. This is a **truste
 | `POST /api/price` | `{requestedDate, products, selection_ids}`; selected products only. Returns upstream fields plus `mocked`. |
 | `POST /api/availability` | Same request shape and selection gate. |
 | `POST /quotes` | Same request shape; fetches price and stock once each and persists a quote valid for 15 minutes. |
-| `POST /orders` | Header `Idempotency-Key`; body `{quote_id, items:[{productId,quantity}], force_flag?:boolean}`. Uses only server-stored prices and catalog data. |
+| `POST /orders` | Header `Idempotency-Key`; body `{quote_id, items:[{productId,quantity,substitutedFrom?}], force_flag?:boolean}`. To request a substitute, quote both original and substitute products and identify the original with `substitutedFrom`; the server validates catalog mappings and scores mapped pack/nutrition shifts, ingredient changes, and unmapped swaps. |
 | `GET /orders` | Defaults to pending orders for this user. Supports `status`, `limit` (1–100), and `offset`. |
 | `GET /orders/:id` | Retrieve this user's order. |
+| `GET /risk-policy` | Read buyer limits, category blocks, and allergen exclusions (returns defaults if unset). |
+| `PUT /risk-policy` | Update any supplied buyer policy fields. |
 | `POST /orders/:id/approve` | Atomically approve a pending order with an unexpired quote. |
 | `POST /orders/:id/reject` | Atomically reject a pending order. |
+| `POST /orders/:id/mandate` | Answer `{ "question_id": "...", "answer": "yes" }`; for `no`, first returns the question's fixed alternatives, then accept the selected `alternative`. The order commits when the score falls below 30 or all remaining questions are answered yes. |
+| `POST /orders/:id/routine` | Set `{ "routine": true|false }` on an approved order to include it in, or remove it from, routine baselines. |
 
 Example quote request after a catalog search:
 
@@ -73,6 +77,8 @@ Example quote request after a catalog search:
 Selections are persisted so an agent must narrow the catalog before a live call. Multiple searches can contribute to one quote. This gate does not prevent a malicious caller from repeatedly searching or querying; there is no production rate limiter in this demo.
 
 `POST /orders` flags `force_flag=true`, header `X-Force-Flag: true`, more than 20 distinct order lines, or more than 20 total sales units. The latter is an intentionally simple demo threshold across heterogeneous units. Otherwise the order is approved immediately. Live queries themselves are not put into the order approval queue.
+
+Automatically approved and human-approved orders are marked routine and feed the last-10-order spend and SKU baselines. `POST /orders/:id/routine` can reclassify an approved order. To exclude or restore an approved order in those baselines, call `POST /orders/:id/baseline-exclusion` with `{ "exclude": true }` or `{ "exclude": false }`. Weekly spend continues to count all approved orders.
 
 ```mermaid
 stateDiagram-v2
@@ -95,9 +101,9 @@ The actual supplied filenames are:
 - `valio_aimo_junction26_carbon_footprint.csv`: join `productId`, value `AVG kg CO2-eq/kg`; 11,033 catalog matches.
 - `valio_aimo_junction26_delivery_reliability.csv`: join `productId`, value `deliveryReliability` (0–1); 4,425 matches.
 
-`sql/schema.sql` defines catalog, selections, quotes, orders, and audit events. Seed uses one transaction with a database lock, batches upserts by product ID, and retains raw JSON for package/unit information. It can be rerun without duplicate products or affecting orders. Missing supplementary data remains null. Static searches use multilingual names and parameterized SQL; a simple substring scan is sufficient for this dataset. The seed updates/inserts supplied products; it does not delete records absent from later input files.
+`sql/schema.sql` defines catalog, selections, quotes, orders, buyer risk policies, and audit events. Seed uses one transaction with a database lock, batches upserts by product ID, and retains raw JSON for package/unit information. It can be rerun without duplicate products or affecting orders. Missing supplementary data remains null. Static searches use multilingual names and parameterized SQL; a simple substring scan is sufficient for this dataset. The seed updates/inserts supplied products; it does not delete records absent from later input files.
 
-CO2 is **kg CO2-eq per kg of product**, not an order footprint. No total footprint is fabricated without reliable mass conversion. Reliability is a historical ratio, not guaranteed availability. Prices shown are per sales unit including tax. Line totals are rounded to cents and summed as integers; this demo does not calculate extra shipping or deposit charges. Blocked products, missing prices, insufficient quantities, passed cutoffs, wrong units, and delivery later than requested cannot be ordered.
+CO2 is **kg CO2-eq per kg of product**, not an order footprint. No total footprint is fabricated without reliable mass conversion. Reliability is a historical ratio, not guaranteed availability. Prices shown are per sales unit including tax. Line totals are rounded to cents and summed as integers. Blocked products, missing prices, insufficient quantities, passed cutoffs, wrong units, and delivery later than requested cannot be ordered.
 
 ## Verification
 
