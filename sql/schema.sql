@@ -74,3 +74,26 @@ CREATE TABLE IF NOT EXISTS order_events (
   status text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Local demo stock; seeding never replenishes purchased inventory.
+CREATE TABLE IF NOT EXISTS inventory (
+  product_id text PRIMARY KEY REFERENCES products(id),
+  quantity numeric NOT NULL DEFAULT 1000 CHECK (quantity >= 0)
+);
+INSERT INTO inventory(product_id) SELECT id FROM products ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION debit_demo_inventory() RETURNS trigger AS $$
+DECLARE line jsonb;
+BEGIN
+  IF NEW.status = 'APPROVED' AND NEW.mocked AND
+     (TG_OP = 'INSERT' OR OLD.status <> 'APPROVED') THEN
+    FOR line IN SELECT value FROM jsonb_array_elements(NEW.items) ORDER BY value->>'productId' LOOP
+      UPDATE inventory SET quantity = quantity - (line->>'quantity')::numeric
+      WHERE product_id = line->>'productId' AND quantity >= (line->>'quantity')::numeric;
+      IF NOT FOUND THEN RAISE EXCEPTION 'Insufficient local inventory for %', line->>'productId'; END IF;
+    END LOOP;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE TRIGGER orders_inventory BEFORE INSERT OR UPDATE OF status ON orders
+FOR EACH ROW EXECUTE FUNCTION debit_demo_inventory();

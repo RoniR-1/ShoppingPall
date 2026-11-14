@@ -1,8 +1,9 @@
+import { pool } from './db.js';
 import { productsRequest, HttpError } from './contracts.js';
 export class ValioClient {
   constructor({ baseUrl = process.env.VALIO_BASE_URL || 'https://junction26.valioaimo.fi', apiKey = process.env.VALIO_API_KEY,
-    mock = process.env.VALIO_MOCK === 'true', fetchImpl = fetch } = {}) {
-    Object.assign(this, { baseUrl, apiKey, mock, fetchImpl });
+    inventoryPool = pool, mock = process.env.VALIO_MOCK === 'true', fetchImpl = fetch } = {}) {
+    Object.assign(this, { baseUrl, apiKey, mock, fetchImpl, inventoryPool });
   }
   price(request) { return this.call('price', request); }
   availability(request) { return this.call('availability', request); }
@@ -12,9 +13,10 @@ export class ValioClient {
       if (endpoint === 'price') return { customerId: request.customer, currency: 'EUR', pricingDate: request.requestedDate,
         products: request.products.map(productId => ({ productId, quantity: 1, netPriceFound: false, error: false,
           priceWithTax: { value: 2.5, currency: 'EUR', validFrom: request.requestedDate, validTo: request.requestedDate } })) };
+      const inventory = (await this.inventoryPool.query('SELECT product_id,quantity FROM inventory WHERE product_id=ANY($1)', [request.products])).rows;
       return { timeNow: new Date().toISOString(), requestedDate: request.requestedDate, products: request.products.map(productId => ({
         productId, salesBlock: false, logisticModel: 'Stock', closingTime: null,
-        scheduleLines: [{ availableAmount: 999999, availableDate: request.requestedDate, salesUnit: 'MOCK', salesBlock: false }]
+        scheduleLines: [{ availableAmount: Number(inventory.find(p => p.product_id === productId)?.quantity ?? 0), availableDate: request.requestedDate, salesUnit: 'MOCK', salesBlock: false }]
       })) };
     }
     if (!this.apiKey) throw new HttpError(503, 'VALIO_API_KEY is required in live mode');

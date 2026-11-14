@@ -1,0 +1,25 @@
+import {describe,it,expect} from 'vitest';
+import {route,SuspicionScorer} from '../src/web-demo/policy.js';
+describe('Gatekeeper',()=>{
+ for(const [score,status] of [[49,'APPROVED'],[50,'APPROVED'],[51,'PENDING_APPROVAL']])it(`score ${score}`,()=>expect(route({},{score:()=>({score,reason:'test'})},50).status).toBe(status));
+ it('runtime threshold changes routing',()=>{const scorer={score:()=>({score:50,reason:'test'})};expect(route({},scorer,49).status).toBe('PENDING_APPROVAL');expect(route({},scorer,50).status).toBe('APPROVED');});
+ it('shortfall always requires review',()=>expect(route({incomplete:true},{score:()=>({score:0,reason:'test'})},50).status).toBe('PENDING_APPROVAL'));
+ it('demo flag is high risk',()=>expect(new SuspicionScorer().score({force_flag:true}).score).toBe(85));
+});
+
+import {directLines,substitutionQuery} from '../src/web-demo/text.js';
+it('parses conversational shopping lists without replacing products',()=>expect(directLines('i want 5 beers and 2 chocolate bars')).toEqual([{query:'beer',quantity:5},{query:'chocolate',quantity:2}]));
+it('only relaxes a supported food style',()=>{expect(substitutionQuery('extra dark chocolate')).toBe('chocolate');expect(substitutionQuery('imaginary potato salad')).toBeNull();expect(substitutionQuery('vegan dark chocolate')).toBeNull();expect(substitutionQuery('beer')).toBeNull();});
+
+import {sourceContext,sourceName} from '../src/web-demo/sources.js';
+it('keeps concurrent database sources isolated',async()=>{
+ const seen=await Promise.all(['demo','real'].map(source=>sourceContext.run(source,async()=>{await new Promise(resolve=>setTimeout(resolve,5));return sourceName();})));
+ expect(seen).toEqual(['demo','real']);expect(sourceName()).toBe('demo');
+});
+
+import {DemoStore} from '../src/web-demo/demo-store.js';
+it('demo is ready with seven products without PostgreSQL',()=>{const d=new DemoStore();expect(d.overview().products).toHaveLength(7);expect(d.search('beer')).toHaveLength(2);expect(d.overview().products[0].substitutions).toHaveLength(1);});
+it('demo checkout is atomic and repeated approval does not debit twice',()=>{const d=new DemoStore();d.save({id:'a',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:2}]});d.decide({id:'a',user_id:'u',action:'approve'});d.decide({id:'a',user_id:'u',action:'approve'});expect(d.stock.get('demo-beer')).toBe(98);d.save({id:'b',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:1},{productId:'demo-eggs',quantity:101}]});expect(()=>d.decide({id:'b',user_id:'u',action:'approve'})).toThrow('Stock changed');expect(d.stock.get('demo-beer')).toBe(98);});
+
+import {closestProducts} from '../src/web-demo/matches.js';
+it('suggests chocolates and typos without unrelated food',()=>{const d=new DemoStore();expect(closestProducts('chocolates',d.products).map(p=>p.id)).toEqual(['demo-dark-chocolate','demo-milk-chocolate']);expect(closestProducts('choclate',d.products)).toHaveLength(2);expect(closestProducts('vegan chocolate',d.products)).toEqual([]);expect(closestProducts('salmon',d.products)).toEqual([]);});

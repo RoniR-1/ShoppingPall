@@ -194,3 +194,69 @@ items, customer ID, quote ID, total in cents, currency and requested date.
 
 Run `node test/order-screening.test.js` to see the screening test cases, their
 inputs, and their results.
+
+## Inventory and core API additions
+
+Mock availability now reads persistent PostgreSQL inventory (initially 1,000
+sales units per product). A database trigger debits stock atomically on every
+transition to APPROVED, including mandate approvals; insufficient stock rolls
+back the transaction. Pending/rejected orders consume nothing. Reseeding does
+not replenish inventory. Live supplier checkout is still unsupported by the
+supplied contract.
+
+`SUSPICION_THRESHOLD` supplies the screening constructor default; explicit
+constructor configuration and `setThreshold` override it.
+
+`node --env-file=.env src/core-server.js` starts an additional contract-shaped
+core API on loopback port 3001, requiring `CORE_API_KEY`. It serves all six
+OpenAPI paths without modifying the source contract. The existing application
+remains a monolith; this entry point alone does not establish strict service
+separation or move database ownership out of the orchestration process.
+
+## Three-tier web procurement portal
+
+Run `npm install`, configure `.env` using `.env.example`, then `npm run seed`
+and `npm run web`. Open http://127.0.0.1:3001. Keep `VALIO_MOCK=true` for
+local simulated checkout. The existing `.env` is preserved, including credentials.
+
+The portal is served on FRONTEND_PORT (3001), proxies only to MIDDLE_LAYER_PORT
+(4002), and never calls the core. The middle process owns parsing, allocation,
+scoring and review orchestration and has no database imports. The core on
+BACKEND_PORT (4003) owns PostgreSQL, authenticated Valio-compatible paths,
+private persistence endpoints and transactional inventory checkout. Private
+`/internal/*` endpoints are extensions outside the unchanged OpenAPI contract.
+The legacy monolith/CLI remains available separately via `npm start`.
+
+Use the setup panel to seed/reset inventory (normal or low stock), or change
+only the suspicion threshold. Stock reset preserves order history. Normal and
+suspicious presets use product 460000; low stock limits it to 0.5 sales units.
+The substitution preset deliberately requests an absent potato salad description.
+Suggestions always derive from the original request. Selecting a suggestion
+creates a new reviewed proposal; approve that proposal to purchase. Shortfalls
+require explicit acceptance of available quantities or rejection.
+
+Direct text supports `2 potato salad; 1 milk` (sales units). Recipe prompts use
+Agent mode with an OpenAI-compatible LUNA_BASE_URL, LUNA_API_KEY and provider's
+actual LUNA_MODEL identifier. No provider credentials/model endpoint were
+supplied, so real Luna inference is not verified. Unknown unit conversions and
+recipe portions must be reviewed by the buyer. Live Valio checkout is unavailable
+in the supplied API and therefore fails closed; mock checkout debits local stock.
+
+`npm run test:portal` runs Vitest threshold/routing tests. `npm test` retains the
+existing Node suite. All services bind to localhost; user IDs are demo identity,
+not production authentication. The default internal key is for local demos only.
+
+### Demo / real database selector
+
+Run `npm run web` and choose Demo: no PostgreSQL, database URL, API key, or seed
+command is needed for direct-text demo orders. Seven mock products, stock,
+substitutions and approval records live in process memory. Prices are synthetic;
+carbon/reliability are unknown rather than invented. Stock reset preserves orders
+until the core process restarts; restarting restores stock and clears demo orders.
+Agent mode separately requires the configured model credentials.
+
+Real requires `REAL_DATABASE_URL` with the seeded catalog schema and
+`VALIO_API_KEY`. Real prices/availability come from Valio and orders are stored in
+PostgreSQL. Real checkout remains preview-only. The selector validates the real
+connection before switching and retains Demo on failure. Demo resets cannot touch
+PostgreSQL. `DEMO_DATABASE_URL` is no longer used.

@@ -6,7 +6,7 @@ export class PlaceholderSuspicionScorer {
 export const OrderStatus = Object.freeze({ APPROVED: 'APPROVED', PENDING_REVIEW: 'PENDING_APPROVAL' });
 
 export class OrderScreeningService {
-  constructor({ scorer = new PlaceholderSuspicionScorer(), threshold = 0 } = {}) {
+  constructor({ scorer = new PlaceholderSuspicionScorer(), threshold = Number(process.env.SUSPICION_THRESHOLD ?? 0) } = {}) {
     if (typeof scorer?.score !== 'function') throw new TypeError('scorer must implement score(order)');
     this.scorer = scorer;
     this.setThreshold(threshold);

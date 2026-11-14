@@ -10,12 +10,16 @@
     "start": "node --env-file-if-exists=.env src/server.js",
     "seed": "node --env-file-if-exists=.env scripts/seed.js",
     "cli": "node --env-file-if-exists=.env src/cli.js",
-    "test": "node --env-file-if-exists=.env --test test/*.test.js"
+    "test": "node --env-file-if-exists=.env --test test/*.test.js",
+    "web": "node scripts/web-demo.js",
+    "test:portal": "vitest run"
   },
   "dependencies": {
     "csv-parse": "^7.0.3",
+    "dotenv": "^18.0.10",
     "express": "^5.1.0",
     "pg": "^8.16.0",
+    "vitest": "^5.1.0",
     "zod": "^4.6.7"
   }
 }

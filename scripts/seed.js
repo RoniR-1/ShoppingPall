@@ -40,6 +40,7 @@ try {
         deleted=EXCLUDED.deleted, carbon_kg_co2_per_kg=EXCLUDED.carbon_kg_co2_per_kg,
         delivery_reliability=EXCLUDED.delivery_reliability, raw=EXCLUDED.raw`, [JSON.stringify(rows)]);
     }
+    await db.query('INSERT INTO inventory(product_id) SELECT id FROM products ON CONFLICT DO NOTHING');
   });
   console.log(JSON.stringify({ products: ids.size, carbonMatches: [...ids].filter(id => carbon.has(id)).length,
     reliabilityMatches: [...ids].filter(id => reliability.has(id)).length }));
