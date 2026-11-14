@@ -1,10 +1,10 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Managed Inventory Agent</title><link rel="stylesheet" href="/style.css"></head><body class="managed-page"><header class="topbar">
   <div class="topbar-left"><a class="brand" href="/user-agent-demo">shopping pal</a><span class="status-tag">managed agent · demo</span></div>
-  <div class="topbar-right"><span class="buyer-tag">buyer: <strong>demo-buyer</strong></span><a class="nav-link" href="/user-agent-demo">User agent demo</a></div>
+  <div class="topbar-right"><span class="buyer-tag">buyer: <strong id="buyer-label"></strong></span><button id="new-session" class="ghost-btn small-btn" type="button">New Session</button><a class="nav-link" href="/user-agent-demo">User agent demo</a></div>
 </header>
 <main class="container">
   <div class="managed-heading"><h1>Managed Inventory Agent</h1><div class="managed-heading-actions"><button class="ghost-btn" id="open-agent-chat" type="button" aria-controls="agent-chat" aria-haspopup="dialog">Chat with your agent</button><button class="primary-btn" data-action="check">Check now</button></div></div>
-<p>Simulated purchasing · Demo identity · Checks every 30 seconds while the server runs</p><p id="error" role="alert"></p><div class="managed-grid">
+<p>Simulated purchasing · Checks every 30 seconds while the server runs</p><p id="error" role="alert"></p><div class="managed-grid">
 <section class="panel">
 <div class="panel-bar"><span>Replenishment rules</span></div><p>Stock thresholds use sales units. Set a price cap such as EUR 5 per 1 kg or EUR 2 per 1 L. Each product’s net contents convert its pack price for comparison. Demo pack sizes are synthetic.</p>
 <form id="rule" class="managed-form"><div class="settings-grid">

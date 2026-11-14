@@ -15,7 +15,8 @@
     <div class="topbar-right">
       <a class="nav-link" href="/managed-agent" data-chrome>Managed agent</a>
       <label class="checkbox-label"><input type="checkbox" id="plain-mode"><span>Plain</span></label>
-      <span class="buyer-tag" data-chrome>buyer: <strong id="buyer-label">demo-buyer</strong></span>
+      <span class="buyer-tag" data-chrome>buyer: <strong id="buyer-label"></strong></span>
+      <button id="new-session" class="ghost-btn small-btn" type="button">New Session</button>
       <button id="toggle" class="ghost-btn small-btn" type="button" data-chrome>Settings</button>
     </div>
   </header>
@@ -41,7 +42,6 @@
             <label class="grow">
               <span>Active buyer</span>
               <select id="user" aria-label="Active buyer">
-                <option value="demo-buyer">demo-buyer</option>
               </select>
             </label>
             <label class="num-field">

@@ -1,4 +1,8 @@
-const user='demo-buyer';
+const newGuestId=()=>`guest-${Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join('')}`;
+let user=(localStorage.getItem('activeBuyer')||'').trim();
+if(!user||user==='demo-buyer'){user=newGuestId();localStorage.setItem('activeBuyer',user);}
+document.getElementById('buyer-label').textContent=user;
+document.getElementById('new-session').onclick=()=>{localStorage.setItem('activeBuyer',newGuestId());location.reload();};
 const sessionStartedAt=Date.now();
 const connectionError='Cannot reach the portal. Start npm run web; this page will reconnect automatically.';
 const $=id=>document.getElementById(id);
