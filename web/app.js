@@ -307,13 +307,17 @@ function renderOrderCard(o, interactive = true) {
         </div>`)
     : '';
 
-  return `<article class="order-card" data-id="${esc(o.id)}">
+  const isInspected = lastExecOrder?.id === o.id;
+  return `<article class="order-card${isInspected ? ' is-inspected' : ''}" data-id="${esc(o.id)}">
     <div class="order-head">
       <div>
         <h3>${esc(title)}</h3>
         <div class="order-meta">${esc(o.reason || '')}</div>
       </div>
-      ${statusBadge(o.status, o.score, o.threshold)}
+      <div class="order-head-right">
+        <button type="button" class="link-btn inspect-btn" data-inspect-order="${esc(o.id)}">${isInspected ? '● Trace shown' : 'Inspect trace'}</button>
+        ${statusBadge(o.status, o.score, o.threshold)}
+      </div>
     </div>
     ${renderItemsTable(o.items, interactive && o.status === 'PENDING_APPROVAL')}
     ${o.items?.length ? `<div class="order-total">Total: ${fmtMoney(total)}</div>` : ''}
@@ -322,6 +326,109 @@ function renderOrderCard(o, interactive = true) {
     ${partialHtml}
     ${actionsHtml}
   </article>`;
+}
+
+function selectionReasonText(mode) {
+  if (mode === 'human-substitution') return 'selected as your requested substitute';
+  if (mode === 'human-pinned') return 'kept from your current selection during order edit';
+  if (mode === 'gemini-selection') return 'selected by Gemini for best unit/packaging fit and catalog rank';
+  if (mode === 'fallback-suggestions') return 'selected from closest catalog suggestions (no exact keyword match)';
+  if (mode === 'no-match') return 'no catalog match found';
+  return 'ranked #1 on keyword relevance, allergen safety, buyer history, stock, and supplier reliability';
+}
+
+function renderTraceNarrative(o) {
+  const total = o.total ?? (o.items || []).reduce((sum, i) => sum + Number(i.quantity) * Number(i.price || 0), 0);
+  const title = o.raw_prompt || o.lines?.map(l => l.requested || `${fmtNum(l.quantity)} × ${l.query}`).join(', ') || o.id;
+  const modelTag = o.parser_model || 'gemini-2.5-flash';
+  const lineCount = (o.lines || []).length;
+
+  const lineTraces = o.line_traces?.length
+    ? o.line_traces
+    : (o.lines || []).map((l, idx) => {
+        const matchedItems = (o.items || []).filter(i => (i.lineIndex ?? 0) === idx);
+        const first = matchedItems[0];
+        const topCandidates = first
+          ? [first, ...(first.alternatives || []).slice(0, 2)]
+          : [];
+        return {
+          lineIndex: idx,
+          requested: l.requested || `${fmtNum(l.quantity)} × ${l.query}`,
+          query: l.query,
+          alternatives: l.alternatives || [],
+          matchedQuery: l.query,
+          totalCandidates: topCandidates.length,
+          selectionMode: first?.substitution ? 'human-substitution' : 'top-ranked',
+          selectedProductId: first?.productId || null,
+          selectedName: first?.name || null,
+          selectedQty: first?.quantity ?? l.quantity,
+          selectedUnit: first?.unit || null,
+          topCandidates
+        };
+      });
+
+  const linesProse = lineTraces.map(lt => {
+    const altsText = lt.alternatives?.length ? ` (tried: <code>${esc(lt.alternatives.slice(0, 3).join(', '))}</code>)` : '';
+    if (!lt.topCandidates?.length) {
+      return `<li><strong>"${esc(lt.requested)}"</strong> → <code>${esc(lt.query)}</code>${altsText}: <strong>0 available matches</strong>.</li>`;
+    }
+    const candList = lt.topCandidates.slice(0, 3).map((c, idx) => {
+      const isWinner = c.productId === lt.selectedProductId || idx === 0;
+      const rel = c.reliability != null ? `, ${fmtNum(Number(c.reliability) * 100)}% rel` : '';
+      const co2 = c.carbon != null ? `, ${fmtNum(c.carbon)} CO₂` : '';
+      const hist = Number(c.bought_count || 0) > 0 ? `, ${c.bought_count}× prior` : ', new';
+      const safety = c.allergen_safe === false ? ', ⚠ allergen' : '';
+      return `<span class="trace-cand${isWinner ? ' is-winner' : ''}">${idx + 1}) <strong>${esc(c.name)}</strong> <small>(${fmtMoney(c.price)}/${esc(c.unit)}, ${fmtNum(c.available)} avail${rel}${co2}${hist}${safety})</small>${isWinner ? ` ✓ <em>${fmtNum(lt.selectedQty)} ${esc(lt.selectedUnit || c.unit)}</em>` : ''}</span>`;
+    }).join(' · ');
+    const totalMatches = lt.totalCandidates || lt.topCandidates.length;
+    return `<li><strong>"${esc(lt.requested)}"</strong> → <code>${esc(lt.matchedQuery || lt.query)}</code>${altsText} (${totalMatches} match${totalMatches === 1 ? '' : 'es'}): ${candList}. Picked <strong>${esc(lt.selectedName || lt.topCandidates[0]?.name)}</strong> (${selectionReasonText(lt.selectionMode)}).</li>`;
+  }).join('');
+
+  const checks = o.checks?.length
+    ? o.checks
+    : [
+        ...(o.questions || []).map(q => ({ status: 'flag', points: q.points, text: q.message })),
+        ...(o.score <= (o.threshold ?? 25) ? [{ status: 'pass', points: 0, text: 'Order matches routine buyer pattern and spend baseline.' }] : [])
+      ];
+
+  const checksHtml = checks.map(c => {
+    const icon = c.status === 'flag' ? '⚠' : '✓';
+    const cls = c.status === 'flag' ? 'trace-check flag' : 'trace-check pass';
+    return `<li class="${cls}"><span>${icon}</span> <span>${esc(c.text)}</span></li>`;
+  }).join('');
+
+  const spendCap = o.buyer_baseline?.spendCap ?? 200;
+  let decisionProse = '';
+  if (o.status === 'PENDING_APPROVAL') {
+    decisionProse = `Because the combined risk score is <strong>${fmtNum(o.score)} pts</strong> (above <strong>${esc(o.user_id || activeBuyer)}</strong>'s threshold of <strong>${fmtNum(o.threshold)} pts</strong>), I held the order in <strong>02 · Approval queue</strong> for your confirmation${o.questions?.length ? ` (${o.questions.length} question${o.questions.length === 1 ? '' : 's'} to review)` : ''}.`;
+  } else if (o.status === 'APPROVED') {
+    decisionProse = o.human_approved
+      ? `Following human review, <strong>${esc(o.user_id || activeBuyer)}</strong> approved this order (<strong>${fmtMoney(total)}</strong>, risk score <strong>${fmtNum(o.score)}/${fmtNum(o.threshold)}</strong>) and stock was deducted.`
+      : `Because the risk score (<strong>${fmtNum(o.score)} pts</strong>) is within <strong>${esc(o.user_id || activeBuyer)}</strong>'s <strong>${fmtNum(o.threshold)} pt</strong> threshold and no blocking issues were found, I <strong>auto-approved</strong> the order immediately.`;
+  } else {
+    decisionProse = `This order (<strong>${fmtMoney(total)}</strong>, risk score <strong>${fmtNum(o.score)}/${fmtNum(o.threshold)}</strong>) was <strong>cancelled / rejected</strong> and no stock was deducted.`;
+  }
+
+  const editActions = (o.audit_trail || []).filter(
+    a => a.actor && a.actor !== 'gatekeeper' && a.text && !/^(approved|rejected|cancelled)\b/i.test(a.text.trim())
+  );
+  const formatActionTime = iso => {
+    if (!iso) return 'now';
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? esc(iso.slice(11, 16)) : esc(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  };
+  const auditHtml = editActions.length
+    ? `<div class="trace-audit"><strong>Edits applied:</strong> ${editActions.map(a => `<span class="trace-audit-item"><code>${formatActionTime(a.at)}</code> ${esc(a.text)}</span>`).join(' → ')}</div>`
+    : '';
+
+  return `<div class="llm-trace-report">
+    <p>Parsed <strong>"${esc(title)}"</strong> for <strong>${esc(o.user_id || activeBuyer)}</strong> via <code>${esc(modelTag)}</code> into ${lineCount} line${lineCount === 1 ? '' : 's'} (${fmtMoney(total)}):</p>
+    <ul class="trace-prose-list">${linesProse}</ul>
+    <p>Policy checks (threshold <strong>${fmtNum(o.threshold)} pts</strong>, cap <strong>${fmtMoney(spendCap)}</strong>):</p>
+    <ul class="trace-checks-list">${checksHtml}</ul>
+    <p class="trace-conclusion">${decisionProse}</p>
+    ${auditHtml}
+  </div>`;
 }
 
 function showExecution(o) {
@@ -334,20 +441,23 @@ function showExecution(o) {
   const badgeEl = $('exec-badge');
   badgeEl.className = `badge ${o.status === 'APPROVED' ? 'approved' : o.status === 'REJECTED' ? 'rejected' : 'pending'}`;
   badgeEl.textContent = `${statusLabel(o.status)} · Risk ${fmtNum(o.score)}/${fmtNum(o.threshold)}`;
-  if (o.status === 'PENDING_APPROVAL') {
-    const title = o.lines?.map(l => l.requested || `${fmtNum(l.quantity)} × ${l.query}`).join(', ') || o.id;
-    $('item-summary').innerHTML = `<p class="order-meta"><strong>${esc(title)}</strong> queued in <strong>02 · Approval queue</strong>${o.reason ? ` — ${esc(o.reason)}` : ''}.</p>`;
-  } else {
-    $('item-summary').innerHTML = renderOrderCard(o, false);
-  }
+  $('item-summary').innerHTML = plainMode ? renderOrderCard(o, false) : renderTraceNarrative(o);
   $('steps').innerHTML = (o.steps || []).map(s => `<li>${esc(s)}</li>`).join('');
   $('raw').textContent = JSON.stringify(o, null, 2);
 }
 
 function renderOrders(orders) {
   lastOrders = orders;
-  const pending = orders.filter(o => o.status === 'PENDING_APPROVAL');
-  const history = orders.filter(o => o.status !== 'PENDING_APPROVAL');
+  const visibleOrders = orders.filter(o => !o.superseded_by);
+  const pending = visibleOrders.filter(o => o.status === 'PENDING_APPROVAL');
+  const history = visibleOrders.filter(o => o.status !== 'PENDING_APPROVAL');
+
+  if (lastExecOrder) {
+    const updatedActive = orders.find(o => o.id === lastExecOrder.id);
+    if (updatedActive) showExecution(updatedActive);
+  } else if (visibleOrders.length && !plainMode) {
+    showExecution(visibleOrders[0]);
+  }
 
   $('count').textContent = pending.length;
   $('orders').innerHTML = pending.length
@@ -431,6 +541,16 @@ async function refresh() {
 }
 
 async function handleOrderDecision(e) {
+  const inspectBtn = e.target.closest('button[data-inspect-order]');
+  if (inspectBtn) {
+    const targetOrder = lastOrders.find(o => o.id === inspectBtn.dataset.inspectOrder);
+    if (targetOrder) {
+      showExecution(targetOrder);
+      renderOrders(lastOrders);
+    }
+    return;
+  }
+
   const resetBtn = e.target.closest('button[data-q-reset]');
   if (resetBtn) {
     acceptedQuestionsByOrder.delete(resetBtn.dataset.qReset);
@@ -556,6 +676,7 @@ async function handleOrderDecision(e) {
 }
 
 $('orders').onclick = handleOrderDecision;
+$('history-orders').onclick = handleOrderDecision;
 
 async function submit() {
   clearInputError();
