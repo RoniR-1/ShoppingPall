@@ -1,0 +1,55 @@
+[
+  {
+    "id": "quantity-spike",
+    "label": "10× quantity spike",
+    "description": "Build a normal basket history, then change one SKU from 1 unit to 10.",
+    "stock": "normal",
+    "steps": [
+      { "label": "Routine basket 1", "prompt": "i want 1 egg; 2 potato salad; 4 lager beer" },
+      { "label": "Routine basket 2", "prompt": "i want 1 egg; 2 potato salad; 4 lager beer" },
+      { "label": "Routine basket 3", "prompt": "i want 1 egg; 2 potato salad; 4 lager beer" },
+      { "label": "Routine basket 4", "prompt": "i want 1 egg; 2 potato salad; 4 lager beer" },
+      { "label": "10× egg quantity", "prompt": "i want 10 eggs; 2 potato salad; 4 lager beer" }
+    ]
+  },
+  {
+    "id": "allergen-conflict",
+    "label": "Known milk allergen",
+    "description": "The in-memory demo marks milk-containing items as unsafe for the sample buyer.",
+    "stock": "normal",
+    "steps": [
+      { "label": "Catering basket with milk", "prompt": "i want 1 milk; 2 potato salad; 4 lager beer" }
+    ]
+  },
+  {
+    "id": "account-spend",
+    "label": "Account-relative spend change",
+    "description": "Four €300 baskets establish the buyer’s pattern; the fifth totals €500. Mock prices are €2.50 per unit.",
+    "stock": "normal",
+    "steps": [
+      { "label": "Routine basket 1 · €300", "prompt": "i want 60 eggs; 60 potato salad" },
+      { "label": "Routine basket 2 · €300", "prompt": "i want 60 eggs; 60 potato salad" },
+      { "label": "Routine basket 3 · €300", "prompt": "i want 60 eggs; 60 potato salad" },
+      { "label": "Routine basket 4 · €300", "prompt": "i want 60 eggs; 60 potato salad" },
+      { "label": "Unusual basket · €500", "prompt": "i want 100 eggs; 100 potato salad" }
+    ]
+  },
+  {
+    "id": "unavailable-substitute",
+    "label": "Unavailable product and substitute",
+    "description": "The demo marks dark chocolate unavailable and offers catalog alternatives while still processing the rest of the basket.",
+    "stock": "normal",
+    "steps": [
+      { "label": "Catering basket · unavailable chocolate", "prompt": "i want 1 dark chocolate; 2 potato salad; 4 lager beer", "demoUnavailable": true }
+    ]
+  },
+  {
+    "id": "low-stock",
+    "label": "Low-stock catering basket",
+    "description": "Run a multi-product request against low demo inventory and review the resulting shortfalls.",
+    "stock": "low",
+    "steps": [
+      { "label": "Request · beer, salad, chocolate", "prompt": "i want 5 lager beer; 2 potato salad; 1 dark chocolate" }
+    ]
+  }
+]

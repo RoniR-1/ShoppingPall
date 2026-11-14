@@ -150,6 +150,38 @@ body {
   user-select: none;
 }
 
+.demo-prompt-controls {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.demo-prompt-controls > label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.demo-prompt-actions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.demo-prompt-actions select {
+  min-width: 220px;
+  flex: 1;
+  background: var(--surface-input);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  padding: 7px 9px;
+  font: inherit;
+}
+
+#scenario-help {
+  margin: 0;
+  font-size: 11px;
+}
+
 input,
 select,
 textarea,

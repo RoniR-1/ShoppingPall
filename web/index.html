@@ -60,6 +60,15 @@
         <span class="prompt-prefix">&gt;</span>
         <textarea id="prompt" rows="2" placeholder="Enter query here"></textarea>
       </div>
+      <div class="demo-prompt-controls">
+        <label for="demo-scenario">Guided demo scenario</label>
+        <div class="demo-prompt-actions">
+          <select id="demo-scenario" aria-label="Choose a demo scenario"><option value="">Loading scenarios…</option></select>
+          <button id="scenario-start" class="ghost-btn small-btn" type="button">Start</button>
+          <button id="scenario-next" class="ghost-btn small-btn" type="button" disabled>Next prompt</button>
+        </div>
+        <p id="scenario-help" class="muted" aria-live="polite">Start a scenario, submit each loaded prompt, and approve any baseline order before continuing.</p>
+      </div>
       <div class="request-footer">
         <label class="checkbox-label">
           <input type="checkbox" id="force-flag">

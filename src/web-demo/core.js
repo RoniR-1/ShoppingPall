@@ -26,7 +26,7 @@ app.use((req,res,next)=>{
   if(req.method==='GET'&&path==='/internal/catalog-overview')return res.json(demo.overview());
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
   if(req.method==='POST'&&path==='/internal/suggestions')return res.json(closestProducts(req.body.q,demo.products));
-  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q));
+  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id));
   if(req.method==='POST'&&path==='/internal/setup'){demo.reset(req.body.stock);return res.json({ok:true,stock:req.body.stock});}
   if(req.method==='POST'&&path==='/internal/save')return res.json(demo.save(req.body));
   if(req.method==='POST'&&path==='/internal/decision')return res.json(demo.decide(req.body));
