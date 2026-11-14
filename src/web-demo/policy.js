@@ -1,22 +1,110 @@
 import { round3 } from '../contracts.js';
 
+const REQUEST_FILLER_WORDS = new Set([
+  'i', 'we', 'you', 'want', 'would', 'like', 'need', 'order', 'buy', 'get', 'please', 'some', 'any',
+  'of', 'for', 'to', 'in', 'on', 'a', 'an', 'the', 'and', 'or', 'with', 'without', 'approx', 'about',
+  'fresh', 'ripe', 'good', 'nice', 'regular', 'normal', 'standard', 'classic',
+  'kg', 'kgs', 'g', 'gr', 'gram', 'grams', 'l', 'lt', 'ltr', 'liter', 'liters', 'litre', 'litres',
+  'ml', 'cl', 'dl', 'pc', 'pcs', 'piece', 'pieces', 'st', 'ki', 'rs', 'unit', 'units',
+  'bag', 'bags', 'box', 'boxes', 'pack', 'packs', 'package', 'packages', 'crate', 'crates',
+  'bottle', 'bottles', 'carton', 'cartons', 'can', 'cans', 'jar', 'jars', 'tray', 'trays', 'tin', 'tins'
+]);
+
+function stemToken(word) {
+  let w = String(word || '').toLowerCase().replace(/[^a-z0-9äöå]/g, '');
+  if (w.endsWith('ies') && w.length > 4) w = `${w.slice(0, -3)}y`;
+  else if (w.endsWith('es') && w.length > 4 && !/(cheese|sauce)/.test(w)) w = w.slice(0, -2);
+  else if (w.endsWith('s') && w.length > 3 && !w.endsWith('ss')) w = w.slice(0, -1);
+  return w;
+}
+
+function tokenizeProductText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\d+(?:[.,]\d+)?/g, ' ')
+    .replace(/[×*+/\\()[\],.:;!?'"-]/g, ' ')
+    .split(/\s+/)
+    .map(stemToken)
+    .filter(w => w.length >= 2);
+}
+
+export function missingRequestTerms(item = {}, line = null) {
+  const rawReq = item.requested || line?.requested || line?.query || '';
+  if (!rawReq || !item.name) return null;
+  const reqTokens = [...new Set(tokenizeProductText(rawReq).filter(w => !REQUEST_FILLER_WORDS.has(w)))];
+  if (!reqTokens.length) return [];
+  const nameTokens = new Set(tokenizeProductText(item.name));
+  if (nameTokens.has('drink') && !nameTokens.has('milk')) nameTokens.add('milk');
+  if (nameTokens.has('beverage') && !nameTokens.has('drink')) nameTokens.add('drink');
+  return reqTokens.filter(t => ![...nameTokens].some(n => n === t || (t.length >= 4 && n.startsWith(t)) || (n.length >= 4 && t.startsWith(n))));
+}
+
+export function isBrandOrVariantMismatch(item = {}, line = null) {
+  const rawReq = item.requested || line?.requested || line?.query || '';
+  if (!rawReq || !item.name) return false;
+  const reqTokens = [...new Set(tokenizeProductText(rawReq).filter(w => !REQUEST_FILLER_WORDS.has(w)))];
+  if (reqTokens.length < 2) return false;
+  const missing = missingRequestTerms(item, line);
+  return Array.isArray(missing) && missing.length > 0 && missing.length < reqTokens.length;
+}
+
 export class SuspicionScorer {
   score(order = {}) {
     const lines = order.lines || [];
     const items = order.items || [];
     const total = Number(order.total ?? items.reduce((sum, i) => sum + Number(i.quantity || 0) * Number(i.price || 0), 0));
     const reasons = [];
+    const questions = [];
     let points = 0;
+
+    const addQuestion = (rule, pts, item, message, extra = {}) => {
+      const targetKey = item?.productId
+        ? `${item.lineIndex ?? 0}:${item.productId}`
+        : `${item?.lineIndex ?? 'order'}`;
+      const lot = round3(Number(item?.lot) || 1);
+      const currentQty = item?.quantity != null ? round3(Number(item.quantity)) : null;
+      const quantityOnlyRules = ['quantitySpike', 'quantityDrop', 'largeVolume', 'lowSpend'];
+      questions.push({
+        id: `${rule}:${targetKey}`,
+        rule,
+        points: round3(pts),
+        lineIndex: item?.lineIndex ?? 0,
+        productId: item?.productId ?? null,
+        productName: item?.name ?? null,
+        unit: item?.unit || 'unit',
+        lot,
+        currentQty,
+        suggestedQty: extra.suggestedQty != null ? round3(extra.suggestedQty) : currentQty,
+        allowQuantityEdit: Boolean(item) && extra.allowQuantityEdit !== false,
+        allowSubstitution: !quantityOnlyRules.includes(rule) && extra.allowSubstitution !== false,
+        message,
+        alternatives: item?.alternatives || []
+      });
+    };
 
     if (order.force_flag) {
       points += 85;
       reasons.push('Manual review flag (+85)');
+      addQuestion(
+        'manualFlag',
+        85,
+        items[0],
+        `You checked manual review (--force-flag) for this order${items[0]?.name ? ` (${items[0].name})` : ''}. Ready to send it through, or would you like to tweak anything first?`
+      );
     }
 
     const totalQty = lines.reduce((n, l) => n + Number(l.quantity || 0), 0);
     if (lines.length > 20 || totalQty > 100) {
       points += 80;
       reasons.push('Large request volume (+80)');
+      const halfQty = items[0]?.quantity ? Math.max(Number(items[0].lot) || 1, Math.floor(Number(items[0].quantity) / 2)) : 1;
+      addQuestion(
+        'largeVolume',
+        80,
+        items[0],
+        `That's quite a large order (${lines.length} line${lines.length === 1 ? '' : 's'}, ${round3(totalQty)} units total). Did you mean to order this much volume, or would you like to scale it back?`,
+        { suggestedQty: halfQty, allowSubstitution: false }
+      );
     }
 
     let unfamiliarCount = 0;
@@ -28,30 +116,101 @@ export class SuspicionScorer {
     let carbonPts = 0;
 
     for (const item of items) {
+      const itemLabel = item.name || item.productId || 'item';
+      const unit = item.unit || 'unit';
+      const lot = Number(item.lot) > 0 ? Number(item.lot) : 1;
+      const snap = q => round3(Math.max(lot, Math.round(Number(q) / lot) * lot));
+      const itemCost = Number(item.lineTotal ?? Number(item.quantity || 0) * Number(item.price || 0)).toFixed(2);
       const priorApprovals = Number(item.human_approved_count || 0) + Number(item.bought_count || 0);
-      if (priorApprovals === 0) unfamiliarCount += 1;
+      if (priorApprovals === 0) {
+        unfamiliarCount += 1;
+        const itemPts = unfamiliarCount === 1 ? 30 : 10;
+        const msg = unfamiliarCount === 1
+          ? `Looks like this is your first time ordering ${itemLabel} (${round3(item.quantity)} ${unit} for €${itemCost}). Does this look like the right product and amount?`
+          : `${itemLabel} (${round3(item.quantity)} ${unit}, €${itemCost}) is also new to your order history. Still want to include it?`;
+        addQuestion('unfamiliarItem', itemPts, item, msg);
+      }
 
       const priorMax = Number(item.prior_max_qty || 0);
       if (priorMax > 0 && Number(item.quantity) > 1.5 * priorMax) {
-        const spike = 30 + 40 * (Number(item.quantity) / priorMax - 1.5);
+        const spike = round3(30 + 40 * (Number(item.quantity) / priorMax - 1.5));
         quantitySpikePts = Math.max(quantitySpikePts, spike);
+        const ratio = Number(item.quantity) / priorMax;
+        const msg = ratio >= 3
+          ? `Whoa — ${round3(item.quantity)} ${unit} of ${itemLabel} is over ${Math.round(ratio)}× what you usually order at most (${round3(priorMax)} ${unit}). Did you really need this many, or want to dial the amount back?`
+          : `You usually order at most ${round3(priorMax)} ${unit} of ${itemLabel}, so ${round3(item.quantity)} ${unit} is a noticeable jump. Keep all ${round3(item.quantity)} ${unit}, or lower the quantity?`;
+        addQuestion('quantitySpike', spike, item, msg, {
+          suggestedQty: snap(priorMax),
+          allowSubstitution: false
+        });
       }
 
       const priorMin = Number(item.prior_min_qty || item.prior_avg_qty || item.prior_max_qty || 0);
       if (priorMin > 0 && Number(item.quantity) < 0.5 * priorMin) {
-        const drop = 25 + 20 * (priorMin / Math.max(Number(item.quantity), 0.001) - 2);
+        const drop = round3(25 + 20 * (priorMin / Math.max(Number(item.quantity), 0.001) - 2));
         quantityDropPts = Math.max(quantityDropPts, drop);
+        addQuestion(
+          'quantityDrop',
+          drop,
+          item,
+          `You normally get at least ${round3(priorMin)} ${unit} of ${itemLabel}, and this order only has ${round3(item.quantity)} ${unit}. Is that smaller amount enough for now, or would you like to bump it up?`,
+          { suggestedQty: snap(priorMin), allowSubstitution: false }
+        );
       }
 
-      if (item.allergen_safe === false) allergenPts = Math.max(allergenPts, 80);
-      if (item.substitution === true) substitutionPts = Math.max(substitutionPts, 30);
+      if (item.allergen_safe === false) {
+        allergenPts = Math.max(allergenPts, 80);
+        addQuestion(
+          'allergenConflict',
+          80,
+          item,
+          `Heads up: ${itemLabel} conflicts with your allergen settings. Do you still want to keep it in this order, or swap/drop it?`
+        );
+      }
+
+      const itemUnfamiliarQ = priorApprovals === 0
+        ? questions.find(q => q.rule === 'unfamiliarItem' && q.lineIndex === (item.lineIndex ?? 0) && q.productId === (item.productId ?? null))
+        : null;
+      const lineObj = lines[item.lineIndex ?? 0];
+      const brandMismatch = !item.userSelected && isBrandOrVariantMismatch(item, lineObj);
+      if (item.substitution === true || brandMismatch) {
+        const missing = missingRequestTerms(item, lineObj);
+        // A general request (e.g. "50 × pear" matched to "PEAR SUOMI KG") has no missing brand/variant qualifiers.
+        const isGenericMatch = item.substitution === true && Array.isArray(missing) && missing.length === 0;
+        if (!isGenericMatch && !item.userSelected) {
+          substitutionPts = Math.max(substitutionPts, 30);
+          const subMsg = Array.isArray(missing) && missing.length > 0
+            ? `You asked for "${item.requested || 'a specific item'}" (specifically ${missing.join(' ')}), and we matched ${itemLabel} (€${Number(item.price || 0).toFixed(2)}/${unit}) instead.`
+            : `We swapped in ${itemLabel} (€${Number(item.price || 0).toFixed(2)}/${unit}) for "${item.requested || 'your requested item'}".`;
+          if (itemUnfamiliarQ) {
+            itemUnfamiliarQ.points = round3(Number(itemUnfamiliarQ.points || 0) + 30);
+            itemUnfamiliarQ.message = `${subMsg} It's also your first time ordering it (${round3(item.quantity)} ${unit} for €${itemCost}) — does this replacement and amount look good?`;
+          } else {
+            addQuestion('substitution', 30, item, `${subMsg} Does that replacement work for you?`);
+          }
+        }
+      }
 
       if (item.reliability != null && Number(item.reliability) < 0.85) {
-        reliabilityPts = Math.max(reliabilityPts, Math.max(10, (0.85 - Number(item.reliability)) * 100));
+        const relPts = round3(Math.max(10, (0.85 - Number(item.reliability)) * 100));
+        reliabilityPts = Math.max(reliabilityPts, relPts);
+        addQuestion(
+          'lowReliability',
+          relPts,
+          item,
+          `Supplier delivery reliability for ${itemLabel} is a bit shaky (${round3(Number(item.reliability) * 100)}%). Are you okay waiting on it, or would you rather swap or drop it?`
+        );
       }
 
       if (item.carbon != null && Number(item.carbon) >= 10) {
-        carbonPts = Math.max(carbonPts, Math.min(40, Number(item.carbon) * 1.5));
+        const carbPts = round3(Math.min(40, Number(item.carbon) * 1.5));
+        carbonPts = Math.max(carbonPts, carbPts);
+        addQuestion(
+          'highCarbon',
+          carbPts,
+          item,
+          `${itemLabel} has a fairly high carbon footprint (${round3(item.carbon)} kg CO₂/kg). Are you okay keeping it, or would you prefer another option?`
+        );
       }
     }
 
@@ -89,11 +248,30 @@ export class SuspicionScorer {
       reasons.push(`High carbon footprint (+${pts})`);
     }
 
+    const topCostItem = [...items].sort(
+      (a, b) => Number(b.lineTotal ?? Number(b.quantity || 0) * Number(b.price || 0)) - Number(a.lineTotal ?? Number(a.quantity || 0) * Number(a.price || 0))
+    )[0];
+
     const spendCap = Number(order.buyerHistory?.spendCap) || 200;
     if (total > spendCap) {
       const pts = round3(35 + 100 * ((total - spendCap) / spendCap));
       points += pts;
       reasons.push(`Order total €${total.toFixed(2)} exceeds €${spendCap.toFixed(2)} baseline (+${pts})`);
+      let suggestedSpendQty = topCostItem?.quantity;
+      if (topCostItem && Number(topCostItem.price) > 0) {
+        const lot = Number(topCostItem.lot) > 0 ? Number(topCostItem.lot) : 1;
+        const otherCost = Math.max(0, total - Number(topCostItem.lineTotal ?? topCostItem.quantity * topCostItem.price));
+        const budgetForTop = Math.max(lot * Number(topCostItem.price), spendCap - otherCost);
+        const rawTarget = Math.floor(budgetForTop / Number(topCostItem.price) / lot) * lot;
+        suggestedSpendQty = round3(Math.max(lot, Math.min(Number(topCostItem.quantity), rawTarget || lot)));
+      }
+      addQuestion(
+        'highSpend',
+        pts,
+        topCostItem,
+        `This order comes out to €${total.toFixed(2)}, which is above your €${spendCap.toFixed(2)} spending baseline${topCostItem ? ` (mainly ${round3(topCostItem.quantity)} ${topCostItem.unit || 'units'} of ${topCostItem.name || topCostItem.productId} at €${Number(topCostItem.lineTotal ?? topCostItem.quantity * topCostItem.price).toFixed(2)})` : ''}. Are you comfortable with that total, or want to trim the amount / swap items?`,
+        { suggestedQty: suggestedSpendQty }
+      );
     }
 
     const minOrderTotal = Number(order.buyerHistory?.minOrderTotal || 0);
@@ -101,6 +279,20 @@ export class SuspicionScorer {
       const pts = round3(20 + 15 * (minOrderTotal / Math.max(total, 0.01) - 2.5));
       points += pts;
       reasons.push(`Order total €${total.toFixed(2)} unusually small vs €${minOrderTotal.toFixed(2)} prior baseline (+${pts})`);
+      const targetItem = topCostItem || items[0];
+      let suggestedLowQty = targetItem?.quantity;
+      if (targetItem && Number(targetItem.price) > 0) {
+        const lot = Number(targetItem.lot) > 0 ? Number(targetItem.lot) : 1;
+        const needed = Math.ceil((minOrderTotal / Number(targetItem.price)) / lot) * lot;
+        suggestedLowQty = round3(Math.max(Number(targetItem.quantity) + lot, needed));
+      }
+      addQuestion(
+        'lowSpend',
+        pts,
+        targetItem,
+        `Just checking — at €${total.toFixed(2)}, this order is much smaller than your usual €${minOrderTotal.toFixed(2)}+ orders. Still want to send it through as-is, or add a bit more?`,
+        { suggestedQty: suggestedLowQty, allowSubstitution: false }
+      );
     }
 
     if (points === 0) {
@@ -110,7 +302,8 @@ export class SuspicionScorer {
 
     return {
       score: round3(points),
-      reason: reasons.join(' · ')
+      reason: reasons.join(' · '),
+      questions
     };
   }
 }

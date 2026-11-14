@@ -62,4 +62,14 @@ test('risk scoring diagnostics', async t => {
     assert.ok(result.element_scores.find(e=>e.product_id==='sku-2').score<30);
     assert.equal(result.decision,'REQUIRES_INTERVENTION');
   });
+
+  await t.test('same-day ISO timestamp availableDate does not trigger deliveryDelay and acceptedDeliveryDelay clears question', () => {
+    const sameDay = scoreOrder([{ ...baseItem, availableDate: '2026-11-16T08:00:00Z', requestedDate: '2026-11-16' }], { policy, history: [] });
+    assert.equal(sameDay.penalties.deliveryDelay, 0);
+    assert.ok(!sameDay.questions.some(q => q.rule === 'deliveryDelay'));
+
+    const accepted = scoreOrder([{ ...baseItem, availableDate: '2026-11-18', requestedDate: '2026-11-16', acceptedDeliveryDelay: true }], { policy, history: [] });
+    assert.equal(accepted.penalties.deliveryDelay, 0);
+    assert.ok(!accepted.questions.some(q => q.rule === 'deliveryDelay'));
+  });
 });

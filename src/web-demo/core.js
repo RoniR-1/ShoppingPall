@@ -14,7 +14,8 @@ const clients={
 const client={get mock(){return sourceName()==='demo'||useMockValio();},price:r=>clients[sourceName()].price(r),availability:r=>clients[sourceName()].availability(r)};
 app.use(express.json({limit:'1mb'}));
 app.use((req,res,next)=>req.get('X-API-Key')===(process.env.CORE_API_KEY||'local-demo-key')?next():res.status(401).json({detail:'Invalid API key'}));
-const portalSchema=`CREATE TABLE IF NOT EXISTS portal_orders(id uuid PRIMARY KEY,user_id text NOT NULL, body jsonb NOT NULL); CREATE TABLE IF NOT EXISTS portal_purchases(id uuid PRIMARY KEY)`;
+const defaultThreshold=()=>round3(Number(process.env.SUSPICION_THRESHOLD??25));
+const portalSchema=`CREATE TABLE IF NOT EXISTS portal_orders(id uuid PRIMARY KEY,user_id text NOT NULL, body jsonb NOT NULL); CREATE TABLE IF NOT EXISTS portal_purchases(id uuid PRIMARY KEY); CREATE TABLE IF NOT EXISTS portal_buyers(user_id text PRIMARY KEY, threshold double precision NOT NULL DEFAULT 25, created_at timestamptz NOT NULL DEFAULT now())`;
 app.use((req,res,next)=>{const source=req.get('X-Data-Source')||'real';if(!['demo','real'].includes(source))return res.status(422).json({error:'Invalid database source'});sourceContext.run(source,next);});
 const demo=new DemoStore();
 app.use((req,res,next)=>{
@@ -22,11 +23,14 @@ app.use((req,res,next)=>{
  try{
   const path=req.path;
   if(req.method==='GET'&&path==='/internal/source')return res.json({source:'demo',realConfigured:Boolean(databaseUrls.real),storage:'memory'});
+  if(req.method==='GET'&&path==='/internal/buyers')return res.json({buyers:demo.listBuyers(defaultThreshold())});
+  if(req.method==='GET'&&path==='/internal/buyer-config')return res.json(demo.getBuyer(req.query.user_id||'demo-buyer',defaultThreshold()));
+  if(req.method==='POST'&&path==='/internal/buyers')return res.json(demo.upsertBuyer(req.body?.user_id,req.body?.threshold??defaultThreshold(),{createOnly:Boolean(req.body?.createOnly)}));
   if(req.method==='GET'&&path==='/internal/buyer-profile'){const approved=demo.list(req.query.user_id).filter(o=>o.status==='APPROVED');const totals=approved.map(o=>Number(o.total||0)).filter(n=>n>0);const maxOrderTotal=round3(totals.length?Math.max(...totals):0);const minOrderTotal=round3(totals.length?Math.min(...totals):0);return res.json({maxOrderTotal,minOrderTotal,spendCap:round3(Math.max(200,maxOrderTotal*1.5))});}
   if(req.method==='GET'&&path==='/internal/catalog-overview')return res.json(demo.overview());
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
   if(req.method==='POST'&&path==='/internal/suggestions')return res.json(closestProducts(req.body.q,demo.products));
-  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id));
+  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id||'demo-buyer'));
   if(req.method==='POST'&&path==='/internal/setup'){demo.reset(req.body.stock);return res.json({ok:true,stock:req.body.stock});}
   if(req.method==='POST'&&path==='/internal/save')return res.json(demo.save(req.body));
   if(req.method==='POST'&&path==='/internal/decision')return res.json(demo.decide(req.body));
@@ -56,34 +60,26 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
   const rows=(await pool.query(`
     WITH history AS (
       SELECT product_id,
-        SUM(bought_count)::int AS bought_count,
-        SUM(human_approved_count)::int AS human_approved_count,
-        COALESCE(MAX(prior_max_qty), 0)::double precision AS prior_max_qty,
-        COALESCE(MIN(prior_min_qty), 0)::double precision AS prior_min_qty,
-        COALESCE(AVG(prior_avg_qty), 0)::double precision AS prior_avg_qty
+        COUNT(*)::int AS bought_count,
+        COUNT(*) FILTER (WHERE is_human_approved)::int AS human_approved_count,
+        COALESCE(MAX(qty), 0)::double precision AS prior_max_qty,
+        COALESCE(MIN(qty), 0)::double precision AS prior_min_qty,
+        COALESCE(AVG(qty), 0)::double precision AS prior_avg_qty
       FROM (
         SELECT item->>'productId' AS product_id,
-          COUNT(*)::int AS bought_count,
-          COUNT(*) FILTER (
-            WHERE o.flag_reason IS NOT NULL
-              OR EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.status = 'PENDING_APPROVAL')
-          )::int AS human_approved_count,
-          MAX((item->>'quantity')::numeric) AS prior_max_qty,
-          MIN((item->>'quantity')::numeric) AS prior_min_qty,
-          AVG((item->>'quantity')::numeric) AS prior_avg_qty
+          (item->>'quantity')::numeric AS qty,
+          (
+            o.flag_reason IS NOT NULL
+            OR EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.status = 'PENDING_APPROVAL')
+          ) AS is_human_approved
         FROM orders o, jsonb_array_elements(o.items) item
         WHERE o.user_id = $1 AND o.status = 'APPROVED'
-        GROUP BY item->>'productId'
         UNION ALL
         SELECT item->>'productId' AS product_id,
-          COUNT(*)::int AS bought_count,
-          COUNT(*) FILTER (WHERE COALESCE((po.body->>'human_approved')::boolean, false))::int AS human_approved_count,
-          MAX((item->>'quantity')::numeric) AS prior_max_qty,
-          MIN((item->>'quantity')::numeric) AS prior_min_qty,
-          AVG((item->>'quantity')::numeric) AS prior_avg_qty
+          (item->>'quantity')::numeric AS qty,
+          COALESCE((po.body->>'human_approved')::boolean, false) AS is_human_approved
         FROM portal_orders po, jsonb_array_elements(COALESCE(po.body->'items','[]'::jsonb)) item
         WHERE po.user_id = $1 AND po.body->>'status' = 'APPROVED'
-        GROUP BY item->>'productId'
       ) combined
       GROUP BY product_id
     ),
@@ -141,6 +137,47 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
     quantity:r.stock_quantity==null?null:round3(r.stock_quantity)
   }));
 }
+async function seedPgBuyers(){
+  await pool.query(portalSchema);
+  const def=defaultThreshold();
+  await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES('demo-buyer',$1::double precision) ON CONFLICT(user_id) DO NOTHING`,[def]);
+  await pool.query(`INSERT INTO portal_buyers(user_id,threshold) SELECT DISTINCT user_id,$1::double precision FROM portal_orders WHERE NULLIF(BTRIM(user_id),'') IS NOT NULL ON CONFLICT(user_id) DO NOTHING`,[def]);
+}
+function normBuyerId(v){
+  const id=String(v||'').trim();
+  if(!id)throw Error('Buyer ID required');
+  return id;
+}
+function normBuyerThreshold(v){
+  const n=Number(v);
+  if(!Number.isFinite(n)||n<0)throw Error('Invalid threshold');
+  return round3(n);
+}
+app.get('/internal/buyers',async(_req,res)=>{
+  await seedPgBuyers();
+  const rows=(await pool.query(`SELECT user_id,threshold FROM portal_buyers ORDER BY created_at ASC, user_id ASC`)).rows;
+  res.json({buyers:rows.map(r=>({user_id:r.user_id,threshold:round3(r.threshold)}))});
+});
+app.get('/internal/buyer-config',async(req,res)=>{
+  await seedPgBuyers();
+  const id=normBuyerId(req.query.user_id||'demo-buyer');
+  const def=defaultThreshold();
+  const row=(await pool.query(`SELECT user_id,threshold FROM portal_buyers WHERE user_id=$1`,[id])).rows[0];
+  res.json({user_id:id,threshold:round3(row?row.threshold:def)});
+});
+app.post('/internal/buyers',async(req,res)=>{
+  await seedPgBuyers();
+  const id=normBuyerId(req.body?.user_id);
+  const t=normBuyerThreshold(req.body?.threshold??defaultThreshold());
+  const createOnly=Boolean(req.body?.createOnly);
+  if(createOnly){
+    const r=await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES($1,$2::double precision) ON CONFLICT(user_id) DO NOTHING RETURNING user_id,threshold`,[id,t]);
+    if(!r.rowCount)throw Error(`Buyer "${id}" already exists`);
+    return res.json({user_id:r.rows[0].user_id,threshold:round3(r.rows[0].threshold)});
+  }
+  const r=await pool.query(`INSERT INTO portal_buyers(user_id,threshold) VALUES($1,$2::double precision) ON CONFLICT(user_id) DO UPDATE SET threshold=EXCLUDED.threshold RETURNING user_id,threshold`,[id,t]);
+  res.json({user_id:r.rows[0].user_id,threshold:round3(r.rows[0].threshold)});
+});
 app.get('/internal/buyer-profile',async(req,res)=>{
   await pool.query(portalSchema);
   const user=String(req.query.user_id||'demo-buyer');
@@ -186,13 +223,14 @@ app.get('/internal/orders',async(req,res)=>{
 });
 app.post('/internal/decision',async(req,res)=>res.json(await transaction(async db=>{
  await db.query(portalSchema);
- const {id,user_id,action,human=false}=req.body;
+ const {id,user_id,action,human=false}=req.body||{};
+ if(!['approve','reject'].includes(action)) throw Error('Invalid action');
  const row=(await db.query('SELECT body FROM portal_orders WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,user_id])).rows[0];
  if(!row) throw Error('Order not found'); const o=row.body;
  if(o.status!=='PENDING_APPROVAL') return o;
  if(action==='reject') o.status='REJECTED';
  else {
-  if(o.incomplete) throw Error('Resolve substitutions or explicitly accept the available partial quantities first');
+  if(o.incomplete||!o.items?.length) throw Error('Resolve substitutions or explicitly accept the available partial quantities first');
   for(const item of [...o.items].sort((a,b)=>a.productId.localeCompare(b.productId))){
    const r=await db.query('UPDATE inventory SET quantity=quantity-$2 WHERE product_id=$1 AND quantity>=$2',[item.productId,item.quantity]);
    if(!r.rowCount&&client.mock) throw Error(`Insufficient stock for ${item.name||item.productId}`);

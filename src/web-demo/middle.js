@@ -4,8 +4,8 @@ import {AsyncLocalStorage} from 'node:async_hooks';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {route} from './policy.js';
-import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
+import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {rankCandidates} from '../agent.js';
 import {round3} from '../contracts.js';
 
@@ -18,7 +18,7 @@ app.use((req,res,next)=>{
   sourceContext.run(source,next);
 });
 
-let threshold=Number(process.env.SUSPICION_THRESHOLD??25);
+const defaultThreshold=()=>Math.round(Number(process.env.SUSPICION_THRESHOLD??25)*1000)/1000;
 
 async function core(path,body){
   const r=await fetch(`http://127.0.0.1:${process.env.BACKEND_PORT||4003}${path}`,{
@@ -31,7 +31,9 @@ async function core(path,body){
     body:body?JSON.stringify(body):undefined,
     signal:AbortSignal.timeout(120000)
   });
-  const data=await r.json();
+  const raw=await r.text();
+  let data;
+  try{data=JSON.parse(raw);}catch{data={error:raw.slice(0,300)||r.statusText};}
   if(!r.ok)throw Error(data.error||JSON.stringify(data.detail));
   return data;
 }
@@ -53,7 +55,8 @@ const selectionSchema=z.object({
 
 async function callGeminiJSON(systemPrompt,userPrompt){
   const base=(process.env.LUNA_BASE_URL||'https://generativelanguage.googleapis.com/v1beta/openai/').trim().replace(/\/+$/,'');
-  const apiKey=process.env.LUNA_API_KEY||'';
+  const rawKey=(process.env.LUNA_API_KEY||'').trim();
+  const apiKey=rawKey.startsWith('Ab8RN6')?`AQ.${rawKey}`:rawKey;
   if(!apiKey)throw Error('Configure LUNA_API_KEY in .env to use the Gemini agent');
   const model=process.env.LUNA_MODEL||'gemini-2.5-flash';
   const r=await fetch(`${base}/chat/completions`,{
@@ -85,7 +88,7 @@ async function callGeminiJSON(systemPrompt,userPrompt){
 
 async function parseRequestLines(text){
   const trimmed=String(text||'').trim();
-  if(!trimmed)throw Error('Enter what you would like to order.');
+  if(!trimmed)throw Error('Try specifying products and quantities, or describe what you want to order.');
   if(!process.env.LUNA_API_KEY){
     return planLinesSchema.parse(directLines(trimmed).map(l=>({...l,requested:`${l.quantity} ${l.query}`})));
   }
@@ -93,13 +96,22 @@ async function parseRequestLines(text){
     `You extract B2B food catalog search lines from a buyer's request.
 Return ONLY valid JSON:
 {"lines":[{"requested":"original item phrase with amount (e.g. 2kg apples)","query":"singular English catalog search keyword (e.g. apple)","alternatives":["plural or synonym","Finnish translation (e.g. omena)"],"quantity":2}]}
+If the input does NOT mention any food, drink, product, ingredient, or dish to order (for example a greeting like "hi" or unrelated text), return:
+{"lines":[],"error":"Try specifying products and quantities, or describe the dish or items you want to order."}
 Rules:
 1. Only include items explicitly mentioned or strictly required by a named dish/recipe. If the buyer asks for a single item (like "2kg apples" or "12 apples"), return ONLY that 1 item—never invent extra ingredients!
 2. "query" and "alternatives" must contain ONLY product/ingredient names, with NO numbers or units.
 3. For simple item counts without weight (e.g. "12 apples" -> ~2 kg), keep "requested" exact ("12 apples") and set "quantity" to a sensible numeric estimate.`,
     trimmed
   );
-  return planLinesSchema.parse(parsed.lines);
+  if(!Array.isArray(parsed?.lines)||parsed.lines.length===0){
+    throw Error(parsed?.error||'Try specifying products and quantities, or describe the dish or items you want to order.');
+  }
+  const checked=planLinesSchema.safeParse(parsed.lines);
+  if(!checked.success){
+    throw Error(parsed?.error||'Could not understand the order items. Try specifying products and quantities.');
+  }
+  return checked.data;
 }
 
 function snapToLot(qty,lot){
@@ -108,7 +120,8 @@ function snapToLot(qty,lot){
   return round3(steps*validLot);
 }
 
-async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,actionId=null){
+async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={},actionId=null){
+  if(typeof pinned==='string'){actionId=pinned;pinned={};}
   const o={
     id:actionId||randomUUID(),
     context,
@@ -138,9 +151,14 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       if(candidates.length)break;
     }
     let suggested=false;
+    const chosenId=approved[index]||pinned[index];
     if(!candidates.length){
       suggested=true;
       candidates=await core('/internal/suggestions',{q:line.query});
+    }else if(candidates.length<4&&!chosenId){
+      const extra=await core('/internal/suggestions',{q:line.query});
+      const seen=new Set(candidates.map(c=>c.id));
+      for(const s of extra)if(!seen.has(s.id)){candidates.push(s);seen.add(s.id);if(candidates.length>=8)break;}
     }
     if(demo_unavailable&&index===0){
       suggested=true;
@@ -148,9 +166,13 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       candidates=broad?await core('/internal/search',{q:broad,user_id:user}):[];
       candidates=candidates.filter(p=>/\bchocolate\b/i.test(p.name)&&!/\b(sauce|powder|drink|ice cream|biscuit|cookie|cake|cereal|spread)\b/i.test(p.name));
     }
-    if(approved[index]){
-      if(!candidates.some(p=>p.id===approved[index]))throw Error('Invalid substitution');
-      candidates=candidates.filter(p=>p.id===approved[index]);
+    if(chosenId){
+      if(!candidates.some(p=>p.id===chosenId)){
+        const byId=await core('/internal/search',{q:String(chosenId),user_id:user});
+        for(const p of byId)if(!candidates.some(c=>c.id===p.id))candidates.push(p);
+      }
+      if(!candidates.some(p=>p.id===chosenId))throw Error('Invalid substitution');
+      candidates=[candidates.find(p=>p.id===chosenId),...candidates.filter(p=>p.id!==chosenId)];
       suggested=false;
     }
     if(!candidates.length){
@@ -163,8 +185,12 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     const enriched=candidates.map(p=>{
       const price=prices.products.find(x=>x.productId===p.id);
       const a=stock.products.find(x=>x.productId===p.id);
-      const s=a?.scheduleLines?.[0];
-      const available=a&&!a.salesBlock&&a.logisticModel==='Stock'&&s&&(s.salesUnit==='MOCK'||s.salesUnit===p.sales_unit)&&!s.salesBlock&&s.availableDate.slice(0,10)<=date&&(!a.closingTime||Date.parse(a.closingTime)>Date.now())?round3(s.availableAmount):0;
+      const eligibleLines=(Array.isArray(a?.scheduleLines)?a.scheduleLines:[]).filter(
+        l=>!l.salesBlock&&(l.salesUnit==='MOCK'||l.salesUnit===p.sales_unit)&&typeof l.availableDate==='string'&&l.availableDate.slice(0,10)<=date&&Number(l.availableAmount)>0
+      );
+      const s=eligibleLines[0]||a?.scheduleLines?.[0];
+      const cutoffOk=!a?.closingTime||(Number.isFinite(Date.parse(a.closingTime))&&Date.parse(a.closingTime)>Date.now());
+      const available=a&&!a.salesBlock&&a.logisticModel==='Stock'&&eligibleLines.length>0&&cutoffOk?round3(s.availableAmount):0;
       const unitPrice=price?.error?null:round3(price?.priceWithTax?.value??price?.catalogPrice?.valueWithTax);
       return {
         ...p,
@@ -175,7 +201,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
         available,
         in_stock:available>0,
         available_amount:available,
-        available_date:s?.availableDate?.slice(0,10)||date,
+        available_date:typeof s?.availableDate==='string'?s.availableDate.slice(0,10):date,
         price:unitPrice,
         unit_price:unitPrice,
         carbon:round3(p.carbon_kg_co2_per_kg),
@@ -187,26 +213,32 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
   }
 
   let aiSelections=new Map();
-  const selectableLines=lineOptions.filter( entry=>!entry.suggested&&entry.options.length>0&&!approved[entry.index]);
+  const selectableLines=lineOptions.filter(entry=>!entry.suggested&&entry.options.length>0&&!entry.line.manualQuantity);
   if(process.env.LUNA_API_KEY&&selectableLines.length>0&&sourceContext.getStore()==='real'){
     try{
-      const promptData=selectableLines.map(entry=>({
-        lineIndex:entry.index,
-        requested:entry.line.requested||`${entry.line.quantity} ${entry.line.query}`,
-        requestedQuantity:entry.line.quantity,
-        candidates:entry.options.slice(0,8).map(c=>({
-          productId:c.productId,
-          name:c.name,
-          sales_unit:c.unit,
-          allowed_lot_size:c.lot,
-          units:c.units,
-          unit_price:c.price,
-          available:c.available,
-          allergen_safe:c.allergen_safe,
-          human_approved_count:c.human_approved_count||0,
-          bought_count:c.bought_count||0
-        }))
-      }));
+      const promptData=selectableLines.map(entry=>{
+        const forcedId=approved[entry.index]||pinned[entry.index];
+        const candidatePool=forcedId&&entry.options.some(c=>c.productId===forcedId)
+          ?[entry.options.find(c=>c.productId===forcedId)]
+          :entry.options.slice(0,8);
+        return {
+          lineIndex:entry.index,
+          requested:entry.line.requested||`${entry.line.quantity} ${entry.line.query}`,
+          requestedQuantity:entry.line.quantity,
+          candidates:candidatePool.map(c=>({
+            productId:c.productId,
+            name:c.name,
+            sales_unit:c.unit,
+            allowed_lot_size:c.lot,
+            units:c.units,
+            unit_price:c.price,
+            available:c.available,
+            allergen_safe:c.allergen_safe,
+            human_approved_count:c.human_approved_count||0,
+            bought_count:c.bought_count||0
+          }))
+        };
+      });
       const picked=selectionSchema.parse(await callGeminiJSON(
         `Select the single best catalog product and exact quantity in SALES UNITS for each requested line.
 Return ONLY valid JSON:
@@ -231,9 +263,12 @@ Rules:
       continue;
     }
     const aiPick=aiSelections.get(index);
-    const orderedOptions=aiPick&&options.some(p=>p.productId===aiPick.productId)
-      ?[options.find(p=>p.productId===aiPick.productId),...options.filter(p=>p.productId!==aiPick.productId)]
-      :options;
+    const forcedId=approved[index]||pinned[index];
+    const orderedOptions=forcedId&&options.some(p=>p.productId===forcedId)
+      ?[options.find(p=>p.productId===forcedId),...options.filter(p=>p.productId!==forcedId)]
+      :(aiPick&&options.some(p=>p.productId===aiPick.productId)
+        ?[options.find(p=>p.productId===aiPick.productId),...options.filter(p=>p.productId!==aiPick.productId)]
+        :options);
     const targetQty=aiPick&&orderedOptions[0]?.productId===aiPick.productId
       ?snapToLot(aiPick.quantity,orderedOptions[0].lot)
       :snapToLot(line.quantity,orderedOptions[0].lot);
@@ -243,10 +278,12 @@ Rules:
       for(const p of orderedOptions){
         if(p.price==null)continue;
         const availLeft=Math.max(0,p.available-(used.get(p.productId)||0));
-        const alloc=Math.floor((Math.min(remaining,availLeft)+1e-9)/p.lot)*p.lot;
+        const desired=p.productId===orderedOptions[0]?.productId?remaining:snapToLot(remaining,p.lot);
+        const alloc=Math.floor((Math.min(desired,availLeft)+1e-9)/p.lot)*p.lot;
         const quantity=round3(alloc);
         if(quantity<=0)continue;
         o.items.push({
+          lineIndex:index,
           productId:p.productId,
           name:p.name,
           unit:p.unit,
@@ -266,7 +303,21 @@ Rules:
           prior_avg_qty:round3(p.prior_avg_qty||0),
           allergen_safe:p.allergen_safe!==false,
           requested:line.requested||`${line.quantity} × ${line.query}`,
-          substitution:Boolean(approved[index])
+          substitution:Boolean(approved[index]),
+          userSelected:Boolean(pinned[index]),
+          alternatives:orderedOptions
+            .filter(opt=>opt.productId!==p.productId&&opt.price!=null&&opt.available>0)
+            .slice(0,8)
+            .map(opt=>({
+              productId:opt.productId,
+              name:opt.name,
+              unit:opt.unit,
+              lot:opt.lot,
+              price:opt.price,
+              available:opt.available,
+              carbon:opt.carbon,
+              reliability:opt.reliability
+            }))
         });
         used.set(p.productId,round3((used.get(p.productId)||0)+quantity));
         remaining=round3(Math.max(0,remaining-quantity));
@@ -285,11 +336,13 @@ Rules:
     }
   }
 
-  enforcePriceCap(o.items,context);
   o.total=round3(o.items.reduce((sum,i)=>sum+(i.lineTotal??i.quantity*i.price),0));
   o.incomplete=o.issues.length>0;
+  if(context)enforcePriceCap(o.items,context);
   o.steps.push('Ranked catalog matches, prices & stock');
   const buyerHistory=await core('/internal/buyer-profile?user_id='+encodeURIComponent(user));
+  const buyerCfg=await core('/internal/buyer-config?user_id='+encodeURIComponent(user));
+  const threshold=round3(buyerCfg.threshold);
   Object.assign(o,route({...o,buyerHistory},undefined,threshold));
   o.score=round3(o.score);
   o.steps.push(`Risk score: ${o.score} / ${threshold} (${o.reason})`);
@@ -302,17 +355,72 @@ Rules:
   return core('/internal/save',o);
 }
 
+const managedAgent=new ManagedAgent({
+  file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',
+  submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,{},id)),
+  listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user)))
+});
+const managedReady=managedAgent.load().catch(()=>{});
+async function managedStatePayload(user){
+  await managedReady;
+  const s=managedAgent.state(user);
+  const orders=await core('/internal/orders?user_id='+encodeURIComponent(user));
+  return {...structuredClone(s),preview:managedAgent.preview(user),orders,simulated:true};
+}
+
+app.use('/portal/managed-agent',(req,res,next)=>{
+  if(sourceContext.getStore()!=='demo')return res.status(422).json({error:'Managed agent currently supports simulated Demo warehouse only'});
+  next();
+});
+app.get('/portal/managed-agent',async(req,res)=>{
+  const user=z.string().trim().min(1).max(100).default('demo-buyer').parse(req.query.user_id);
+  await managedReady;
+  res.json(await managedStatePayload(user));
+});
+app.post('/portal/managed-agent',async(req,res)=>{
+  const b=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),action:z.string().min(1)}).passthrough().parse(req.body||{});
+  await managedReady;
+  if(b.action==='check')await managedAgent.tick(b.user_id);
+  else await managedAgent.command(b.user_id,b);
+  res.json(await managedStatePayload(b.user_id));
+});
+app.post('/portal/managed-agent/chat',async(req,res)=>{
+  const b=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),text:z.string().min(1).max(2000)}).parse(req.body||{});
+  await managedReady;
+  res.json(managedAgent.chat(b.user_id,b.text));
+});
+setInterval(()=>{for(const user of Object.keys(managedAgent.states))managedAgent.tick(user).catch(()=>{});},30000).unref();
+
 app.get('/portal/catalog-overview',async(req,res)=>{
   const q=encodeURIComponent(String(req.query.q||''));
   const u=encodeURIComponent(String(req.query.user_id||'demo-buyer'));
   res.json(await core(`/internal/catalog-overview?user_id=${u}&q=${q}`));
 });
-app.get('/portal/config',async(_,res)=>res.json({threshold,model:process.env.LUNA_MODEL||'gemini-2.5-flash',...await core('/internal/source')}));
+app.get('/portal/buyers',async(_req,res)=>res.json(await core('/internal/buyers')));
+app.post('/portal/buyers',async(req,res)=>{
+  const b=z.object({
+    user_id:z.string().trim().min(1).max(100),
+    threshold:z.number().min(0).default(defaultThreshold())
+  }).parse(req.body);
+  res.json(await core('/internal/buyers',{user_id:b.user_id,threshold:round3(b.threshold),createOnly:true}));
+});
+app.get('/portal/config',async(req,res)=>{
+  const user=String(req.query.user_id||'demo-buyer').trim()||'demo-buyer';
+  const [cfg,src]=await Promise.all([
+    core('/internal/buyer-config?user_id='+encodeURIComponent(user)),
+    core('/internal/source')
+  ]);
+  res.json({user_id:cfg.user_id,threshold:round3(cfg.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash',...src});
+});
 app.post('/portal/config',async(req,res)=>{
-  const b=z.object({threshold:z.number().min(0),stock:z.enum(['normal','low']).optional()}).parse(req.body);
+  const b=z.object({
+    user_id:z.string().trim().min(1).max(100).default('demo-buyer'),
+    threshold:z.number().min(0),
+    stock:z.enum(['normal','low']).optional()
+  }).parse(req.body);
   if(b.stock)await core('/internal/setup',{stock:b.stock});
-  threshold=round3(b.threshold);
-  res.json({threshold,model:process.env.LUNA_MODEL||'gemini-2.5-flash'});
+  const saved=await core('/internal/buyers',{user_id:b.user_id,threshold:round3(b.threshold)});
+  res.json({user_id:saved.user_id,threshold:round3(saved.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash'});
 });
 app.get('/portal/orders',async(req,res)=>res.json(await core('/internal/orders?user_id='+encodeURIComponent(z.string().min(1).parse(req.query.user_id)))));
 app.post('/portal/requests',async(req,res)=>{
@@ -326,17 +434,61 @@ app.post('/portal/requests',async(req,res)=>{
   res.json(await plan(lines,b.user_id,b.force_flag,{},b.demo_unavailable));
 });
 app.post('/portal/orders/:id/:action',async(req,res)=>{
-  const {user_id,choices={},acceptPartial=false}=req.body;
+  const {user_id,choices,quantities,removeLines,acceptPartial}=z.object({
+    user_id:z.string().trim().min(1).max(100),
+    choices:z.record(z.string(),z.string().min(1)).default({}),
+    quantities:z.record(z.string(),z.number().positive().max(100000)).default({}),
+    removeLines:z.array(z.number().int().min(0)).default([]),
+    acceptPartial:z.boolean().default(false)
+  }).parse(req.body||{});
   const orders=await core('/internal/orders?user_id='+encodeURIComponent(user_id));
   const o=orders.find(o=>o.id===req.params.id);
   if(!o)throw Error('Order not found');
-  if(!['approve','reject'].includes(req.params.action))throw Error('Invalid action');
-  if(req.params.action==='approve'&&o.incomplete){
-    if(Object.keys(choices).length){
-      const replacement=await plan(o.lines,user_id,true,{...o.approved,...choices},o.demo_unavailable,o.context);
-      await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
-      return res.json(replacement);
+  if(!['approve','reject','substitute'].includes(req.params.action))throw Error('Invalid action');
+  if(o.status!=='PENDING_APPROVAL')throw Error('Order has already been decided');
+
+  const hasLineEdits=Object.keys(choices).length>0||Object.keys(quantities).length>0||removeLines.length>0;
+  if((req.params.action==='approve'||req.params.action==='substitute')&&hasLineEdits){
+    const removeSet=new Set(removeLines);
+    const nextLines=[];
+    const nextApproved={};
+    const nextPinned={};
+    (o.lines||[]).forEach((line,oldIdx)=>{
+      if(removeSet.has(oldIdx))return;
+      const newIdx=nextLines.length;
+      const updatedLine={...line};
+      if(quantities[oldIdx]!==undefined){
+        const newQty=round3(quantities[oldIdx]);
+        updatedLine.quantity=newQty;
+        updatedLine.manualQuantity=true;
+        updatedLine.requested=`${newQty} × ${line.query}`;
+      }
+      const existingItem=(o.items||[]).find(i=>i.lineIndex===oldIdx);
+      if(choices[oldIdx]){
+        // Buyer manually selected this product from the review UI; pin it without re-flagging it as an unexpected swap.
+        nextPinned[newIdx]=choices[oldIdx];
+      }else if(o.approved?.[oldIdx]){
+        nextApproved[newIdx]=o.approved[oldIdx];
+      }else if(existingItem?.productId){
+        nextPinned[newIdx]=existingItem.productId;
+      }
+      nextLines.push(updatedLine);
+    });
+
+    if(!nextLines.length){
+      return res.json(await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true}));
     }
+
+    const keepForceFlag=req.params.action==='substitute'?Boolean(o.force_flag):false;
+    const replacement=await plan(nextLines,user_id,keepForceFlag,nextApproved,o.demo_unavailable,o.context||null,nextPinned);
+    await core('/internal/decision',{id:o.id,user_id,action:'reject',human:true});
+    const safeToAutoFinalize=req.params.action==='approve'&&!replacement.incomplete&&replacement.items.every(i=>i.allergen_safe!==false);
+    if(safeToAutoFinalize&&replacement.status!=='APPROVED'){
+      return res.json(await core('/internal/decision',{id:replacement.id,user_id,action:'approve',human:true}));
+    }
+    return res.json(replacement);
+  }
+  if(req.params.action==='approve'&&o.incomplete){
     if(!acceptPartial||!o.items.length)throw Error('Select substitutions or accept the available partial order');
     o.incomplete=false;
     o.steps.push('Human accepted partial quantities');
@@ -344,13 +496,8 @@ app.post('/portal/orders/:id/:action',async(req,res)=>{
   }
   res.json(await core('/internal/decision',{id:o.id,user_id,action:req.params.action,human:true}));
 });
-const managed=new ManagedAgent({listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user))),file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,id))});
-await managed.load();
-app.use('/portal/managed-agent',(req,res,next)=>{if(sourceContext.getStore()!=='demo')return res.status(422).json({error:'Managed agent currently supports simulated Demo warehouse only'});next();});
-const managedUser=req=>z.string().min(1).max(100).parse(req.query.user_id||req.body?.user_id);
-app.get('/portal/managed-agent',async(req,res)=>{const user=managedUser(req);res.json({...managed.state(user),preview:managed.preview(user),orders:await core('/internal/orders?user_id='+encodeURIComponent(user)),simulated:true});});
-app.post('/portal/managed-agent',async(req,res)=>{const user=managedUser(req);if(req.body.action==='check'){await managed.tick(user);return res.json(managed.state(user));}res.json(await managed.command(user,req.body));});
-app.post('/portal/managed-agent/chat',(req,res)=>{res.json(managed.chat(managedUser(req),z.string().min(1).max(500).parse(req.body.text)));});
-setInterval(()=>{for(const user of Object.keys(managed.states))managed.tick(user).catch(e=>console.error('Managed check failed:',e.message));},30000).unref();
-app.use((e,_req,res,_next)=>res.status(422).json({error:e.message}));
+app.use((e,_req,res,_next)=>{
+  const msg=e instanceof z.ZodError?e.issues.map(i=>i.message).join('; '):e.message;
+  res.status(422).json({error:msg||'Request failed'});
+});
 app.listen(Number(process.env.MIDDLE_LAYER_PORT||4002),'127.0.0.1',()=>console.log('Middle :'+(process.env.MIDDLE_LAYER_PORT||4002)));
