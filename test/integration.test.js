@@ -6,6 +6,8 @@ import { createApp } from '../src/app.js';
 import { pool } from '../src/db.js';
 import { ValioClient } from '../src/valio.js';
 import { recipeCart } from '../src/agent.js';
+import { createOrder } from '../src/orders.js';
+import { OrderScreeningService } from '../src/order-screening.js';
 test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
   const user = `test-${randomUUID()}`;
   let calls = 0;
@@ -40,6 +42,31 @@ test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
       assert.equal(quote.items[0].unit_price,2.5); assert.equal(quote.mocked,true);
     });
     const orderBody = (extra={}) => ({quote_id:quote.id,items:[{productId:'460000',quantity:1}],...extra});
+    await t.test('terminal, unknown and ambiguous-cutoff availability fail closed', async () => {
+      const originalAvailability = valio.availability.bind(valio);
+      try {
+        for (const changes of [{logisticModel:'Terminal'}, {logisticModel:'Unknown'}, {closingTime:'2099-01-01T12:00:00'}]) {
+          valio.availability = async input => {
+            const result = await originalAvailability(input);
+            Object.assign(result.products[0], changes);
+            return result;
+          };
+          const result = await api('/quotes', quoteBody());
+          assert.equal(result.status, 201);
+          assert.equal(result.body.items[0].orderable, false);
+          assert.equal((await api('/orders', {quote_id:result.body.id,items:[{productId:'460000',quantity:1}]})).status, 422);
+        }
+      } finally { valio.availability = originalAvailability; }
+    });
+    await t.test('failed or invalid custom screening leaves no order or quote lock', async () => {
+      const before = Number((await pool.query('SELECT count(*) AS n FROM orders WHERE user_id=$1', [user])).rows[0].n);
+      for (const score of [() => NaN, () => { throw new Error('scorer offline'); }]) {
+        const service = new OrderScreeningService({ scorer:{score} });
+        await assert.rejects(createOrder(user, randomUUID(), orderBody(), service), /Order screening failed/);
+      }
+      assert.equal(Number((await pool.query('SELECT count(*) AS n FROM orders WHERE user_id=$1', [user])).rows[0].n), before);
+      assert.equal((await pool.query('SELECT 1 FROM quote_locks WHERE quote_id=$1', [quote.id])).rowCount, 0);
+    });
     await t.test('risk policy is configurable and category blocks are enforced',async () => {
       const defaults=await api('/risk-policy');
       assert.equal(defaults.status,200); assert.equal(defaults.body.hard_spend_limit,1000);
@@ -150,6 +177,29 @@ test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
       await pool.query('UPDATE quotes SET items=$1 WHERE id=$2',[JSON.stringify(changed),quote.id]);
       assert.equal((await api('/orders',orderBody())).status,422);
       await pool.query('UPDATE quotes SET items=$1 WHERE id=$2',[JSON.stringify(quote.items),quote.id]);
+    });
+    await t.test('stock lost after quote rolls back every debit and approval change', async () => {
+      const other = await api('/catalog/search?product_id=460001');
+      const ids = ['460000', '460001'];
+      const originalStock = (await pool.query('SELECT product_id,quantity FROM inventory WHERE product_id=ANY($1)', [ids])).rows;
+      try {
+        await pool.query('UPDATE inventory SET quantity=100 WHERE product_id=ANY($1)', [ids]);
+        const q = await api('/quotes', { requestedDate:'2026-11-16', products:ids, selection_ids:[selection.selection_id, other.body.selection_id] });
+        const order = await api('/orders', { quote_id:q.body.id, items:ids.map(productId => ({productId,quantity:1})), force_flag:true });
+        assert.equal(order.status, 201);
+        await pool.query('UPDATE inventory SET quantity=0 WHERE product_id=$1', [ids[1]]);
+        const failed = await api(`/orders/${order.body.id}/approve`, {});
+        assert.equal(failed.status, 409);
+        assert.match(failed.body.error, /Insufficient local inventory/);
+        const stock = (await pool.query('SELECT product_id,quantity FROM inventory WHERE product_id=ANY($1) ORDER BY product_id', [ids])).rows;
+        assert.deepEqual(stock.map(row => Number(row.quantity)), [100, 0]);
+        assert.equal((await api(`/orders/${order.body.id}`)).body.status, 'PENDING_APPROVAL');
+        assert.equal((await pool.query('SELECT 1 FROM quote_locks WHERE order_id=$1', [order.body.id])).rowCount, 1);
+        assert.equal((await pool.query('SELECT 1 FROM order_events WHERE order_id=$1', [order.body.id])).rowCount, 1);
+        assert.equal((await api(`/orders/${order.body.id}/reject`, {})).status, 200);
+      } finally {
+        for (const row of originalStock) await pool.query('UPDATE inventory SET quantity=$1 WHERE product_id=$2', [row.quantity,row.product_id]);
+      }
     });
     await t.test('expired quotes cannot be approved, but can be rejected',async () => {
       const order=(await api('/orders',orderBody({force_flag:true}))).body;

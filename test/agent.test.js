@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recipeCart, ollamaJSON, rankCandidates } from '../src/agent.js';
+import { recipeCart, lunaJSON, rankCandidates } from '../src/agent.js';
 import { z } from 'zod';
 import { parseBudget, stripBudget, parseDeliveryDeadline, stripOrderConstraints, parseSustainability } from '../src/contracts.js';
 
@@ -21,29 +21,37 @@ test('recipe reuses planned synonyms without an extra model call', async () => {
   assert.ok(messages.some(message => message.includes('Selecting products and quantities completed')));
 });
 
-test('Ollama requests bounded structured output with thinking disabled', async () => {
+const lunaEnv = { LUNA_BASE_URL: 'https://luna.example/v1', LUNA_API_KEY: 'test-key', LUNA_MODEL: 'test-model' };
+const lunaReply = value => Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(value) } }] });
+
+test('Luna requests bounded JSON and includes the validation schema', async () => {
   const schema = z.object({ ok: z.boolean() });
-  const result = await ollamaJSON('test', schema, async (_url, options) => {
+  const result = await lunaJSON('test', schema, async (url, options) => {
     const body = JSON.parse(options.body);
-    assert.equal(body.think, false);
-    assert.equal(body.keep_alive, '15m');
-    assert.equal(body.options.num_predict, 1024);
-    assert.equal(body.format.properties.ok.type, 'boolean');
-    return new Response(JSON.stringify({ message: { content: '{"ok":true}' } }));
-  });
+    assert.equal(url, 'https://luna.example/v1/chat/completions');
+    assert.equal(options.headers.Authorization, 'Bearer test-key');
+    assert.equal(body.model, 'test-model');
+    assert.equal(body.max_tokens, 1024);
+    assert.deepEqual(body.response_format, { type: 'json_object' });
+    assert.match(body.messages[0].content, /"ok":\{"type":"boolean"/);
+    return lunaReply({ ok: true });
+  }, lunaEnv);
   assert.deepEqual(result, { ok: true });
 });
 
-test('Ollama timeouts identify the model and suggest a diagnostic', async () => {
-  await assert.rejects(ollamaJSON('test', z.object({}), async () => {
+test('Luna missing configuration and timeouts fail without a fallback', async () => {
+  let calls = 0;
+  await assert.rejects(lunaJSON('test', z.object({}), async () => { calls++; }, {}), /Configure LUNA_API_KEY and LUNA_BASE_URL/);
+  assert.equal(calls, 0);
+  await assert.rejects(lunaJSON('test', z.object({}), async () => {
     throw new DOMException('timed out', 'TimeoutError');
-  }), /Ollama model .* timed out after .*ollama ps/);
+  }, lunaEnv), /unavailable or timed out/);
 });
 
-test('Ollama output limit explains failure instead of parsing truncated JSON', async () => {
-  await assert.rejects(ollamaJSON('test', z.object({}), async () =>
-    new Response(JSON.stringify({ done_reason: 'length', message: { content: '{' } }))),
-  /1024-token output limit/);
+test('Luna rejects truncated output', async () => {
+  await assert.rejects(lunaJSON('test', z.object({}), async () =>
+    Response.json({ choices: [{ finish_reason: 'length', message: { content: '{' } }] }), lunaEnv),
+  /truncated/);
 });
 
 test('recipe retries an unmatched ingredient and uses only the successful selection', async () => {
@@ -155,10 +163,9 @@ test('invalid lot quantities are corrected without rounding silently', async () 
   assert.equal(replies.length, 0);
 });
 
-test('actual Ollama schema errors use the same readable validation message', async () => {
-  await assert.rejects(ollamaJSON('test', z.object({ items: z.array(z.object({ quantity: z.number().max(1000000) })) }),
-    async () => new Response(JSON.stringify({ message: { content: '{"items":[{"quantity":1000001}]}' } }))),
-  /Invalid quantities for 1 item/);
+test('Luna schema errors use the same readable validation message', async () => {
+  await assert.rejects(lunaJSON('test', z.object({ items: z.array(z.object({ quantity: z.number().max(1000000) })) }),
+    async () => lunaReply({items:[{quantity:1000001}]}), lunaEnv), /Invalid quantities for 1 item/);
 });
 
 test('invalid ingredient plans fail with a readable stage before searching', async () => {
@@ -403,4 +410,83 @@ test('recipeCart enriches and sorts candidates with live price and availability 
   const cheapIndex = prompts[1].indexOf('"cheap-fast"');
   const expensiveIndex = prompts[1].indexOf('"expensive"');
   assert.ok(cheapIndex > 0 && cheapIndex < expensiveIndex, 'Cheaper candidate should appear before expensive candidate');
+});
+test('catalog cannot enlarge the five-candidate window', async () => {
+  let calls=0;
+  await assert.rejects(recipeCart('soup', async () => ({selection_id:'selected',products:Array.from({length:6},(_,i)=>({id:String(i)}))}),
+    async () => {calls++; return {ingredients:[{query:'soup'}]};}), /Invalid catalog search response/);
+  assert.equal(calls,1);
+});
+test('empty Luna content returns an actionable error', async () => {
+  await assert.rejects(lunaJSON('test', z.object({}), async () => Response.json({choices:[{message:{content:''}}]}), lunaEnv), /empty or invalid content/);
+});
+test('Luna HTTP errors, refusal and malformed responses stop inference', async () => {
+  for (const [fetcher, pattern] of [
+    [async()=>new Response('bad request',{status:400}), /failed \(400\)/],
+    [async()=>new Response('unavailable',{status:503}), /failed \(503\)/],
+    [async()=>{throw new TypeError('fetch failed');}, /unavailable or timed out/],
+    [async()=>Response.json({choices:[{message:{content:'{"items":'}}]}), /invalid JSON/]
+  ]) await assert.rejects(lunaJSON('test',z.object({}),fetcher,lunaEnv),pattern);
+});
+for (const items of [
+  [{productId:'cream',quantity:0}], [{productId:'cream',quantity:-1}],
+  [{productId:'cream',quantity:1},{productId:'cream',quantity:1}],
+  [{productId:'invented',quantity:1}]
+]) test('invalid cart exhausts exactly one correction without quote or order: '+JSON.stringify(items), async () => {
+  let calls=0;
+  await assert.rejects(recipeCart('cream',async path => {
+    assert.ok(path.startsWith('/catalog/search?'));
+    return {selection_id:'s',products:[{id:'cream',allowed_lot_size:1}]};
+  }, async () => ++calls === 1 ? {ingredients:[{query:'cream'}]} : {items}), /one correction attempt.*No quote or order was requested/);
+  assert.equal(calls,3);
+});
+
+test('Luna malformed cart gets one correction and no quote is requested', async () => {
+  let calls = 0;
+  const model = (prompt, schema) => lunaJSON(prompt, schema, async () => {
+    calls++;
+    if (calls === 1) return lunaReply({ ingredients: [{ query: 'cream' }] });
+    if (calls === 2) return Response.json({ choices: [{ message: { content: '{invalid' } }] });
+    return lunaReply({ items: [{ productId: 'cream', quantity: 2 }] });
+  }, lunaEnv);
+  const cart = await recipeCart('cream', async path => {
+    assert.ok(path.startsWith('/catalog/search?'));
+    return { selection_id:'s', products:[{ id:'cream', allowed_lot_size:1 }] };
+  }, model);
+  assert.equal(calls, 3);
+  assert.deepEqual(cart.items, [{ productId:'cream', quantity:2 }]);
+});
+
+test('Luna rate limit stops recipe without correction or quoting', async () => {
+  let calls = 0;
+  const model = (prompt, schema) => lunaJSON(prompt, schema, async () => {
+    calls++;
+    if (calls === 1) return lunaReply({ ingredients: [{ query:'cream' }] });
+    return new Response('', { status:429 });
+  }, lunaEnv);
+  await assert.rejects(recipeCart('cream', async path => {
+    assert.ok(path.startsWith('/catalog/search?'));
+    return {selection_id:'s',products:[{id:'cream',allowed_lot_size:1}]};
+  }, model), error => error.status === 429 && error.code === 'AI_RATE_LIMITED');
+  assert.equal(calls, 2);
+});
+
+test('Luna response body timeout stops without cart correction or quoting', async () => {
+  let calls = 0;
+  const model = (prompt, schema) => lunaJSON(prompt, schema, async () => {
+    calls++;
+    if (calls === 1) return lunaReply({ ingredients: [{ query:'cream' }] });
+    return { ok:true, status:200, text:async () => { throw new DOMException('timed out', 'TimeoutError'); } };
+  }, lunaEnv);
+  await assert.rejects(recipeCart('cream', async path => {
+    assert.ok(path.startsWith('/catalog/search?'));
+    return {selection_id:'s',products:[{id:'cream',allowed_lot_size:1}]};
+  }, model), error => error.status === 502 && error.code === 'AI_UNAVAILABLE');
+  assert.equal(calls, 2);
+});
+
+test('Luna preserves 429 if its error body cannot be read', async () => {
+  await assert.rejects(lunaJSON('test', z.object({}), async () => ({
+    ok:false, status:429, text:async () => { throw new Error('body unavailable'); }
+  }), lunaEnv), error => error.status === 429 && error.code === 'AI_RATE_LIMITED');
 });

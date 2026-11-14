@@ -50,7 +50,9 @@ const line = {id:'one',quantity:5,salesUnit:'KG',required:{category:'food'},pref
 test('splits direct substitutions, tracks stock and idempotent replay',async () => {
   const {session,calls,catalog} = setup();
   console.log('Expected: fulfill 5 KG with 2 KG of a and 3 KG of b; a replay uses no stock, then the next line has a 5 KG shortfall.');
-  const result = await session.process(line);
+  const pending = await session.process(line);
+  assert.deepEqual(pending.pendingIntervention[0].suggestions, ['b']);
+  const result = await session.process(line, { approvedProductIds: ['b'] });
   assert.deepEqual(result.completedOrders.map(p => p.quantity),[2,3]);
   assert.equal(result.pendingIntervention.length,0);
   await session.process(line);
@@ -63,7 +65,8 @@ test('splits direct substitutions, tracks stock and idempotent replay',async () 
 test('never follows a substitute to its substitute',async () => {
   const {session} = setup();
   console.log('Expected: use a and its direct substitute b only; leave a 1 KG shortfall and do not use c.');
-  const result = await session.process({...line,quantity:6});
+  await session.process({...line,quantity:6});
+  const result = await session.process({...line,quantity:6}, {approvedProductIds:['b']});
   assert.equal(result.pendingIntervention[0].shortfall,1);
   assert.equal(result.inventory.c,undefined);
 });
@@ -94,7 +97,8 @@ test('validates requests against OpenAPI',async () => {
 test('workflow calls catalog once and availability only for original and direct substitute', async () => {
   const {session, requests} = setup();
   console.log('Expected: download catalog once, check a then b, and allocate 2 KG and 3 KG with zero remaining stock.');
-  const result = await session.run([line]);
+  await session.run([line]);
+  const result = await session.process(line, {approvedProductIds:['b']});
   assert.deepEqual(requests, [
     {method:'GET', path:'/api/products/download', body:undefined},
     {method:'POST', path:'/api/availability', body:{customer:'test', requestedDate:'2026-11-16', products:['a']}},
@@ -108,7 +112,8 @@ test('workflow calls catalog once and availability only for original and direct 
 test('run stops after a shortfall without processing later lines', async () => {
   const {session, requests} = setup({amounts:[1,1,9]});
   console.log('Expected: allocate 1 KG each from a and b, report a 3 KG shortfall, and stop before checking c.');
-  const result = await session.run([line, {...line,id:'later',preferred:{id:'c'}}]);
+  await session.run([line, {...line,id:'later',preferred:{id:'c'}}]);
+  const result = await session.process(line, {approvedProductIds:['b']});
   assert.equal(result.pendingIntervention[0].shortfall,3);
   assert.deepEqual(result.completedOrders.map(p => p.productId), ['a','b']);
   assert.equal(requests.some(r => r.body?.products?.includes('c')), false);
@@ -120,4 +125,131 @@ test('rejects approval for an unproposed product before availability', async () 
   await session.process(missing);
   await assert.rejects(session.process(missing,{approvedProductIds:['unknown']}), /proposed eligible/);
   assert.equal(requests.length,1);
+});
+test('failed availability rolls back allocations and cached stock', async () => {
+  const {session} = setup();
+  const first = session.client.availability.bind(session.client);
+  let calls = 0;
+  session.client.availability = async body => {
+    if (++calls === 1) throw Error('upstream failed');
+    return first(body);
+  };
+  await assert.rejects(session.process(line), /upstream failed/);
+  assert.deepEqual(session.summary().completedOrders, []);
+  assert.deepEqual(session.summary().pendingIntervention, []);
+  const pending = await session.process(line);
+  assert.equal(pending.pendingIntervention[0].shortfall, 3);
+});
+test('substitute must preserve required constraints and be explicitly approved', async () => {
+  const {session, catalog} = setup();
+  const products = await catalog.download();
+  products[0].countryOfOrigin = 'FI'; products[1].countryOfOrigin = 'SE';
+  const result = await session.process({...line, required:{category:'food', countryOfOrigin:'FI'}});
+  assert.equal(result.pendingIntervention[0].shortfall, 3);
+  assert.deepEqual(result.pendingIntervention[0].suggestions, []);
+  await assert.rejects(session.process({...line, required:{category:'food', countryOfOrigin:'FI'}}, {approvedProductIds:['b']}), /proposed eligible/);
+});
+test('explicit shortfall acceptance or rejection only resolves simulation', async () => {
+  const {session} = setup();
+  await session.process(line);
+  const accepted = session.resolveShortfall('one', 'accept');
+  assert.deepEqual(accepted.resolutions, [{lineId:'one',status:'SHORTFALL_ACCEPTED',fulfilled:2,shortfall:3}]);
+  assert.equal((await session.process(line)).completedOrders.length, 1);
+  const second = setup().session;
+  await second.process(line);
+  const rejected = second.resolveShortfall('one', 'reject');
+  assert.equal(rejected.completedOrders.length, 0);
+  assert.equal(rejected.inventory.a.remaining, 2);
+  assert.equal(rejected.resolutions[0].status, 'REJECTED');
+  assert.throws(() => second.resolveShortfall('one', 'accept'), /No pending/);
+});
+test('no-match suggestions remain available after an unavailable selection', async () => {
+  const {session} = setup({amounts:[0,0,0]});
+  const missing = {...line, preferred:{id:'missing'}};
+  await session.process(missing);
+  const result = await session.process(missing, {approvedProductIds:['a']});
+  assert.deepEqual(result.pendingIntervention[0].suggestions, ['a','b','c']);
+  assert.throws(() => session.resolveShortfall('one','accept'), /no allocated stock/);
+});
+test('cutoff, delivery date, unit, lots and unknown stock fail closed', async () => {
+  for (const patch of [
+    {closingTime:'2026-11-14T12:00:00'}, {closingTime:'2026-11-14T12:00:00Z'},
+    {scheduleLines:[{salesBlock:false,availableAmount:10,availableDate:'2026-11-17',salesUnit:'KG'}]},
+    {scheduleLines:[{salesBlock:false,availableAmount:10,availableDate:'2026-11-16',salesUnit:'PCS'}]},
+    {logisticModel:'Terminal'}
+  ]) {
+    const {session} = setup();
+    session.now = () => new Date('2026-11-14T12:00:00Z');
+    const original = session.client.availability.bind(session.client);
+    session.client.availability = async body => {
+      const result = await original(body);
+      result.products.forEach(p => Object.assign(p, patch));
+      return result;
+    };
+    const result = await session.process(line);
+    assert.equal(result.completedOrders.length, 0, JSON.stringify(patch));
+    assert.equal(result.pendingIntervention[0].shortfall, 5);
+  }
+  const {session,catalog} = setup({amounts:[5,3,9]});
+  (await catalog.download())[0].allowedLotSize = 4;
+  const result = await session.process({...line,quantity:5});
+  assert.equal(result.completedOrders[0].quantity,4);
+  assert.equal(result.pendingIntervention[0].shortfall,1);
+});
+test('failed second availability batch rolls back entire session', async () => {
+  const products = Array.from({length:1001},(_,i)=>({id:String(i),salesUnit:'KG',allowedLotSize:1}));
+  let calls = 0;
+  const catalog = { search:async () => products, download:async () => products, matches:() => true };
+  const client = {availability:async ({products:ids}) => {
+    if (++calls === 2) throw Error('batch failed');
+    return {products:ids.map(productId => ({productId,logisticModel:'Stock',salesBlock:false,closingTime:null,scheduleLines:[{salesBlock:false,availableAmount:1,availableDate:'2026-11-16',salesUnit:'KG'}]}))};
+  }};
+  const session = new ProcurementSession({catalog,client,customer:'test',requestedDate:'2026-11-16'});
+  await assert.rejects(session.process({id:'batch',quantity:1001,salesUnit:'KG'}), /batch failed/);
+  assert.deepEqual(session.summary().inventory, {});
+  assert.deepEqual(session.summary().pendingIntervention, []);
+});
+test('concurrent processing is rejected without mutating state', async () => {
+  const {session} = setup();
+  const original = session.catalog.search.bind(session.catalog);
+  let release;
+  const barrier = new Promise(resolve => {release = resolve;});
+  session.catalog.search = async (...args) => { await barrier; return original(...args); };
+  const first = session.process(line);
+  await assert.rejects(session.process({...line,id:'two'}), /already processing/);
+  release(); await first;
+  assert.equal(session.summary().pendingIntervention.length, 1);
+});
+test('client strips key after cross-origin HTTPS redirect and retains one deadline', async () => {
+  const calls=[];
+  const client=new ProcurementClient({baseUrl:'https://supplier.test',apiKey:'secret',fetchImpl:async (url,options)=>{
+    calls.push({url:String(url), ...options});
+    return calls.length === 1 ? new Response('',{status:302,headers:{location:'https://cdn.test/file'}}) : new Response('[]');
+  }});
+  assert.equal(await client.request('/api/products/download','GET'), '[]');
+  assert.equal(calls[0].headers['X-API-Key'],'secret');
+  assert.equal(calls[1].headers['X-API-Key'],undefined);
+  assert.equal(calls[0].signal,calls[1].signal);
+});
+test('client 429, network, timeout and malformed schema have structured errors and no retries', async () => {
+  for (const [fetchImpl,status,code] of [
+    [async()=>new Response('',{status:429}),429,'VALIO_RATE_LIMITED'],
+    [async()=>{throw new TypeError('offline');},502,'VALIO_UNAVAILABLE'],
+    [async()=>{throw new DOMException('timeout','TimeoutError');},502,'VALIO_TIMEOUT'],
+    [async()=>Response.json({products:[]}),502,'VALIO_INVALID_RESPONSE']
+  ]) {
+    let calls=0;
+    const client=new ProcurementClient({baseUrl:'https://supplier.test',apiKey:'secret',fetchImpl:async (...args)=>{calls++;return fetchImpl(...args);}});
+    await assert.rejects(client.availability({customer:'test',requestedDate:'2026-11-16',products:['a']}), error=>error.status===status && error.code===code);
+    assert.equal(calls,1);
+  }
+});
+for (const decision of ['accept', 'reject']) test(`run resumes later lines after a human chooses to ${decision} a shortfall`, async () => {
+  const {session} = setup({amounts:[2,3,9]});
+  const later = {...line,id:'later',quantity:1,preferred:{id:'c'}};
+  await session.run([line,later]);
+  session.resolveShortfall('one', decision);
+  const result = await session.run([line,later]);
+  assert.ok(result.completedOrders.some(item => item.lineId === 'later' && item.productId === 'c'));
+  assert.equal(result.pendingIntervention.length,0);
 });

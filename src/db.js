@@ -8,7 +8,11 @@ if (!connectionString) {
 export const pool = new pg.Pool({ connectionString });
 export async function transaction(fn) {
   const client = await pool.connect();
+  let rollbackError;
   try { await client.query('BEGIN'); const result = await fn(client); await client.query('COMMIT'); return result; }
-  catch (error) { await client.query('ROLLBACK'); throw error; }
-  finally { client.release(); }
+  catch (error) {
+    try { await client.query('ROLLBACK'); } catch (failure) { rollbackError = failure; }
+    throw error;
+  }
+  finally { client.release(rollbackError); }
 }

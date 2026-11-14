@@ -18,6 +18,15 @@ function product(productId, overrides = {}) {
 const policy = { hard_spend_limit:1000, weekly_spend_limit:5000, excluded_allergens:[] };
 
 test('catalog substitution scoring and mandate diagnostics', async t => {
+  await t.test('even an unchanged mapped substitution requires review', () => {
+    const original = product('original');
+    original.raw.substitutions.push({ product:'original', substituteProduct:'substitute' });
+    const [item] = buildOrderItems([{ productId:'substitute', quantity:1, substitutedFrom:'original' }], { items:[original, product('substitute')] });
+    const risk = scoreOrder([item], { policy, history:[] });
+    assert.equal(item.substitutionRisk, 'mapped');
+    assert.equal(risk.decision, 'REQUIRES_INTERVENTION');
+    assert.ok(risk.questions.some(q => q.rule === 'substitution'));
+  });
   await t.test('mapped pack or nutrition shift gets 30 points and the deterministic prompt', () => {
     const original = product('original', { raw:{ substitutions:[{product:'original',substituteProduct:'substitute'}],
       synkkaData:{keyIngredients:[{value:'same ingredient list',language:'en'}],nutritionalContent:[{id:'ENER-KJO',value:100}],unitConversions:[{netWeight:{value:100}}]} } });

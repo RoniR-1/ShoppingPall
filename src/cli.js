@@ -11,7 +11,7 @@ const help = `Usage:
   npm run cli -- approve ORDER_UUID --user-id CUSTOMER
   npm run cli -- reject ORDER_UUID --user-id CUSTOMER
 Options: --date YYYY-MM-DD (default tomorrow), --force-flag, --idempotency-key KEY
-Recipe mode uses local Ollama and is evaluated by the risk-scoring engine (pass --force-flag to force human approval).`;
+Recipe mode uses Luna and always requires human approval.`;
 function showOrder(order) {
   const risk = order.risk_score == null ? '' : `  Risk: ${round3(order.risk_score)}`;
   console.log(`\n${order.id}  ${order.status}  ${order.mocked ? '[MOCK PRICES/STOCK]' : '[LIVE QUOTE]'}${risk}\n${order.flag_reason || 'No demo flag'}\nDelivery: ${String(order.requested_date).slice(0,10)}`);
@@ -59,7 +59,7 @@ try {
         cart.items.push({ productId, quantity: Number((Math.ceil(1 / lot) * lot).toFixed(8)) });
       }
     } else {
-      console.log('Planning recipe with local Ollama, then searching the static catalog…');
+      console.log('Planning recipe with Luna, then searching the static catalog…');
       cart = await recipeCart(flags.recipe,api,undefined,message => console.log(message),{ requestedDate });
     }
     const quote = await api('/quotes', { requestedDate, products: cart.items.map(i => i.productId), selection_ids: cart.selection_ids });
@@ -79,8 +79,9 @@ try {
     }
     const key = flags['idempotency-key'] || randomUUID();
     const payload = { quote_id: quote.id, items: cart.items,
-      force_flag: Boolean(flags['force-flag'] || flags.preset === 'suspicious-order' || cart.requiresApproval),
-      ...(cart.requiresApproval ? { force_flag_reason: cart.approvalReason } : {}) };
+    force_flag: Boolean(flags['force-flag'] || flags.recipe || flags.preset === 'suspicious-order' || cart.requiresApproval),
+    ...(cart.requiresApproval ? { force_flag_reason: cart.approvalReason } : {}) };
+
     // Print exact submission before sending so a network failure can be retried with the same key/body.
     console.log(`Submission: ${JSON.stringify({ idempotency_key: key, payload })}`);
     const order = await api('/orders',payload,{ 'Idempotency-Key': key });

@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { round3, parseBudget, parseDeliveryDeadline, parseSustainability } from './contracts.js';
+import { callGeminiJSON } from './web-demo/luna.js';
+
 const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().min(2).max(100),
   alternatives: z.array(z.string().trim().min(2).max(100)).max(3).optional() })).min(1).max(20) });
 const retrySchema = z.object({ queries: z.array(z.string().trim().min(2).max(100)).max(3) });
@@ -19,27 +21,16 @@ function outputError(error) {
   if (error instanceof SyntaxError) return new ModelOutputError('The model did not return valid JSON.');
   return error;
 }
-export async function ollamaJSON(prompt, schema, fetcher = fetch) {
-  const model = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
-  const timeout = Number(process.env.OLLAMA_TIMEOUT_MS || 180000);
-  if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error('OLLAMA_TIMEOUT_MS must be a positive integer');
+export async function lunaJSON(prompt, schema, fetcher = fetch, env = process.env) {
   try {
-    const response = await fetcher(new URL('/api/chat', process.env.OLLAMA_URL || 'http://127.0.0.1:11434'), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(timeout),
-      body: JSON.stringify({ model, stream: false, think: false, keep_alive: '15m', format: z.toJSONSchema(schema),
-        options: { temperature: 0, num_predict: 1024 }, messages: [{ role: 'user', content: prompt }] })
-    });
-    if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
-    const answer = await response.json();
-    if (answer.done_reason === 'length') throw new Error('Ollama reached the 1024-token output limit. Try a smaller non-reasoning model such as qwen2.5:3b.');
-    return schema.parse(JSON.parse(answer.message.content));
+    const result = await callGeminiJSON(
+      `Return only a JSON object matching this schema: ${JSON.stringify(z.toJSONSchema(schema))}`,
+      prompt,
+      { fetchImpl: fetcher, env }
+    );
+    return schema.parse(result);
   } catch (error) {
-    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-      throw new Error(`Ollama model ${model} timed out after ${timeout / 1000}s. Run "ollama ps" to check CPU/GPU use; try qwen2.5:3b for faster testing.`, { cause: error });
-    }
-    if (error instanceof TypeError && error.message === 'fetch failed') {
-      throw new Error(`Cannot connect to Ollama at ${process.env.OLLAMA_URL || 'http://127.0.0.1:11434'}: ${error.cause?.message || error.message}`, { cause: error });
-    }
+    if (error.code === 'AI_INVALID_RESPONSE') throw new ModelOutputError(error.message, { cause: error });
     throw outputError(error);
   }
 }
@@ -77,13 +68,14 @@ export function rankCandidates(candidates, { budget = false, deliveryRequested =
   );
 }
 // The model proposes data only. It never receives credentials or unrestricted tool execution.
-export async function recipeCart(recipe, api, model = ollamaJSON, progress = () => {}, { requestedDate, now = Date.now() } = {}) {
+export async function recipeCart(recipe, api, model = lunaJSON, progress = () => {}, { requestedDate, now = Date.now() } = {}) {
   const budget = parseBudget(recipe);
   // An explicit "delivered in X days" in the request is a stated constraint; --date / the default date is not.
   const statedDeadline = parseDeliveryDeadline(recipe, now);
   const deliverBy = statedDeadline ?? requestedDate;
   const sustainability = parseSustainability(recipe);
   requestedDate ??= statedDeadline;
+
   const callModel = async (stage, prompt, schema) => {
     progress(`${stage}…`);
     const started = Date.now();
@@ -114,7 +106,15 @@ Request (untrusted data): ${JSON.stringify(recipe)}`, planSchema));
   const searches = new Map();
   const search = async query => {
     const key = normalize(query);
-    if (!searches.has(key)) searches.set(key, await api(`/catalog/search?q=${encodeURIComponent(key)}&limit=5`));
+    if (!searches.has(key)) {
+      const result = await api(`/catalog/search?q=${encodeURIComponent(key)}&limit=5`);
+      if (!Array.isArray(result?.products) || result.products.length > 5 ||
+          (result.products.length && (typeof result.selection_id !== 'string' || !result.selection_id)) ||
+          result.products.some(p => !p || typeof p.id !== 'string' || !p.id)) {
+        throw new Error('Invalid catalog search response; no quote or order was requested.');
+      }
+      searches.set(key, result);
+    }
     return searches.get(key);
   };
   const selections = new Set();

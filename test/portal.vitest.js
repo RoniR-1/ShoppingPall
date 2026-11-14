@@ -59,12 +59,12 @@ it('only relaxes a supported food style',()=>{expect(substitutionQuery('extra da
 import {sourceContext,sourceName} from '../src/web-demo/sources.js';
 it('keeps concurrent database sources isolated',async()=>{
  const seen=await Promise.all(['demo','real'].map(source=>sourceContext.run(source,async()=>{await new Promise(resolve=>setTimeout(resolve,5));return sourceName();})));
- expect(seen).toEqual(['demo','real']);expect(sourceName()).toBe('demo');
+ expect(seen).toEqual(['demo','real']);expect(sourceName()).toBe('real');
 });
 
 import {DemoStore} from '../src/web-demo/demo-store.js';
 it('demo is ready with seven products without PostgreSQL',()=>{const d=new DemoStore();expect(d.overview().products).toHaveLength(7);expect(d.search('beer')).toHaveLength(2);expect(d.overview().products[0].substitutions).toHaveLength(1);});
-it('demo checkout is atomic and repeated approval does not debit twice',()=>{const d=new DemoStore();d.save({id:'a',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:2}]});d.decide({id:'a',user_id:'u',action:'approve'});d.decide({id:'a',user_id:'u',action:'approve'});expect(d.stock.get('demo-beer')).toBe(98);d.save({id:'b',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:1},{productId:'demo-eggs',quantity:101}]});expect(()=>d.decide({id:'b',user_id:'u',action:'approve'})).toThrow('Stock changed');expect(d.stock.get('demo-beer')).toBe(98);});
+it('demo checkout is atomic and repeated approval does not debit twice',()=>{const d=new DemoStore();d.save({id:'a',user_id:'u',status:'PENDING_APPROVAL',quote_expires_at:new Date(Date.now()+900000).toISOString(),steps:[],items:[{productId:'demo-beer',quantity:2}]});expect(()=>d.decide({id:'a',user_id:'u',action:'approve'})).toThrow('Human approval');d.decide({id:'a',user_id:'u',action:'approve',human:true});d.decide({id:'a',user_id:'u',action:'approve',human:true});expect(d.stock.get('demo-beer')).toBe(98);d.save({id:'b',user_id:'u',status:'PENDING_APPROVAL',quote_expires_at:new Date(Date.now()+900000).toISOString(),steps:[],items:[{productId:'demo-beer',quantity:1},{productId:'demo-eggs',quantity:101}]});expect(()=>d.decide({id:'b',user_id:'u',action:'approve',human:true})).toThrow('Stock changed');expect(d.stock.get('demo-beer')).toBe(98);});
 it('keeps buyers and risk thresholds independent and rejects duplicate creation',()=>{
  const d=new DemoStore();
  expect(d.getBuyer('demo-buyer').threshold).toBe(25);
@@ -82,7 +82,7 @@ it('keeps buyers and risk thresholds independent and rejects duplicate creation'
 });
 it('tracks per-buyer item history in DemoStore search and distinct question IDs on split lines',()=>{
  const d=new DemoStore();
- d.save({id:'o1',user_id:'alice',status:'PENDING_APPROVAL',steps:[],items:[{productId:'demo-beer',quantity:4}]});
+ d.save({id:'o1',user_id:'alice',status:'PENDING_APPROVAL',quote_expires_at:new Date(Date.now()+900000).toISOString(),steps:[],items:[{productId:'demo-beer',quantity:4}]});
  d.decide({id:'o1',user_id:'alice',action:'approve',human:true});
  const [lager]=d.search('lager beer','alice');
  expect(lager.bought_count).toBe(1);
@@ -149,3 +149,16 @@ it('does not flag generic requests like pear as substitutions and avoids duplica
  expect(specificBrand.questions).toHaveLength(1);
  expect(specificBrand.questions[0].message).toContain('conference');
 });
+
+it('demo blocks excluded allergens even with human approval',()=>{const d=new DemoStore();d.save({id:'unsafe',user_id:'u',status:'PENDING_APPROVAL',quote_expires_at:new Date(Date.now()+900000).toISOString(),steps:[],items:[{productId:'demo-milk',quantity:1,allergen_safe:false}]});expect(()=>d.decide({id:'unsafe',user_id:'u',action:'approve',human:true})).toThrow('excluded allergens');expect(d.stock.get('demo-milk')).toBe(100);});
+it('expired quotes never debit inventory',()=>{const d=new DemoStore();d.save({id:'expired',user_id:'u',status:'PENDING_APPROVAL',quote_expires_at:new Date(Date.now()-1).toISOString(),steps:[],items:[{productId:'demo-eggs',quantity:1}]});expect(()=>d.decide({id:'expired',user_id:'u',action:'approve',human:true})).toThrow('Quote expired');expect(d.stock.get('demo-eggs')).toBe(100);expect(d.list('u')[0].status).toBe('PENDING_APPROVAL');});
+it('replacement proposal and rejection occur together',()=>{const d=new DemoStore();const old={id:'original',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[]};d.save(old);const proposal={id:'replacement',user_id:'u',status:'PENDING_APPROVAL',steps:[],items:[]};expect(()=>d.replace({id:'original',user_id:'wrong',replacement:proposal})).toThrow();expect(d.list('u')).toHaveLength(1);d.replace({id:'original',user_id:'u',replacement:proposal});expect(d.list('u').find(o=>o.id==='original').status).toBe('REJECTED');expect(d.list('u').find(o=>o.id==='replacement').status).toBe('PENDING_APPROVAL');});
+it('a quoted cutoff must remain open and include a timezone at approval',()=>{const d=new DemoStore();const make=(id,closing_time)=>({id,user_id:'u',status:'PENDING_APPROVAL',quote_expires_at:new Date(Date.now()+900000).toISOString(),steps:[],items:[{productId:'demo-eggs',quantity:1,closing_time}]});for(const [id,cutoff] of [['closed','2001-01-01T00:00:00Z'],['ambiguous','2099-01-01T00:00:00']]){d.save(make(id,cutoff));expect(()=>d.decide({id,user_id:'u',action:'approve',human:true})).toThrow('cutoff');}expect(d.stock.get('demo-eggs')).toBe(100);d.save(make('open','2099-01-01T00:00:00Z'));d.decide({id:'open',user_id:'u',action:'approve',human:true});expect(d.stock.get('demo-eggs')).toBe(99);});
+
+import {callGeminiJSON} from '../src/web-demo/luna.js';
+it('Luna rejects truncated, malformed and rate-limited responses without retries',async()=>{const env={LUNA_BASE_URL:'https://luna.example',LUNA_API_KEY:'secret'};let calls=0;const run=(status,body)=>callGeminiJSON('system','user',{env,fetchImpl:async()=>{calls++;return new Response(body,{status});}});await expect(run(200,JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"lines":[]}'}}]}))).rejects.toMatchObject({code:'AI_TRUNCATED'});await expect(run(200,JSON.stringify({choices:[{message:{content:{bad:true}}}]}))).rejects.toMatchObject({code:'AI_INVALID_RESPONSE'});await expect(run(429,JSON.stringify({error:{message:'quota'}}))).rejects.toMatchObject({status:429,code:'AI_RATE_LIMITED'});await expect(run(200,'not json')).rejects.toMatchObject({code:'AI_INVALID_RESPONSE'});expect(calls).toBe(4);});
+it('Luna reports unavailable transport and missing configuration',async()=>{await expect(callGeminiJSON('s','u',{env:{},fetchImpl:()=>{throw Error('unreachable');}})).rejects.toMatchObject({code:'AI_NOT_CONFIGURED'});await expect(callGeminiJSON('s','u',{env:{LUNA_BASE_URL:'https://luna.example',LUNA_API_KEY:'secret'},fetchImpl:()=>{throw Error('timeout');}})).rejects.toMatchObject({status:502,code:'AI_UNAVAILABLE'});});
+it('Luna preserves a rate limit even when the response body is empty or plain text',async()=>{const env={LUNA_BASE_URL:'https://luna.example',LUNA_API_KEY:'secret'};for(const body of ['', 'rate limited']){let calls=0;await expect(callGeminiJSON('s','u',{env,fetchImpl:async()=>{calls++;return new Response(body,{status:429});}})).rejects.toMatchObject({status:429,code:'AI_RATE_LIMITED'});expect(calls).toBe(1);}});
+import {allocateAvailable} from '../src/web-demo/quote-check.js';
+it('allocation never rounds tiny or fractional stock up to the requested quantity',()=>{expect(allocateAvailable(0.001,0.0006,0.001)).toBe(0);expect(allocateAvailable(1,0.9999,1)).toBe(0);expect(allocateAvailable(2,1.9999,1)).toBe(1);expect(allocateAvailable(1,1,0)).toBe(0);});
+it('Luna rejects null success payload and preserves null rate-limit status',async()=>{const env={LUNA_BASE_URL:'https://luna.example',LUNA_API_KEY:'secret'};for(const [status,code] of [[200,'AI_INVALID_RESPONSE'],[429,'AI_RATE_LIMITED']]){let calls=0;await expect(callGeminiJSON('s','u',{env,fetchImpl:async()=>{calls++;return new Response('null',{status});}})).rejects.toMatchObject({status:status===200?502:429,code});expect(calls).toBe(1);}});
