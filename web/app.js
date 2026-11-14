@@ -1,7 +1,17 @@
 const $ = id => document.getElementById(id);
 let dataSource = 'real';
 let plainMode = localStorage.getItem('plainMode') === '1';
-let activeBuyer = (localStorage.getItem('activeBuyer') || '').trim() || 'demo-buyer';
+const newGuestId = () => `guest-${Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')}`;
+let activeBuyer = (localStorage.getItem('activeBuyer') || '').trim();
+if (!activeBuyer || activeBuyer === 'demo-buyer') {
+  activeBuyer = newGuestId();
+  localStorage.setItem('activeBuyer', activeBuyer);
+}
+$('new-session').onclick = () => {
+  localStorage.setItem('activeBuyer', newGuestId());
+  location.reload();
+};
+$('buyer-label').textContent = activeBuyer;
 let settingsOpen = false;
 let lastExecOrder = null;
 let lastOrders = [];
