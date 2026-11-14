@@ -4,4 +4,4 @@ node_modules/
 *.log
 .local/
 .codex
-.AGENTS.md
+AGENTS.md
