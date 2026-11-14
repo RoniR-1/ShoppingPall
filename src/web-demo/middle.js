@@ -138,12 +138,15 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
       candidates=await core('/internal/search',{q,user_id:user});
       if(candidates.length){matchedQuery=q;break;}
     }
+    if(meta.managedSimulation&&context?.why?.product_id){
+      candidates=candidates.filter(product=>product.id===context.why.product_id);
+    }
     let suggested=false;
     const chosenId=approved[index]||pinned[index];
     if(!candidates.length){
       suggested=true;
       candidates=await core('/internal/suggestions',{q:line.query});
-    }else if(candidates.length<4&&!chosenId){
+    }else if(candidates.length<4&&!chosenId&&!meta.managedSimulation){
       const extra=await core('/internal/suggestions',{q:line.query});
       const seen=new Set(candidates.map(c=>c.id));
       for(const s of extra)if(!seen.has(s.id)){candidates.push(s);seen.add(s.id);if(candidates.length>=8)break;}
@@ -409,6 +412,16 @@ ${deliveryDeadline?`5a. The buyer wants delivery by ${deliveryDeadline}. Prefer 
     }
   }
 
+  // A simulated replenishment is a single product request. Do not create an
+  // approval order when there is no complete, policy-eligible supplier quote.
+  if(meta.managedSimulation&&o.issues.length){
+    const issue=o.issues[0], line=lines[issue.index], candidate=o.line_traces.find(t=>t.lineIndex===issue.index)?.topCandidates?.[0];
+    const reason=issue.reason.startsWith('No catalog match')?'no matching supplier product':
+      candidate?.allergen_safe===false?'product conflicts with the buyer allergen policy':
+      candidate?.price==null?'no valid supplier quote':
+      issue.reason.startsWith('No exact match')?'no exact supplier match':'supplier stock is insufficient';
+    throw Object.assign(Error(`${line.query}: replenishment blocked because ${reason}.`),{code:'REPLENISHMENT_BLOCKED'});
+  }
   o.total=round3(o.items.reduce((sum,i)=>sum+(i.lineTotal??i.quantity*i.price),0));
   if(budget!=null){
     o.budget_limit=round3(budget);
@@ -480,7 +493,7 @@ app.post('/portal/managed-agent/chat',async(req,res)=>{
   res.json(managedAgent.chat(b.user_id,b.text));
 });
 const simulationInFlight=new Set();
-setInterval(()=>{for(const [user,state] of Object.entries(managedAgent.states)){if(!state.simulation||simulationInFlight.has(user))continue;simulationInFlight.add(user);managedAgent.simulationStep(user).catch(()=>{}).finally(()=>simulationInFlight.delete(user));}},1000).unref();
+setInterval(()=>{for(const [user,state] of Object.entries(managedAgent.states)){if(!state.simulation||simulationInFlight.has(user))continue;simulationInFlight.add(user);managedAgent.simulationStep(user).catch(()=>{}).finally(()=>simulationInFlight.delete(user));}},250).unref();
 setInterval(()=>{for(const [user,state] of Object.entries(managedAgent.states))if(!state.simulation)managedAgent.tick(user).catch(()=>{});},30000).unref();
 
 app.get('/portal/catalog-overview',async(req,res)=>{

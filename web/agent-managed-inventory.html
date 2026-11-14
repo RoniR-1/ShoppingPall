@@ -20,7 +20,7 @@
       <p id="error" class="input-error" role="alert" hidden></p>
       <div class="simulation-actions"><button class="primary-btn" id="simulation-toggle" type="button">Start simulation</button><button class="ghost-btn" id="demand-spike" type="button">Simulate demand spike</button></div>
       <div class="control-grid">
-        <div><span class="field-label" id="speed-label">Speed</span><div class="speed-options" role="group" aria-labelledby="speed-label"><button class="ghost-btn" type="button" data-speed="1x">1x (8s)</button><button class="ghost-btn" type="button" data-speed="fast">Fast (3s)</button></div></div>
+        <div><span class="field-label" id="speed-label">Speed</span><div class="speed-options" role="group" aria-labelledby="speed-label"><button class="ghost-btn" type="button" data-speed="1x">1x (8s)</button><button class="ghost-btn" type="button" data-speed="fast">Fast (3s)</button><button class="ghost-btn" type="button" data-speed="6x">6x (1.3s)</button></div></div>
         <label><span class="field-label">Governance mode</span><select id="governance"><option value="autonomous">Full Autonomous</option><option value="human">Human-in-the-Loop</option></select></label>
       </div>
       <div class="kpi-grid" aria-label="Operations summary">
@@ -43,7 +43,7 @@
     <section class="panel" aria-labelledby="activity-title">
       <div class="panel-bar"><span id="activity-title">03 · Agent activity</span><span class="muted">Live demo feed</span></div>
       <div class="activity-heading"><strong>Approval queue</strong><span class="muted" id="approval-count">0 PENDING</span></div>
-      <p class="intro">Orders needing human review appear here.</p>
+      <p class="intro">Orders awaiting approval and blocked replenishments appear here.</p>
       <div id="approvals"><p class="dashboard-empty">No orders awaiting approval.</p></div>
       <details class="inventory-details" open><summary>+ Live agent telemetry <span class="muted">(local time)</span></summary><div id="telemetry" class="telemetry-feed" role="log" aria-live="polite"><p class="telemetry-empty">Awaiting agent activity...</p></div></details>
       <details class="inventory-details"><summary>+ Decision evidence <span class="muted">(audit and reconciliation)</span></summary><div class="details-content" id="activity"></div></details>

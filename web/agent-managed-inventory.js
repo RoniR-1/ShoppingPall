@@ -89,21 +89,41 @@ function renderStock() {
 }
 function renderApprovals() {
   const pending = (state.orders || []).filter(order => order.context?.agent?.type === 'managed' && order.status === 'PENDING_APPROVAL');
-  $('approval-count').textContent = `${pending.length} PENDING`;
-  if (!pending.length) { $('approvals').replaceChildren(node('p', 'No orders awaiting approval. Your agent will surface decisions here.', 'dashboard-empty')); return; }
-  $('approvals').replaceChildren(...pending.map(order => {
+  const blocked = (state.activity || []).filter(entry => entry.status === 'DENIED' && !entry.resolved_at && (state.preview || []).some(rule => rule.episode === entry.id));
+  $('approval-count').textContent = `${pending.length} PENDING${blocked.length ? ` · ${blocked.length} BLOCKED` : ''}`;
+  if (!pending.length && !blocked.length) { $('approvals').replaceChildren(node('p', 'No orders awaiting approval or blocked replenishments.', 'dashboard-empty')); return; }
+  const cards = pending.map(order => {
     const card = node('article', null, 'approval-card');
-    const heading = node('div', null, 'approval-heading'); heading.append(node('strong', order.items?.map(item => `${item.quantity} ${item.name}`).join(', ') || 'Purchase order'), node('span', 'REVIEW REQUIRED', 'approval-tag'));
-    card.append(heading, node('p', order.reason || 'This order requires your approval.'));
+    const incomplete = order.incomplete || !order.items?.length;
+    const product = order.lines?.map(line => line.query).filter(Boolean).join(', ') || (state.preview || []).find(rule => rule.id === order.context?.why?.rule_id)?.query || 'Requested product';
+    const heading = node('div', null, 'approval-heading'); heading.append(node('strong', incomplete ? `${product} · replenishment blocked` : order.items.map(item => `${item.quantity} ${item.name}`).join(', ')), node('span', incomplete ? 'BLOCKED' : 'REVIEW REQUIRED', 'approval-tag'));
+    card.append(heading);
     const cap = order.context?.constraints;
-    const total = Number(order.total);
-    const value = Number.isFinite(total) ? new Intl.NumberFormat('en-IE', { style: 'currency', currency: order.items?.[0]?.currency || 'EUR' }).format(total) : 'Unavailable';
-    const policy = cap?.max_price != null ? `${cap.currency || 'EUR'} ${cap.max_price} per ${cap.price_quantity || 1} ${cap.price_unit || cap.sales_unit || 'unit'}` : 'No cap configured';
-    card.append(node('p', `Order value: ${value} · Price cap: ${policy}`, 'approval-policy'));
-    if (order.incomplete) { const explanation = node('p', 'This order has missing or blocked items. Review them in the '); const link = node('a', 'User Agent Demo'); link.href = '/user-agent-demo'; explanation.append(link, document.createTextNode(' before approving.')); card.append(explanation); }
-    { const actions = node('div', null, 'form-actions'); for (const action of order.incomplete ? ['reject'] : ['approve', 'reject']) { const button = node('button', action === 'approve' ? 'Approve' : 'Reject', action === 'approve' ? 'primary-btn' : 'ghost-btn'); button.type = 'button'; button.onclick = () => perform(async () => { let response; try { response = await fetch(`/portal/orders/${encodeURIComponent(order.id)}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Data-Source': 'demo' }, body: JSON.stringify({ user_id: user }), signal: AbortSignal.timeout(15000) }); } catch { throw Error(connectionError); } const result = await response.json(); if (!response.ok) throw Error(result.error || 'Decision failed'); await request('', { action: 'check' }); }); actions.append(button); } card.append(actions); }
+    if (incomplete) {
+      const issues = order.issues || [];
+      const matching = issues.flatMap(issue => issue.options || []).filter(option => order.lines?.some(line => String(option.name || '').toLowerCase() === String(line.query || '').toLowerCase()));
+      const reason = matching.some(option => option.allergen_safe === false) ? 'The product conflicts with the buyer allergen policy.' : matching.some(option => option.price == null) ? 'A supplier price is unavailable.' : matching.some(option => Number(option.available ?? option.available_amount) <= 0) ? 'The supplier has insufficient stock.' : issues.map(issue => issue.reason).filter(Boolean).join('; ') || 'A complete supplier quote is unavailable.';
+      card.append(node('p', `${reason} No purchase order was dispatched. Dismiss this request after reviewing the issue.`));
+    } else {
+      card.append(node('p', order.reason || 'This order requires your approval.'));
+      const total = Number(order.total);
+      const value = Number.isFinite(total) ? new Intl.NumberFormat('en-IE', { style: 'currency', currency: order.items[0]?.currency || 'EUR' }).format(total) : 'Unavailable';
+      const policy = cap?.max_price != null ? `${cap.currency || 'EUR'} ${cap.max_price} per ${cap.price_quantity || 1} ${cap.price_unit || cap.sales_unit || 'unit'}` : 'No cap configured';
+      card.append(node('p', `Order value: ${value} · Price cap: ${policy}`, 'approval-policy'));
+    }
+    { const actions = node('div', null, 'form-actions'); for (const action of incomplete ? ['reject'] : ['approve', 'reject']) { const button = node('button', action === 'approve' ? 'Approve' : incomplete ? 'Dismiss request' : 'Reject', action === 'approve' ? 'primary-btn' : 'ghost-btn'); button.type = 'button'; button.onclick = () => perform(async () => { let response; try { response = await fetch(`/portal/orders/${encodeURIComponent(order.id)}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Data-Source': 'demo' }, body: JSON.stringify({ user_id: user }), signal: AbortSignal.timeout(15000) }); } catch { throw Error(connectionError); } const result = await response.json(); if (!response.ok) throw Error(result.error || 'Decision failed'); await request('', { action: 'check' }); }); actions.append(button); } card.append(actions); }
     return card;
-  }));
+  });
+  for (const entry of blocked) {
+    const rule = (state.preview || []).find(item => item.episode === entry.id);
+    const card = node('article', null, 'approval-card');
+    const heading = node('div', null, 'approval-heading'); heading.append(node('strong', `${rule?.query || 'Product'} · replenishment blocked`), node('span', 'BLOCKED', 'approval-tag'));
+    card.append(heading, node('p', entry.message || 'Replenishment could not be completed.'));
+    const button = node('button', 'Retry after resolving issue', 'ghost-btn'); button.type = 'button';
+    button.onclick = () => perform(() => request('', { action: 'reset_episode', id: entry.id }));
+    card.append(button); cards.push(card);
+  }
+  $('approvals').replaceChildren(...cards);
 }
 function renderTelemetry() {
   const entries = (state.telemetry || []).slice(-80).reverse();
@@ -148,4 +168,4 @@ $('close-agent-chat').onclick = () => $('agent-chat').close();
 $('agent-chat').addEventListener('close', () => { if (chatDraftReady) { chatDraftReady = false; $('rule-details').open = true; $('rule').scrollIntoView({ behavior: 'smooth', block: 'center' }); $('rule').elements.minimum.focus({ preventScroll: true }); } });
 $('chat').onsubmit = async event => { event.preventDefault(); const form = event.currentTarget, button = form.querySelector('button'); button.disabled = true; $('reply').textContent = 'Preparing your rule…'; try { const result = await request('/chat', { text: new FormData(form).get('text') }); $('reply').textContent = result.message; if (result.proposal) { $('rule').elements.query.value = result.proposal.query; syncQuantity(); for (const [key, value] of Object.entries(result.proposal)) { const field = $('rule').elements.namedItem(key); if (field) field.value = value ?? ''; } $('rule-draft').textContent = 'Draft filled from your instruction. Edit and save to apply.'; chatDraftReady = true; } } catch (error) { $('reply').textContent = error.message; } finally { button.disabled = false; } };
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 1000);
