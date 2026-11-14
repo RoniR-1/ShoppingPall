@@ -17,6 +17,12 @@ export class ManagedAgent {
  s.connected=true;s.enabled=true;
  if(!s.inventory){s.inventory=new DemoStore().products.map(p=>({id:p.id,name:p.name,unit:p.sales_unit,on_hand:0}));for(const r of s.rules){let item=s.inventory.find(p=>p.name.toLowerCase()===r.query.toLowerCase()||p.id===r.query);if(!item){item={id:randomUUID(),name:r.query,unit:'ST',on_hand:0};s.inventory.push(item);}item.on_hand=r.on_hand;r.product_id=item.id;}}
  for(const item of s.inventory){item.net_contents=demoContents[item.id]||item.net_contents;item.baseUnit??=item.unit;item.units??=[{unitId:item.unit,sizeInBaseUnits:1}];item.allowedLotSize??=1;}
+ // Start the demo with one example rule; later saved rules remain available.
+ if(user==='demo-buyer'&&!s.initialRuleSetup){
+ if(s.rules.length)s.rules=s.rules.slice(0,1);
+ else {const item=s.inventory[0];if(item)s.rules.push({...ruleSchema.parse({query:item.name,minimum:10,target:20,on_hand:item.on_hand,price_unit:item.unit}),product_id:item.id,id:randomUUID(),version:1,sales_unit:item.unit,price_unit_factor:1});}
+ s.initialRuleSetup=true;
+ }
  return s;}
  chat(user,text){const s=this.state(user);const normalized=text.toLowerCase().replace(/atleast/g,'at least');
  const match=/at least\s+(\d+(?:\.\d+)?)\s+(?:units? of\s+)?(.+)/i.exec(normalized);

@@ -20,7 +20,19 @@ npm run seed &&
 npm start
 ```
 
-Only Docker needs sudo; run npm as your regular user. `--wait` waits for PostgreSQL's health check before seeding, and `&&` stops the sequence if a step fails. `ECONNREFUSED 127.0.0.1:5432` means the database is not accepting connections; resolve the Docker startup error first. The Node `url.parse()` deprecation warning does not cause this failure.
+Only Docker needs sudo; run npm as your regular user. `--wait` waits for PostgreSQL's health check before seeding, and `&&` stops the sequence if a step fails. `ECONNREFUSED 127.0.0.1:5432` means the database is not accepting connections; resolve the Docker startup error first.
+
+If an older `.env` has empty values, set `DATABASE_URL=postgresql://aimo:aimo@127.0.0.1:5432/aimo` and `VALIO_MOCK=true`. The database URL matches the local Compose credentials. An empty database URL previously caused `SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string`. Preserve any other credentials already in your `.env`.
+
+If npm prints `DEP0169` (`url.parse()`) or a retired audit endpoint notice, update the npm CLI. These warnings can come from older npm dependencies rather than application code. npm 12.2.2 requires Node 22.22.2+, 24.15.0+, or 26+:
+
+```sh
+npm install --global npm@12.2.2 --prefix "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+hash -r
+npm --version
+npm audit
+```
 
 In another terminal:
 
@@ -32,7 +44,7 @@ npm run cli -- approvals --user-id customer-123
 
 The first preset is automatically `APPROVED`; the second is `PENDING_APPROVAL`. Enter `a` or `r` in the approval console, or use `approve ORDER_UUID` / `reject ORDER_UUID` with `--user-id`. `approvals --list-only` prints without prompting. Both presets select products `460000` and `460001` from the local catalog, with at least one sales unit rounded up to a valid lot size. In live mode these products might be unavailable; deterministic demos use `VALIO_MOCK=true`.
 
-The workspace used during implementation has an ignored `.env` pointing to a temporary PostgreSQL instance at `127.0.0.1:55432`, database `aimo`, role `roni`. For a durable installation use the Compose volume and `.env.example` above. Source datasets are challenge-only, as stated in the supplied schema.
+The Compose database persists in the `aimo-data` volume. Source datasets are challenge-only, as stated in the supplied schema.
 
 ## Recipe agent
 
@@ -226,7 +238,7 @@ separation or move database ownership out of the orchestration process.
 ## Three-tier web procurement portal
 
 Run `npm install`, configure `.env` using `.env.example`, then `npm run seed`
-and `npm run web`. Open http://127.0.0.1:3001. Keep `VALIO_MOCK=true` for
+and `npm run web`. Open http://127.0.0.1:3001/user-agent-demo. Keep `VALIO_MOCK=true` for
 local simulated checkout. The existing `.env` is preserved, including credentials.
 
 The portal is served on FRONTEND_PORT (3001), proxies only to MIDDLE_LAYER_PORT

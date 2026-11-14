@@ -6,6 +6,11 @@ let settingsOpen = false;
 let lastExecOrder = null;
 let lastOrders = [];
 const acceptedQuestionsByOrder = new Map();
+let promptScenarios = [];
+let guidedScenario = null;
+let guidedIndex = -1;
+let guidedOrderId = null;
+let guidedOrderStatus = null;
 
 const esc = s => String(s ?? '—').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtNum = v => {
@@ -454,6 +459,8 @@ async function handleOrderDecision(e) {
           });
           acceptedQuestionsByOrder.delete(orderId);
           showExecution(approved);
+          if (guidedScenario && guidedOrderId === orderId) guidedOrderId = approved.id;
+          updateGuidedProgress(approved);
           await refresh();
         });
         return;
@@ -485,6 +492,8 @@ async function handleOrderDecision(e) {
         removeLines: [lineIndex]
       });
       showExecution(updated);
+      if (guidedScenario && guidedOrderId === el.dataset.id) guidedOrderId = updated.id;
+      updateGuidedProgress(updated);
       await refresh();
     });
     return;
@@ -506,6 +515,8 @@ async function handleOrderDecision(e) {
         quantities: { [lineIndex]: newQty }
       });
       showExecution(updated);
+      if (guidedScenario && guidedOrderId === el.dataset.id) guidedOrderId = updated.id;
+      updateGuidedProgress(updated);
       await refresh();
     });
     return;
@@ -538,6 +549,8 @@ async function handleOrderDecision(e) {
       acceptPartial: el.querySelector('.partial')?.checked || false
     });
     showExecution(updated);
+    if (guidedScenario && guidedOrderId === el.dataset.id) guidedOrderId = updated.id;
+    updateGuidedProgress(updated);
     await refresh();
   });
 }
@@ -560,9 +573,14 @@ async function submit() {
     const result = await api('/requests', {
       user_id: activeBuyer,
       text,
-      force_flag: !plainMode && $('force-flag').checked
+      force_flag: !plainMode && $('force-flag').checked,
+      demo_unavailable: Boolean(guidedScenario?.steps[guidedIndex]?.demoUnavailable)
     });
     showExecution(result);
+    if (guidedScenario) {
+      guidedOrderId = result.id;
+      updateGuidedProgress(result);
+    }
     await refresh();
   } catch (e) {
     if (lastExecOrder) showExecution(lastExecOrder);
@@ -638,5 +656,91 @@ $('source').onchange = () => run(async () => {
   showSettingsFeedback(`Switched catalog source to "${dataSource}".`, 'ok');
 });
 
+async function loadDemoScenarios() {
+  try {
+    const response = await fetch('/demo-prompts.json');
+    if (!response.ok) throw Error('Could not load demo prompts');
+    promptScenarios = await response.json();
+    $('demo-scenario').innerHTML = promptScenarios.map(s => `<option value="${esc(s.id)}">${esc(s.label)}</option>`).join('');
+    $('demo-scenario').onchange = () => {
+      const selected = promptScenarios.find(s => s.id === $('demo-scenario').value);
+      if (selected) $('scenario-help').textContent = `${selected.description} (${selected.steps.length} step${selected.steps.length === 1 ? '' : 's'}).`;
+    };
+    $('demo-scenario').dispatchEvent(new Event('change'));
+  } catch (error) {
+    $('demo-scenario').innerHTML = '<option value="">Sample prompts unavailable</option>';
+    $('scenario-help').textContent = error.message;
+  }
+}
+
+function loadScenarioStep(index) {
+  guidedIndex = index;
+  guidedOrderId = null;
+  guidedOrderStatus = null;
+  const step = guidedScenario.steps[index];
+  $('prompt').value = step.prompt;
+  $('force-flag').checked = false;
+  $('scenario-next').disabled = true;
+  $('scenario-help').textContent = `Step ${index + 1} of ${guidedScenario.steps.length} (${step.label}): Submit this prompt, then approve it if queued before continuing.`;
+  $('prompt').focus();
+}
+
+function updateGuidedProgress(order) {
+  if (!guidedScenario || !order || (guidedOrderId && order.id !== guidedOrderId)) return;
+  guidedOrderId = order.id;
+  guidedOrderStatus = order.status;
+  if (order.status === 'APPROVED') {
+    if (guidedIndex === guidedScenario.steps.length - 1) {
+      $('scenario-help').textContent = guidedScenario.completion || `Scenario complete — all ${guidedScenario.steps.length} prompts were processed.`;
+      $('scenario-next').disabled = true;
+    } else {
+      $('scenario-help').textContent = `Step ${guidedIndex + 1} approved. Click "Next prompt" to continue.`;
+      $('scenario-next').disabled = false;
+    }
+  } else if (order.status === 'REJECTED') {
+    $('scenario-help').textContent = `Step ${guidedIndex + 1} was discarded/rejected. Click "Start" to restart the scenario.`;
+    $('scenario-next').disabled = true;
+  } else {
+    $('scenario-help').textContent = `Step ${guidedIndex + 1} is waiting in the approval queue — review and approve it before continuing.`;
+    $('scenario-next').disabled = true;
+  }
+}
+
+$('scenario-start').onclick = () => run(async () => {
+  const scenario = promptScenarios.find(s => s.id === $('demo-scenario').value);
+  if (!scenario) throw Error('Choose a demo scenario first.');
+  dataSource = 'demo';
+  $('source').value = 'demo';
+  const freshBuyer = `scenario-${scenario.id}-${Date.now().toString(36).slice(-4)}`;
+  activeBuyer = freshBuyer;
+  const cfg = await api('/config?user_id=' + encodeURIComponent(activeBuyer));
+  $('threshold').value = cfg.threshold;
+  guidedScenario = scenario;
+  await api('/config', {
+    user_id: activeBuyer,
+    threshold: Number($('threshold').value) || 25,
+    stock: scenario.stock || 'normal'
+  });
+  resetExecutionView();
+  await refresh();
+  loadScenarioStep(0);
+});
+
+$('scenario-next').onclick = () => run(async () => {
+  if (!guidedScenario || guidedOrderStatus !== 'APPROVED') throw Error('Submit and approve the current prompt before continuing.');
+  if (guidedIndex >= guidedScenario.steps.length - 1) {
+    $('scenario-next').disabled = true;
+    $('scenario-help').textContent = guidedScenario.completion || 'Scenario complete.';
+    return;
+  }
+  await api('/config', {
+    user_id: activeBuyer,
+    threshold: Number($('threshold').value) || 25,
+    stock: guidedScenario.stock || 'normal'
+  });
+  loadScenarioStep(guidedIndex + 1);
+});
+
 applyPlainMode();
+loadDemoScenarios();
 run(refresh);

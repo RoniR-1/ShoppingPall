@@ -120,16 +120,18 @@ function snapToLot(qty,lot){
   return round3(steps*validLot);
 }
 
-async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={}){
+async function plan(lines,user,force_flag=false,approved={},demo_unavailable=false,context=null,pinned={},actionId=null){
+  if(typeof pinned==='string'){actionId=pinned;pinned={};}
   const o={
-    id:randomUUID(),
+    id:actionId||randomUUID(),
+    context,
+    agent_type:context?.agent?.type||'custom',
     user_id:user,
     created_at:new Date().toISOString(),
     lines,
     force_flag,
     demo_unavailable,
     approved,
-    ...(context?{context}:{}),
     items:[],
     issues:[],
     steps:['Parsed request with Gemini'],
@@ -194,6 +196,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
         ...p,
         productId:p.id,
         unit:p.sales_unit,
+        currency:price?.priceWithTax?.currency||price?.catalogPrice?.currency||prices.currency||'EUR',
         lot:round3(Number(p.allowed_lot_size)||1),
         available,
         in_stock:available>0,
@@ -284,6 +287,8 @@ Rules:
           productId:p.productId,
           name:p.name,
           unit:p.unit,
+          net_contents:p.net_contents,
+          currency:p.currency,
           lot:p.lot,
           quantity,
           available:p.available,
@@ -351,8 +356,8 @@ Rules:
 }
 
 const managedAgent=new ManagedAgent({
-  file:'.local/managed-agent.json',
-  submit:(lines,user,context)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context)),
+  file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',
+  submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,{},id)),
   listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user)))
 });
 const managedReady=managedAgent.load().catch(()=>{});
@@ -360,13 +365,16 @@ async function managedStatePayload(user){
   await managedReady;
   const s=managedAgent.state(user);
   const orders=await core('/internal/orders?user_id='+encodeURIComponent(user));
-  return {...structuredClone(s),preview:managedAgent.preview(user),orders};
+  return {...structuredClone(s),preview:managedAgent.preview(user),orders,simulated:true};
 }
 
+app.use('/portal/managed-agent',(req,res,next)=>{
+  if(sourceContext.getStore()!=='demo')return res.status(422).json({error:'Managed agent currently supports simulated Demo warehouse only'});
+  next();
+});
 app.get('/portal/managed-agent',async(req,res)=>{
   const user=z.string().trim().min(1).max(100).default('demo-buyer').parse(req.query.user_id);
   await managedReady;
-  await managedAgent.tick(user);
   res.json(await managedStatePayload(user));
 });
 app.post('/portal/managed-agent',async(req,res)=>{
@@ -381,6 +389,7 @@ app.post('/portal/managed-agent/chat',async(req,res)=>{
   await managedReady;
   res.json(managedAgent.chat(b.user_id,b.text));
 });
+setInterval(()=>{for(const user of Object.keys(managedAgent.states))managedAgent.tick(user).catch(()=>{});},30000).unref();
 
 app.get('/portal/catalog-overview',async(req,res)=>{
   const q=encodeURIComponent(String(req.query.q||''));

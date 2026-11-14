@@ -4,15 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>shopping pal</title>
-  <link id="theme-css" rel="stylesheet" href="style.css">
+  <link id="theme-css" rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-left" data-chrome>
-      <a class="brand" href="/">shopping pal</a>
+      <a class="brand" href="/user-agent-demo">shopping pal</a>
       <span id="source-status" class="status-tag">postgres · 17,546 items</span>
     </div>
     <div class="topbar-right">
+      <a class="nav-link" href="/managed-agent" data-chrome>Managed agent</a>
       <label class="checkbox-label"><input type="checkbox" id="plain-mode"><span>Plain</span></label>
       <span class="buyer-tag" data-chrome>buyer: <strong id="buyer-label">demo-buyer</strong></span>
       <button id="toggle" class="ghost-btn small-btn" type="button" data-chrome>Settings</button>
@@ -134,6 +135,21 @@
           <pre id="raw"></pre>
         </details>
       </section>
+
+      <details class="panel history-panel scenarios-panel" id="scenarios-wrap" data-chrome>
+        <summary class="panel-bar history-summary">
+          <span>Guided demo scenarios <span class="muted">(presets)</span></span>
+          <span class="muted toggle-hint">Show / hide</span>
+        </summary>
+        <div class="demo-prompt-controls">
+          <div class="demo-prompt-actions">
+            <select id="demo-scenario" aria-label="Choose a demo scenario"><option value="">Loading scenarios…</option></select>
+            <button id="scenario-start" class="ghost-btn small-btn" type="button">Start</button>
+            <button id="scenario-next" class="ghost-btn small-btn" type="button" disabled>Next prompt</button>
+          </div>
+          <p id="scenario-help" class="muted" aria-live="polite">Start a scenario, submit each loaded prompt, and approve any baseline order before continuing.</p>
+        </div>
+      </details>
     </div>
 
     <div class="col">
@@ -158,6 +174,6 @@
     </div>
   </main>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

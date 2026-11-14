@@ -13,6 +13,7 @@ export const orderRequest = z.object({ quote_id: z.string().uuid(), force_flag: 
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
+
 export function assert(condition, status, message) { if (!condition) throw new HttpError(status, message); }
 export function round3(value) {
   if (value === null || value === undefined || value === '') return value;

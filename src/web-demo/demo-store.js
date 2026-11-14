@@ -8,8 +8,8 @@ export const demoContents={
 // Entirely local, process-memory demo. No credentials or database connection.
 export class DemoStore {
  constructor(){
-  const fixtures=[['demo-beer','Lager beer','demo-dark-beer'],['demo-dark-beer','Dark beer','demo-beer'],['demo-eggs','Eggs',null],['demo-dark-chocolate','Dark chocolate','demo-milk-chocolate'],['demo-milk-chocolate','Milk chocolate','demo-dark-chocolate'],['demo-milk','Milk',null],['demo-potato-salad','Potato salad',null]];
-  this.products=fixtures.map(([id,name,sub])=>({id,name,net_contents:demoContents[id],search_text:name.toLowerCase(),sales_unit:'ST',allowed_lot_size:1,carbon_kg_co2_per_kg:null,delivery_reliability:null,raw:{substitutions:sub?[{product:id,substituteProduct:sub}]:[]}}));
+  const fixtures=[['demo-beer','Lager beer','demo-dark-beer',[]],['demo-dark-beer','Dark beer','demo-beer',[]],['demo-eggs','Eggs',null,[]],['demo-dark-chocolate','Dark chocolate','demo-milk-chocolate',[]],['demo-milk-chocolate','Milk chocolate','demo-dark-chocolate',['milk']],['demo-milk','Milk',null,['milk']],['demo-potato-salad','Potato salad',null,['milk']]];
+  this.products=fixtures.map(([id,name,sub,allergens])=>({id,name,allergens,net_contents:demoContents[id],search_text:name.toLowerCase(),sales_unit:'ST',allowed_lot_size:1,carbon_kg_co2_per_kg:null,delivery_reliability:null,raw:{substitutions:sub?[{product:id,substituteProduct:sub}]:[]}}));
   this.orders=new Map();this.buyers=new Map([['demo-buyer',this.#normThreshold(process.env.SUSPICION_THRESHOLD??25)]]);this.reset('normal');
  }
  #normThreshold(v){const n=Number(v);if(!Number.isFinite(n)||n<0)throw Error('Invalid threshold');return Math.round(n*1000)/1000;}
@@ -53,7 +53,7 @@ export class DemoStore {
    const minQty=bought?Math.round(Math.min(...hits)*1000)/1000:0;
    const avgQty=bought?Math.round((hits.reduce((a,b)=>a+b,0)/bought)*1000)/1000:0;
    const rank=p.search_text===q?4:p.search_text.startsWith(q)?3:1;
-   return {...p,match_rank:rank,allergen_safe:true,bought_count:bought,human_approved_count:humanCount,prior_max_qty:maxQty,prior_min_qty:minQty,prior_avg_qty:avgQty};
+   return {...p,match_rank:rank,allergen_safe:!(p.allergens||[]).includes('milk'),bought_count:bought,human_approved_count:humanCount,prior_max_qty:maxQty,prior_min_qty:minQty,prior_avg_qty:avgQty};
   });
  }
  overview(){const row=p=>({...p,quantity:this.stock.get(p.id)});return {mocked:true,products:this.products.map(p=>({...row(p),substitutions:p.raw.substitutions.map(s=>row(this.products.find(p=>p.id===s.substituteProduct)))}))};}
@@ -70,7 +70,7 @@ export class DemoStore {
    for(const [id,quantity]of totals)this.stock.set(id,this.stock.get(id)-quantity);
    if(human)o.human_approved=true;
   }
-  o.status=action==='approve'?'APPROVED':'REJECTED';o.steps.push(action==='approve'?'Demo purchase completed · stock updated':'Order rejected');return structuredClone(o);
+  o.status=action==='approve'?'APPROVED':'REJECTED';if(action==='approve'&&human)o.human_approved=true;o.steps.push(action==='approve'?'Demo purchase completed · stock updated':'Order rejected');return structuredClone(o);
  }
  live(kind,r){return kind==='price'?{customerId:r.customer,currency:'EUR',pricingDate:r.requestedDate,products:r.products.map(productId=>({productId,quantity:1,netPriceFound:false,error:!this.stock.has(productId),priceWithTax:{value:2.5,currency:'EUR',validFrom:r.requestedDate,validTo:r.requestedDate}}))}:{timeNow:new Date().toISOString(),requestedDate:r.requestedDate,products:r.products.map(productId=>({productId,salesBlock:false,logisticModel:'Stock',closingTime:null,scheduleLines:[{availableAmount:this.stock.get(productId)||0,availableDate:r.requestedDate,salesUnit:'ST',salesBlock:false}]}))};}
 }
