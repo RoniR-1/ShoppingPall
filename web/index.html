@@ -4,17 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>shopping pal</title>
-  <link rel="stylesheet" href="style.css">
+  <link id="theme-css" rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="topbar-left">
+    <div class="topbar-left" data-chrome>
       <a class="brand" href="/">shopping pal</a>
       <span id="source-status" class="status-tag">postgres · 17,546 items</span>
     </div>
     <div class="topbar-right">
-      <span class="buyer-tag">buyer: <strong id="buyer-label">demo-buyer</strong></span>
-      <button id="toggle" class="ghost-btn small-btn" type="button">Settings</button>
+      <label class="checkbox-label"><input type="checkbox" id="plain-mode"><span>Plain</span></label>
+      <span class="buyer-tag" data-chrome>buyer: <strong id="buyer-label">demo-buyer</strong></span>
+      <button id="toggle" class="ghost-btn small-btn" type="button" data-chrome>Settings</button>
     </div>
   </header>
 
@@ -51,16 +52,16 @@
 
   <main class="container">
     <section class="panel request-panel">
-      <div class="panel-bar">
+      <div class="panel-bar" data-chrome>
         <span>01 · Order input</span>
         <span class="muted">Ctrl+Enter to submit</span>
       </div>
       <div class="prompt-wrap">
-        <span class="prompt-prefix">&gt;</span>
+        <span class="prompt-prefix" data-chrome>&gt;</span>
         <textarea id="prompt" rows="2" placeholder="Enter query here"></textarea>
       </div>
       <div class="request-footer">
-        <label class="checkbox-label">
+        <label class="checkbox-label" data-chrome>
           <input type="checkbox" id="force-flag">
           <span>Require manual review (--force-flag)</span>
         </label>
@@ -69,12 +70,12 @@
     </section>
 
     <section class="panel" id="execution" hidden>
-      <div class="panel-bar">
+      <div class="panel-bar" data-chrome>
         <span id="exec-title">Execution result</span>
         <span id="exec-badge" class="badge"></span>
       </div>
       <div id="item-summary"></div>
-      <details class="trace-details">
+      <details class="trace-details" data-chrome>
         <summary>+ Trace log &amp; raw JSON</summary>
         <ol id="steps" class="steps-list"></ol>
         <pre id="raw"></pre>
@@ -82,7 +83,7 @@
     </section>
 
     <section class="panel">
-      <div class="panel-bar">
+      <div class="panel-bar" data-chrome>
         <div>
           <span>02 · Approval queue</span>
           <span class="muted">(<span id="count">0</span> pending)</span>
@@ -92,7 +93,7 @@
       <div id="orders"></div>
     </section>
 
-    <details class="panel history-panel" id="history-wrap">
+    <details class="panel history-panel" id="history-wrap" data-chrome>
       <summary class="panel-bar history-summary">
         <span>03 · Order log <span class="muted">(<span id="history-count">0</span> processed)</span></span>
         <span class="muted toggle-hint">Show / hide</span>
@@ -100,7 +101,7 @@
       <div id="history-orders"></div>
     </details>
 
-    <section class="panel catalog-panel">
+    <section class="panel catalog-panel" data-chrome>
       <div class="panel-bar">
         <span>04 · Catalog lookup</span>
       </div>

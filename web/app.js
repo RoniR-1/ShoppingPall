@@ -1,6 +1,9 @@
 const $ = id => document.getElementById(id);
 let dataSource = 'real';
 let toastTimer = null;
+let plainMode = localStorage.getItem('plainMode') === '1';
+let lastExecOrder = null;
+let lastOrders = [];
 
 const esc = s => String(s ?? '—').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtNum = v => {
@@ -91,7 +94,36 @@ function renderItemsTable(items) {
   </table>`;
 }
 
+function renderPlainCard(o, interactive = true) {
+  const total = o.total ?? o.items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.price || 0), 0);
+  const itemsText = o.items?.length
+    ? o.items.map(i => `#${esc(i.productId)} × ${fmtNum(i.quantity)} ${esc(i.unit)} (${fmtMoney(i.lineTotal ?? Number(i.quantity) * Number(i.price))})`).join(', ')
+    : 'none';
+  const issuesHtml = (o.issues || []).map(i => `
+    <div>
+      <span>${esc(i.reason)} (-${fmtNum(i.shortfall)})</span>
+      ${interactive && i.options?.length ? `<select data-line="${i.index}">
+        <option value="">alt…</option>
+        ${i.options.slice(0, 8).map(p => `<option value="${esc(p.productId)}">#${esc(p.productId)} (${esc(p.unit)}) ${fmtMoney(p.price)} [${fmtNum(p.available)}]</option>`).join('')}
+      </select>` : ''}
+    </div>
+  `).join('');
+  const partialHtml = interactive && o.incomplete && o.items?.length
+    ? `<label><input type="checkbox" class="partial"> partial</label>`
+    : '';
+  const actionsHtml = interactive && o.status === 'PENDING_APPROVAL'
+    ? ` <button data-action="approve" type="button">${o.incomplete ? 'apply' : 'ok'}</button> <button data-action="reject" type="button">no</button>`
+    : '';
+  const state = o.status === 'APPROVED' ? 'ok' : o.status === 'REJECTED' ? 'no' : 'hold';
+  return `<div class="order-card" data-id="${esc(o.id)}">
+    <div><code>${state} ${fmtNum(o.score)}/${fmtNum(o.threshold)}</code> | ${itemsText} | ${fmtMoney(total)}${actionsHtml}</div>
+    ${issuesHtml}
+    ${partialHtml}
+  </div>`;
+}
+
 function renderOrderCard(o, interactive = true) {
+  if (plainMode) return renderPlainCard(o, interactive);
   const total = o.total ?? o.items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.price || 0), 0);
   const title = o.lines?.map(l => l.requested || `${fmtNum(l.quantity)} × ${l.query}`).join(', ') || o.id;
   const issuesHtml = (o.issues || []).map(i => `
@@ -133,7 +165,8 @@ function renderOrderCard(o, interactive = true) {
   </article>`;
 }
 
-function showExecution(o) {
+function showExecution(o, announce = true) {
+  lastExecOrder = o;
   $('execution').hidden = false;
   const badgeEl = $('exec-badge');
   badgeEl.className = `badge ${o.status === 'APPROVED' ? 'approved' : o.status === 'REJECTED' ? 'rejected' : 'pending'}`;
@@ -141,8 +174,43 @@ function showExecution(o) {
   $('item-summary').innerHTML = renderOrderCard(o, o.status === 'PENDING_APPROVAL');
   $('steps').innerHTML = (o.steps || []).map(s => `<li>${esc(s)}</li>`).join('');
   $('raw').textContent = JSON.stringify(o, null, 2);
-  notify(`${statusLabel(o.status)} — ${o.reason || 'Order processed'}`);
+  if (announce) notify(plainMode ? `${o.status === 'APPROVED' ? 'ok' : o.status === 'REJECTED' ? 'no' : 'hold'} (${fmtNum(o.score)}/${fmtNum(o.threshold)})` : `${statusLabel(o.status)} — ${o.reason || 'Order processed'}`);
 }
+
+function renderOrders(orders) {
+  lastOrders = orders;
+  const pending = orders.filter(o => o.status === 'PENDING_APPROVAL');
+  const history = orders.filter(o => o.status !== 'PENDING_APPROVAL');
+
+  $('count').textContent = pending.length;
+  $('orders').innerHTML = pending.length
+    ? pending.map(o => renderOrderCard(o, true)).join('')
+    : (plainMode ? '' : '<div class="empty">No orders waiting for human approval.</div>');
+
+  $('history-count').textContent = history.length;
+  $('history-orders').innerHTML = history.length
+    ? history.slice(0, 15).map(o => renderOrderCard(o, false)).join('')
+    : '<div class="empty">No processed orders yet.</div>';
+}
+
+function applyPlainMode() {
+  $('plain-mode').checked = plainMode;
+  $('theme-css').disabled = plainMode;
+  document.title = plainMode ? 'notes' : 'shopping pal';
+  document.querySelectorAll('[data-chrome]').forEach(el => { el.hidden = plainMode; });
+  if (plainMode) $('setup').hidden = true;
+  $('prompt').rows = plainMode ? 1 : 2;
+  $('prompt').placeholder = plainMode ? '' : 'Enter query here';
+  $('submit').textContent = plainMode ? 'Run' : 'Run order';
+  if (lastExecOrder) showExecution(lastExecOrder, false);
+  renderOrders(lastOrders);
+}
+
+$('plain-mode').onchange = () => {
+  plainMode = $('plain-mode').checked;
+  localStorage.setItem('plainMode', plainMode ? '1' : '0');
+  applyPlainMode();
+};
 
 async function refresh() {
   $('buyer-label').textContent = $('user').value;
@@ -153,18 +221,7 @@ async function refresh() {
     : 'demo · 7 items';
 
   const orders = await api('/orders?user_id=' + encodeURIComponent($('user').value));
-  const pending = orders.filter(o => o.status === 'PENDING_APPROVAL');
-  const history = orders.filter(o => o.status !== 'PENDING_APPROVAL');
-
-  $('count').textContent = pending.length;
-  $('orders').innerHTML = pending.length
-    ? pending.map(o => renderOrderCard(o, true)).join('')
-    : '<div class="empty">No orders waiting for human approval.</div>';
-
-  $('history-count').textContent = history.length;
-  $('history-orders').innerHTML = history.length
-    ? history.slice(0, 15).map(o => renderOrderCard(o, false)).join('')
-    : '<div class="empty">No processed orders yet.</div>';
+  renderOrders(orders);
 }
 
 async function handleOrderDecision(e) {
@@ -192,13 +249,13 @@ $('item-summary').onclick = handleOrderDecision;
 async function submit() {
   const text = $('prompt').value.trim();
   if (!text) {
-    notify('Please enter what you want to order.');
+    notify(plainMode ? 'empty' : 'Please enter what you want to order.');
     return;
   }
   $('execution').hidden = false;
   $('exec-badge').className = 'badge pending';
   $('exec-badge').textContent = 'Processing…';
-  $('item-summary').innerHTML = '<p class="order-meta">Matching products and checking stock with Gemini…</p>';
+  $('item-summary').innerHTML = plainMode ? '<p>…</p>' : '<p class="order-meta">Matching products and checking stock with Gemini…</p>';
   const result = await api('/requests', {
     user_id: $('user').value,
     text,
@@ -292,4 +349,5 @@ $('catalog-clear-btn').onclick = () => {
   $('catalog-clear-btn').hidden = true;
 };
 
+applyPlainMode();
 run(refresh);
