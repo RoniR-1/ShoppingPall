@@ -36,6 +36,13 @@ test('managed portal serves its page, drafts rules, enforces caps and reconciles
     });
   }
   const base=`http://127.0.0.1:${ports[0]}`;
+  const unsafe=await fetch(base+'/portal/requests',{method:'POST',headers:{'Content-Type':'application/json','X-Data-Source':'demo'},body:JSON.stringify({user_id:'buyer',text:'i want to fucking kill myself and then eat 2 kebabs and 2 apples and 2 dicks'})});
+  assert.equal(unsafe.status,422);
+  const support=await unsafe.json();
+  assert.equal(support.code,'SUPPORT_NEEDED');
+  assert.match(support.error,/No order was placed/);
+  const empty=await fetch(base+'/portal/orders?user_id=buyer',{headers:{'X-Data-Source':'demo'}});
+  assert.deepEqual(await empty.json(),[]);
   async function api(path,body,source='demo'){
     const response=await fetch(base+'/portal'+path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json','X-Data-Source':source},body:body?JSON.stringify(body):undefined});
     assert.equal(response.status,200,await response.clone().text());

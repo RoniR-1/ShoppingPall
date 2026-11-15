@@ -561,7 +561,7 @@ test('Luna HTTP errors, refusal and malformed responses stop inference', async (
     [async()=>new Response('bad request',{status:400}), /failed \(400\)/],
     [async()=>new Response('unavailable',{status:503}), /failed \(503\)/],
     [async()=>{throw new TypeError('fetch failed');}, /unavailable or timed out/],
-    [async()=>Response.json({choices:[{message:{content:'{"items":'}}]}), /invalid JSON/]
+    [async()=>Response.json({choices:[{message:{content:'{"items":'}}]}), /rephrase the products and quantities.*no order was placed/]
   ]) await assert.rejects(lunaJSON('test',z.object({}),fetcher,lunaEnv),pattern);
 });
 for (const items of [

@@ -288,6 +288,17 @@ observes warehouse stock above the minimum. Pausing/disconnecting stops future
 checks; it does not cancel already-created orders. Demo orders and supplier
 stock remain in the core's process memory and reset when core restarts.
 
+State operations wait briefly for a live lock holder. A lock with a recorded
+owner is recovered automatically only when that owner is on the same host and
+the operating system confirms its process is gone. Locks are never reclaimed
+based on age: a long supplier call may still be in progress. An older ownerless
+lock, an unverifiable owner, or an abandoned recovery gate needs operator
+inspection. Stop all processes that share the affected state file, preserve the
+state and reconcile any uncertain dispatches against orders, then remove only
+the inspected stale `<state-file>.lock` and, if present,
+`<state-file>.lock.recovery` directories before restarting. The real inventory
+simulation uses the same locking behavior for its separate state file.
+
 This is not the production architecture described in the design: no real
 inventory connector, OAuth/credential vault, authenticated tenant identities,
 agent scopes, shared transactional spending reservations, database-backed jobs,
