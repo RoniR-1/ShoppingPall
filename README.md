@@ -27,7 +27,11 @@ The workspace used during implementation has an ignored `.env` pointing to a tem
 
 ## Recipe agent
 
-Set `LUNA_BASE_URL` to your OpenAI-compatible API base URL and `LUNA_API_KEY` to its key in `.env`. Set `LUNA_MODEL` to the provider's model name (default `gemini-2.5-flash`) and optionally `LUNA_TIMEOUT_MS` to a positive timeout in milliseconds (default 60000). The CLI and portal use the same Luna configuration. Then run:
+Set `LUNA_BASE_URL` to your OpenAI-compatible API base URL and `LUNA_API_KEY` to its key in `.env`. Set `LUNA_MODEL` to the provider's model name (default `gemini-2.5-flash`) and optionally `LUNA_TIMEOUT_MS` to a positive timeout in milliseconds (default 60000). The CLI and portal use the same Luna configuration.
+
+For a Google Gemini API key, the OpenAI-compatible base URL is `https://generativelanguage.googleapis.com/v1beta/openai/`; the AI Studio API keys page is not an API endpoint. Use a key issued for the configured provider.
+
+Then run:
 
 ```sh
 npm run cli -- agent --user-id customer-123 --recipe "50 portions of creamy salmon soup" --date 2026-11-16

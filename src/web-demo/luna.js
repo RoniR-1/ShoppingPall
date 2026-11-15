@@ -53,6 +53,9 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
   try {
     payload = JSON.parse(raw);
   } catch {
+    if (response.ok && (/\btext\/html\b/i.test(response.headers?.get('content-type') || '') || /^\s*<(?:!doctype\s+html|html)\b/i.test(raw))) {
+      throw aiError('AI provider returned a web page instead of an API response. Check that LUNA_BASE_URL is the provider\'s OpenAI-compatible API base URL, not its website.', 502, 'AI_INVALID_RESPONSE');
+    }
     if (response.ok) throw aiError('AI provider returned malformed JSON', 502, 'AI_INVALID_RESPONSE');
     payload = {};
   }

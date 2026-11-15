@@ -22,3 +22,11 @@ test('provider refusal and invalid content fail closed with actionable errors', 
  await assert.rejects(request({message:{refusal:'no',content:null}}),{code:'AI_REFUSAL',status:422});
  await assert.rejects(request({message:{content:'Sorry, cannot help'}}),e=>e.code==='AI_INVALID_RESPONSE'&&e.message.includes('no order was placed'));
 });
+
+test('a provider website returned in place of the API response identifies the base URL problem', async () => {
+ const env={LUNA_BASE_URL:'https://example.com/api-keys',LUNA_API_KEY:'secret'};
+ for(const [body,headers] of [['<!doctype html><html></html>',{}],['web page',{'Content-Type':'text/html; charset=utf-8'}]]) {
+  await assert.rejects(callGeminiJSON('system','user',{env,fetchImpl:async()=>new Response(body,{status:200,headers})}),
+   e=>e.code==='AI_INVALID_RESPONSE'&&e.message.includes('LUNA_BASE_URL')&&e.message.includes('API base URL'));
+ }
+});
