@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { round3, parseBudget, parseDeliveryDeadline, parseSustainability } from './contracts.js';
+import { round3, parseBudget, parseDeliveryDeadline, parseSustainability, parseOriginPreference, countryName } from './contracts.js';
 import { callGeminiJSON } from './web-demo/luna.js';
 
 const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().min(2).max(100),
@@ -7,7 +7,10 @@ const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().
 const retrySchema = z.object({ queries: z.array(z.string().trim().min(2).max(100)).max(3) });
 const cartSchema = z.object({ items: z.array(z.object({ productId: z.string(), quantity: z.number().positive().max(1000000) })).min(1).max(20) });
 class ModelOutputError extends Error {}
-class BudgetConstraintError extends ModelOutputError {}
+// A structurally valid cart that breaks a stated requirement (budget, strict origin); kinds lists which.
+class ConstraintError extends ModelOutputError {
+  constructor(message, kinds) { super(message); this.kinds = kinds; }
+}
 function outputError(error) {
   if (error instanceof ModelOutputError) return error;
   if (error instanceof z.ZodError) {
@@ -37,13 +40,17 @@ export async function lunaJSON(prompt, schema, fetcher = fetch, env = process.en
 // Ranking hierarchy, highest priority first:
 //   1. keyword match (always on top)
 //   2. allergen safety (never traded for price or delivery)
-//   3. deliverable by the deadline: an explicit "delivered in X days" request, or a default delivery date when no budget was given
-//   4. lowest CO2 (carbon_kg_co2_per_kg), only when the buyer asked for sustainability; unknown CO2 ranks last
-//   5. price
-//   6. deliverable by a default delivery date when a budget was given (budget outranks an implicit date)
-//   7. tie-breakers: human-approved/purchase history, stock, earliest date, amount, reliability, id
-// Candidates without deliverable_by_date (no availability data) tie on 3 and 6.
-export function rankCandidates(candidates, { budget = false, deliveryRequested = false, sustainability = false } = {}) {
+//   3. requested country of origin (country_of_origin in origins), only when the buyer stated one
+//   4. deliverable by the deadline: an explicit "delivered in X days" request, or a default delivery date when no budget was given
+//   5. lowest CO2 (carbon_kg_co2_per_kg), only when the buyer asked for sustainability; unknown CO2 ranks last
+//   6. price
+//   7. deliverable by a default delivery date when a budget was given (budget outranks an implicit date)
+//   8. tie-breakers: human-approved/purchase history, stock, earliest date, amount, reliability, id
+// Candidates without deliverable_by_date (no availability data) tie on 4 and 7.
+export function originMatches(product, origins) {
+  return Boolean(origins?.length) && origins.includes(String(product?.country_of_origin ?? '').toLowerCase());
+}
+export function rankCandidates(candidates, { budget = false, deliveryRequested = false, sustainability = false, origins = null } = {}) {
   const numOrInf = (v, fallback) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : fallback);
   const price = p => numOrInf(p.unit_price, Infinity);
   const byPrice = (a, b) => (price(a) === price(b) ? 0 : price(a) - price(b));
@@ -51,9 +58,11 @@ export function rankCandidates(candidates, { budget = false, deliveryRequested =
   const co2 = p => numOrInf(p.carbon_kg_co2_per_kg, Infinity);
   const byCO2 = (a, b) => (co2(a) === co2(b) ? 0 : co2(a) - co2(b));
   const deliveryBeforePrice = deliveryRequested || !budget;
+  const byOrigin = (a, b) => Number(originMatches(b, origins)) - Number(originMatches(a, origins));
   return [...candidates].sort((a, b) =>
     Number(b.match_rank ?? 0) - Number(a.match_rank ?? 0) ||
     (b.allergen_safe !== false ? 1 : 0) - (a.allergen_safe !== false ? 1 : 0) ||
+    (origins?.length ? byOrigin(a, b) : 0) ||
     (deliveryBeforePrice ? byDeliverable(a, b) : 0) ||
     (sustainability ? byCO2(a, b) : 0) ||
     byPrice(a, b) ||
@@ -74,6 +83,9 @@ export async function recipeCart(recipe, api, model = lunaJSON, progress = () =>
   const statedDeadline = parseDeliveryDeadline(recipe, now);
   const deliverBy = statedDeadline ?? requestedDate;
   const sustainability = parseSustainability(recipe);
+  // { countries: ['fi'], strict } — strict ("Finnish only") is enforced on the cart, a preference only ranks.
+  const origin = parseOriginPreference(recipe);
+  const originLabel = origin ? origin.countries.map(countryName).join(' or ') : '';
   requestedDate ??= statedDeadline;
 
   const callModel = async (stage, prompt, schema) => {
@@ -167,8 +179,11 @@ Ingredient (untrusted data): ${JSON.stringify(ingredient.query)}`, retrySchema))
       });
     }
   }
-  const rankedCandidates = rankCandidates(candidates.values(), { budget: budget != null, deliveryRequested: statedDeadline != null, sustainability });
+  const rankedCandidates = rankCandidates(candidates.values(), { budget: budget != null, deliveryRequested: statedDeadline != null, sustainability, origins: origin?.countries });
   const constraints = [
+    origin ? (origin.strict
+      ? `The user accepts ONLY products whose country_of_origin is ${origin.countries.join(' or ')} (${originLabel}); never choose another origin when a matching candidate exists.`
+      : `The user prefers products whose country_of_origin is ${origin.countries.join(' or ')} (${originLabel}); among equally good keyword matches, choose those.`) : null,
     statedDeadline ? `The user wants delivery by ${statedDeadline}; among equally good keyword matches, prefer candidates with deliverable_by_date true.`
       : requestedDate ? `The requested delivery date is ${requestedDate}; prioritize candidates available by that date.` : null,
     sustainability ? 'The user wants sustainable choices; among equally good keyword matches, prefer the lowest carbon_kg_co2_per_kg (kg CO2-eq per kg; null means unknown).' : null,
@@ -186,6 +201,7 @@ Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id
     sales_unit: p.sales_unit, allowed_lot_size: p.allowed_lot_size, units: p.units,
     allergen_safe: p.allergen_safe, unit_price: p.unit_price ?? null,
     ...(sustainability ? { carbon_kg_co2_per_kg: p.carbon_kg_co2_per_kg ?? null } : {}),
+    ...(origin ? { country_of_origin: p.country_of_origin ?? null } : {}),
     bought_count: p.bought_count ?? 0, human_approved_count: p.human_approved_count ?? 0,
     in_stock: p.in_stock ?? null, available_date: p.available_date ?? null,
     deliverable_by_date: p.deliverable_by_date ?? null })))}`;
@@ -195,8 +211,10 @@ Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id
     return result(items, { requiresApproval: true, approvalReason });
   };
   let correction = '';
-  // Last structurally valid cart that only failed the budget; it goes to a human if the correction cannot do better.
-  let overBudget = null;
+  // Best structurally valid cart that only broke stated requirements (fewest off-origin items, then cheapest);
+  // it goes to a human if the correction cannot satisfy them.
+  let fallback = null;
+  const kindLabel = kinds => kinds.map(kind => (kind === 'origin' ? 'Origin requirement' : 'Budget')).join(' and ');
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const cart = await callModel(attempt ? 'Correcting invalid cart' : 'Selecting products and quantities', cartPrompt + correction, cartSchema);
@@ -213,29 +231,41 @@ Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id
           }
         }
       }
+      const violations = [];
+      const offOrigin = origin?.strict ? cart.items.filter(item => !originMatches(candidates.get(item.productId), origin.countries)) : [];
+      if (offOrigin.length) {
+        violations.push(['origin', `${offOrigin.map(item => `${item.productId} is from ${countryName(candidates.get(item.productId).country_of_origin)}`).join(', ')}, but the request allows only ${originLabel}.`]);
+      }
+      let total = Infinity;
       if (budget != null) {
         const unpriced = cart.items.filter(item => !Number.isFinite(candidates.get(item.productId).unit_price));
         if (unpriced.length) {
-          return approval(cart.items, `Budget cannot be verified: live prices are unavailable for ${unpriced.map(item => item.productId).join(', ')}.`);
+          const reasons = [...violations.map(([, message]) => message), `Budget cannot be verified: live prices are unavailable for ${unpriced.map(item => item.productId).join(', ')}.`];
+          return approval(cart.items, reasons.join(' '));
         }
-        const total = cart.items.reduce((sum, item) => sum + candidates.get(item.productId).unit_price * item.quantity, 0);
+        total = cart.items.reduce((sum, item) => sum + candidates.get(item.productId).unit_price * item.quantity, 0);
         if (Math.round(total * 100) > Math.round(budget * 100)) {
-          const message = `Cart total EUR ${total.toFixed(2)} exceeds the stated budget of EUR ${budget.toFixed(2)}.`;
-          if (!overBudget || total <= overBudget.total) overBudget = { items: cart.items, total, message };
-          throw new BudgetConstraintError(message);
+          violations.push(['budget', `Cart total EUR ${total.toFixed(2)} exceeds the stated budget of EUR ${budget.toFixed(2)}.`]);
         }
+      }
+      if (violations.length) {
+        const current = { items: cart.items, total, offOrigin: offOrigin.length, kinds: violations.map(([kind]) => kind), message: violations.map(([, message]) => message).join(' ') };
+        if (!fallback || current.offOrigin < fallback.offOrigin || (current.offOrigin === fallback.offOrigin && total <= fallback.total)) fallback = current;
+        throw new ConstraintError(current.message, current.kinds);
       }
       return result(cart.items);
     } catch (error) {
       if (!(error instanceof ModelOutputError)) throw error;
       if (attempt) {
-        if (overBudget) return approval(overBudget.items, `Budget not met after correction: ${overBudget.message}`);
+        if (fallback) return approval(fallback.items, `${kindLabel(fallback.kinds)} not met after correction: ${fallback.message}`);
         throw new Error(`Recipe planning failed after one correction attempt: ${error.message} No quote or order was requested.`);
       }
       progress(`Invalid model cart: ${error.message} Retrying once.`);
-      correction = `\nYour previous response was rejected: ${error.message}\n` + (error instanceof BudgetConstraintError
-        ? `Lower the cost: prefer cheaper suitable candidates (allergen-safe, same item) and the smallest package counts that still cover the request. Do not drop requested items. If the budget cannot be met, return the cheapest complete cart.\n`
-        : '') + `Return a corrected complete cart using the catalog above. Do not repeat the invalid values.`;
+      const kinds = error instanceof ConstraintError ? error.kinds : [];
+      correction = `\nYour previous response was rejected: ${error.message}\n` +
+        (kinds.includes('origin') ? `Replace items from other countries with candidates whose country_of_origin is ${origin.countries.join(' or ')}. If no such candidate exists for an item, keep its best match; it will be sent for human review.\n` : '') +
+        (kinds.includes('budget') ? `Lower the cost: prefer cheaper suitable candidates (allergen-safe, same item) and the smallest package counts that still cover the request. Do not drop requested items. If the budget cannot be met, return the cheapest complete cart.\n` : '') +
+        `Return a corrected complete cart using the catalog above. Do not repeat the invalid values.`;
     }
   }
 }

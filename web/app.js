@@ -344,6 +344,7 @@ function selectionReasonText(mode) {
   if (mode === 'gemini-selection') return 'selected by Gemini for best unit/packaging fit and catalog rank';
   if (mode === 'fallback-suggestions') return 'selected from closest catalog suggestions (no exact keyword match)';
   if (mode === 'no-match') return 'no catalog match found';
+  if (mode === 'origin-blocked') return 'none from the required country of origin; sent for human review';
   return 'ranked #1 on keyword relevance, allergen safety, buyer history, stock, and supplier reliability';
 }
 
@@ -383,15 +384,16 @@ function renderTraceNarrative(o) {
       return `<li><strong>"${esc(lt.requested)}"</strong> → <code>${esc(lt.query)}</code>${altsText}: <strong>0 available matches</strong>.</li>`;
     }
     const candList = lt.topCandidates.slice(0, 3).map((c, idx) => {
-      const isWinner = c.productId === lt.selectedProductId || idx === 0;
+      const isWinner = lt.selectionMode !== 'origin-blocked' && (c.productId === lt.selectedProductId || idx === 0);
+      const origin = c.country_of_origin ? `, ${esc(String(c.country_of_origin).toUpperCase())}` : '';
       const rel = c.reliability != null ? `, ${fmtNum(Number(c.reliability) * 100)}% rel` : '';
       const co2 = c.carbon != null ? `, ${fmtNum(c.carbon)} CO₂` : '';
       const hist = Number(c.bought_count || 0) > 0 ? `, ${c.bought_count}× prior` : ', new';
       const safety = c.allergen_safe === false ? ', ⚠ allergen' : '';
-      return `<span class="trace-cand${isWinner ? ' is-winner' : ''}">${idx + 1}) <strong>${esc(c.name)}</strong> <small>(${fmtMoney(c.price)}/${esc(c.unit)}, ${fmtNum(c.available)} avail${rel}${co2}${hist}${safety})</small>${isWinner ? ` ✓ <em>${fmtNum(lt.selectedQty)} ${esc(lt.selectedUnit || c.unit)}</em>` : ''}</span>`;
+      return `<span class="trace-cand${isWinner ? ' is-winner' : ''}">${idx + 1}) <strong>${esc(c.name)}</strong> <small>(${fmtMoney(c.price)}/${esc(c.unit)}, ${fmtNum(c.available)} avail${origin}${rel}${co2}${hist}${safety})</small>${isWinner ? ` ✓ <em>${fmtNum(lt.selectedQty)} ${esc(lt.selectedUnit || c.unit)}</em>` : ''}</span>`;
     }).join(' · ');
     const totalMatches = lt.totalCandidates || lt.topCandidates.length;
-    return `<li><strong>"${esc(lt.requested)}"</strong> → <code>${esc(lt.matchedQuery || lt.query)}</code>${altsText} (${totalMatches} match${totalMatches === 1 ? '' : 'es'}): ${candList}. Picked <strong>${esc(lt.selectedName || lt.topCandidates[0]?.name)}</strong> (${selectionReasonText(lt.selectionMode)}).</li>`;
+    return `<li><strong>"${esc(lt.requested)}"</strong> → <code>${esc(lt.matchedQuery || lt.query)}</code>${altsText} (${totalMatches} match${totalMatches === 1 ? '' : 'es'}): ${candList}. ${lt.selectionMode === 'origin-blocked' ? `Nothing picked (${selectionReasonText(lt.selectionMode)})` : `Picked <strong>${esc(lt.selectedName || lt.topCandidates[0]?.name)}</strong> (${selectionReasonText(lt.selectionMode)})`}.</li>`;
   }).join('');
 
   const checks = o.checks?.length
