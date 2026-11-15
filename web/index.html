@@ -13,11 +13,13 @@
       <span id="source-status" class="status-tag">postgres · 17,546 items</span>
     </div>
     <div class="topbar-right">
-      <a class="nav-link" href="/agent-managed-inventory" data-chrome>Agent-Managed Inventory</a>
-      <label class="checkbox-label"><input type="checkbox" id="plain-mode"><span>Plain</span></label>
+      <nav class="mode-nav" aria-label="Workspace mode" data-chrome>
+        <a class="nav-link active" href="/user-agent-demo" aria-current="page">Order &amp; Gatekeeper</a>
+        <a class="nav-link" href="/agent-managed-inventory">Agent-Managed Inventory</a>
+      </nav>
       <span class="buyer-tag" data-chrome>buyer: <strong id="buyer-label"></strong></span>
-      <button id="new-session" class="ghost-btn small-btn" type="button">New Session</button>
       <button id="toggle" class="ghost-btn small-btn" type="button" data-chrome>Settings</button>
+      <button id="new-session" class="ghost-btn small-btn" type="button">New Session</button>
     </div>
   </header>
 
@@ -108,7 +110,7 @@
         </div>
         <div class="prompt-wrap">
           <span class="prompt-prefix" data-chrome>&gt;</span>
-          <textarea id="prompt" rows="4" placeholder="Enter query here"></textarea>
+          <textarea id="prompt" rows="4" placeholder="Enter products and quantities (e.g. 50 pears, 10 L oat milk)..."></textarea>
         </div>
         <div id="input-error" class="input-error" role="alert" hidden>
           <span id="input-error-text"></span>
@@ -123,7 +125,7 @@
         </div>
       </section>
 
-      <section class="panel" id="execution" hidden>
+      <section class="panel trace-panel" id="execution" hidden>
         <div class="panel-bar" data-chrome>
           <span id="exec-title">AI decision &amp; trace report</span>
           <span id="exec-badge" class="badge"></span>
@@ -153,7 +155,7 @@
     </div>
 
     <div class="col">
-      <section class="panel">
+      <section class="panel queue-panel">
         <div class="panel-bar" data-chrome>
           <div>
             <span>02 · Approval queue</span>
@@ -164,7 +166,7 @@
         <div id="orders"></div>
       </section>
 
-      <details class="panel history-panel" id="history-wrap" data-chrome>
+      <details class="panel history-panel ledger-panel" id="history-wrap" data-chrome>
         <summary class="panel-bar history-summary">
           <span>03 · Order log <span class="muted">(<span id="history-count">0</span> processed)</span></span>
           <span class="muted toggle-hint">Show / hide</span>

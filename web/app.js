@@ -1,6 +1,7 @@
 const $ = id => document.getElementById(id);
 let dataSource = 'real';
-let plainMode = localStorage.getItem('plainMode') === '1';
+const plainMode = false;
+localStorage.removeItem('plainMode');
 const newGuestId = () => `guest-${Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')}`;
 let activeBuyer = (localStorage.getItem('activeBuyer') || '').trim();
 if (!activeBuyer || activeBuyer === 'demo-buyer') {
@@ -517,23 +518,10 @@ function renderBuyers(buyers) {
 }
 
 function applyPlainMode() {
-  $('plain-mode').checked = plainMode;
-  $('theme-css').disabled = plainMode;
-  document.title = plainMode ? 'notes' : 'shopping pal';
-  document.querySelectorAll('[data-chrome]').forEach(el => { el.hidden = plainMode; });
+  $('theme-css').disabled = false;
+  document.title = 'shopping pal';
   setSettingsView(false);
-  $('prompt').rows = plainMode ? 1 : 4;
-  $('prompt').placeholder = plainMode ? '' : 'Enter query here';
-  $('submit').textContent = plainMode ? 'Run' : 'Run order';
-  if (lastExecOrder) showExecution(lastExecOrder);
-  renderOrders(lastOrders);
 }
-
-$('plain-mode').onchange = () => {
-  plainMode = $('plain-mode').checked;
-  localStorage.setItem('plainMode', plainMode ? '1' : '0');
-  applyPlainMode();
-};
 
 async function refresh() {
   localStorage.setItem('activeBuyer', activeBuyer);
