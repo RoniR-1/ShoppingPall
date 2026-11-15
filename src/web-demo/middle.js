@@ -7,10 +7,8 @@ import {route} from './policy.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
 import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {RealInventorySimulation} from './real-inventory-simulation.js';
-import {rankCandidates} from '../agent.js';
-import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints} from '../contracts.js';
 import {rankCandidates,originMatches} from '../agent.js';
-import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,parseOriginPreference,countryName,stripOrderConstraints} from '../contracts.js';
+import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints,parseOriginPreference,countryName} from '../contracts.js';
 import {callGeminiJSON} from './luna.js';
 import {allocateAvailable} from './quote-check.js';
 
