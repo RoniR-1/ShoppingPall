@@ -61,6 +61,19 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
 }
 
 async function requestModel({base, apiKey, model, timeout, maxTokens, systemPrompt, userPrompt, fetchImpl}) {
+  const geminiNative = /generativelanguage\.googleapis\.com\/v1beta$/i.test(base);
+  const nativeModel = model.replace(/^models\//, '');
+  const url = geminiNative
+    ? `${base}/models/${encodeURIComponent(nativeModel)}:generateContent?key=${encodeURIComponent(apiKey)}`
+    : `${base}/chat/completions`;
+  const headers = geminiNative
+    ? { 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  const body = geminiNative
+    ? { systemInstruction: { parts: [{ text: systemPrompt }] }, contents: [{ role: 'user', parts: [{ text: userPrompt }] },], generationConfig: { temperature: 0, maxOutputTokens: maxTokens, responseMimeType: 'application/json' } }
+    : { model, temperature: 0, max_tokens: maxTokens,
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+        response_format: { type: 'json_object' } };
   const controller = new AbortController();
   let timer;
   let response;
@@ -70,12 +83,10 @@ async function requestModel({base, apiKey, model, timeout, maxTokens, systemProm
       timer = setTimeout(() => { controller.abort(); reject(Error('timeout')); }, timeout);
     });
     await Promise.race([(async () => {
-      response = await fetchImpl(`${base}/chat/completions`, {
+      response = await fetchImpl(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, temperature: 0, max_tokens: maxTokens,
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-          response_format: { type: 'json_object' } }),
+        headers,
+        body: JSON.stringify(body),
         signal: controller.signal
       });
       raw = await response.text();
@@ -119,6 +130,18 @@ async function requestModel({base, apiKey, model, timeout, maxTokens, systemProm
     throw error;
   }
 
+  if (geminiNative) {
+    const candidate = payload.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    if (finishReason === 'SAFETY') {
+      throw aiError('The request could not be processed. Please rephrase the products and quantities; no order was placed.', 422, 'AI_REFUSAL');
+    }
+    if (finishReason === 'MAX_TOKENS') throw aiError('AI output was truncated; retry or simplify the request', 502, 'AI_TRUNCATED');
+    const content = candidate?.content?.parts?.map(part => part.text || '').join('');
+    if (typeof content !== 'string' || !content.trim()) throw aiError('AI provider returned empty or invalid content', 502, 'AI_INVALID_RESPONSE');
+    try { return JSON.parse(content.replace(/^```(?:json)?\s*|\s*```$/g, '')); }
+    catch { throw aiError('Could not interpret the request. Please rephrase the products and quantities and try again; no order was placed.', 502, 'AI_INVALID_RESPONSE'); }
+  }
   const choice = payload.choices?.[0];
   if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
     throw aiError('The request could not be processed. Please rephrase the products and quantities; no order was placed.', 422, 'AI_REFUSAL');
