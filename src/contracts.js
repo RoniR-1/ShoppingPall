@@ -105,20 +105,24 @@ export function parseSustainability(text) {
   return new RegExp(SUSTAINABILITY.source, 'i').test(String(text ?? ''));
 }
 // Removes sustainability wording whether it is its own clause ("10 eggs, sustainable please") or inline ("10 eco-friendly eggs").
-export function stripSustainability(text) {
-  const source = String(text ?? '');
-  if (!parseSustainability(source)) return source;
-  return source.replace(SUSTAINABILITY, ' ')
+// Removes every match of a global regex whether it is its own clause ("10 eggs, sustainable please") or inline
+// ("10 eco-friendly eggs"), then drops clauses left empty.
+function removeInline(source, pattern) {
+  return source.replace(pattern, ' ')
     .split(/([,;\n])/).reduce((parts, piece, i) => {
       if (i % 2) { parts.sep = piece; return parts; }
-      const clean = piece.replace(/\s+/g, ' ').replace(/^\s*(?:and|please)\b\s*|\s*\b(?:and|please)\s*$/gi, '').trim();
+      const clean = piece.replace(/\s+/g, ' ').replace(/^[\s:-]+/, '').replace(/^\s*(?:and|please)\b\s*|\s*\b(?:and|please)\s*$/gi, '').trim();
       if (clean) parts.out += (parts.out ? `${parts.sep === '\n' ? '\n' : parts.sep + ' '}` : '') + clean;
       return parts;
     }, { out: '', sep: ',' }).out.replace(/[\s.!]+$/, '');
 }
-// Removes order-wide constraints (budget, delivery window, sustainability, origin) so only product lines remain for parsing.
+export function stripSustainability(text) {
+  const source = String(text ?? '');
+  return parseSustainability(source) ? removeInline(source, SUSTAINABILITY) : source;
+}
+// Removes order-wide constraints (budget, delivery window, sustainability, nutrition, origin) so only product lines remain.
 export function stripOrderConstraints(text) {
-  return stripOrigin(stripSustainability(stripDelivery(stripBudget(text))));
+  return stripOrigin(stripNutrition(stripSustainability(stripDelivery(stripBudget(text)))));
 }
 // Country of origin requests. Codes match products.country_of_origin (ISO 3166-1 alpha-2, lower case).
 // Adjectives such as "French" or "Greek" only count in an explicit origin context ("French only", "prefer French",
@@ -196,4 +200,74 @@ export function stripOrigin(text) {
   // Strip from the end so earlier match positions stay valid.
   for (const match of findOrigins(source).reverse()) source = stripClause(source, match);
   return source;
+}
+
+// Nutrition goals. Each nutrient is its own ranking factor; values are compared per 100 g / 100 ml.
+// code = GS1 nutrient code in synkkaData.nutritionalContent; words = how buyers name it (longest first wins).
+export const NUTRIENTS = {
+  protein: { code: 'PRO-', label: 'protein', unit: 'g', words: ['proteins?'] },
+  saturatedFat: { code: 'FASAT', label: 'saturated fat', unit: 'g', words: ['saturated\\s+fats?', 'saturates', 'sat(?:urated)?[-\\s]fats?'] },
+  fat: { code: 'FAT', label: 'fat', unit: 'g', words: ['fats?'] },
+  carbs: { code: 'CHOAVL', label: 'carbohydrates', unit: 'g', words: ['carbohydrates?', 'carbs?'] },
+  sugar: { code: 'SUGAR-', label: 'sugar', unit: 'g', words: ['sugars?'] },
+  salt: { code: 'SALTEQ', label: 'salt', unit: 'g', words: ['salt', 'sodium'] },
+  fibre: { code: 'FIBTG', label: 'fibre', unit: 'g', words: ['fib(?:re|er)s?'] },
+  energy: { code: 'ENER-E14', label: 'calories', unit: 'kcal', words: ['calories', 'calorie', 'kcal', 'energy'] },
+  lactose: { code: 'LACS', label: 'lactose', unit: 'g', words: ['lactose'] }
+};
+const NUTRIENT_WORD = Object.entries(NUTRIENTS).flatMap(([key, n]) => n.words.map(w => [key, w]));
+const NUTRIENT_ALT = NUTRIENT_WORD.map(([, w]) => w).sort((a, b) => b.length - a.length).join('|');
+const nutrientKey = word => NUTRIENT_WORD.find(([, w]) => new RegExp(`^(?:${w})$`, 'i').test(word.replace(/\s+/g, ' ').trim()))?.[0];
+const NUTRITION_PATTERNS = [
+  // "high protein", "more fibre", "rich in protein", "lots of protein"
+  [String.raw`\b(?:high(?:er)?|highest|more|most|max(?:imum)?|rich\s+in|lots\s+of|plenty\s+of|extra)[-\s]+(?:in\s+)?(NUTRIENT)\b`, 'max'],
+  // "protein-rich", "protein rich"
+  [String.raw`\b(NUTRIENT)[-\s]+rich\b`, 'max'],
+  // "low fat", "less sugar", "reduced salt", "low in saturated fat", "fewer calories"
+  [String.raw`\b(?:low(?:er)?|lowest|less|least|reduced|fewer|min(?:imal|imum)?|little|light\s+on)[-\s]+(?:in\s+)?(NUTRIENT)\b`, 'min'],
+  // "sugar-free", "fat free", "lactose free", "no added sugar"
+  [String.raw`\b(NUTRIENT)[-\s]+free\b`, 'min'],
+  [String.raw`\bno[-\s]+added[-\s]+(NUTRIENT)\b`, 'min'],
+  [String.raw`\bketo\b()`, 'min', 'carbs']
+].map(([source, direction, fixed]) => [new RegExp(source.replace('NUTRIENT', NUTRIENT_ALT), 'gi'), direction, fixed]);
+function findNutrition(text) {
+  const source = String(text ?? '');
+  const found = [];
+  for (const [pattern, direction, fixed] of NUTRITION_PATTERNS) {
+    for (const match of source.matchAll(new RegExp(pattern.source, 'gi'))) {
+      const nutrient = fixed ?? nutrientKey(match[1]);
+      if (nutrient) found.push({ nutrient, direction, index: match.index, length: match[0].length });
+    }
+  }
+  return found.sort((a, b) => a.index - b.index || b.length - a.length);
+}
+// [{ nutrient: 'protein', direction: 'max' }, ...] in the order the buyer mentioned them (first = most important).
+export function parseNutritionGoals(text) {
+  const goals = [];
+  for (const { nutrient, direction } of findNutrition(text)) {
+    if (!goals.some(g => g.nutrient === nutrient)) goals.push({ nutrient, direction });
+  }
+  return goals;
+}
+export function stripNutrition(text) {
+  const source = String(text ?? '');
+  if (!findNutrition(source).length) return source;
+  return removeInline(source, new RegExp(NUTRITION_PATTERNS.map(([p]) => `(?:${p.source})`).join('|'), 'gi'));
+}
+export function describeNutritionGoal({ nutrient, direction }) {
+  return `${direction === 'max' ? 'most' : 'least'} ${NUTRIENTS[nutrient].label}`;
+}
+// Converts synkkaData.nutritionalContent into { protein: 3.7, fat: 26, ... } per 100 g/ml.
+// Entries per portion or in unknown units are skipped, so that nutrient counts as unknown.
+export function nutritionPer100(entries) {
+  const out = {};
+  if (!Array.isArray(entries)) return out;
+  for (const [key, n] of Object.entries(NUTRIENTS)) {
+    const entry = entries.find(e => e?.id === n.code);
+    const basis = Number(entry?.basisQuantity);
+    const unitFactor = { GRM: 1, MGM: 0.001, MC: 0.000001, E14: 1 }[entry?.unit];
+    if (!entry || !Number.isFinite(Number(entry.value)) || !(basis > 0) || !['GRM', 'MLT'].includes(entry.basisQuantityUnit) || unitFactor === undefined) continue;
+    out[key] = round3(Number(entry.value) * unitFactor * 100 / basis);
+  }
+  return out;
 }

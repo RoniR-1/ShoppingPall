@@ -5,7 +5,7 @@ import {DemoStore} from './demo-store.js';
 import {assertQuoteCutoffs} from './quote-check.js';
 import {pool,transaction,sourceContext,sourceName,databaseUrls} from './sources.js';
 import {ValioClient} from '../valio.js';
-import {productsRequest,round3} from '../contracts.js';
+import {productsRequest,round3,nutritionPer100} from '../contracts.js';
 const app=express();
 const useMockValio=()=>process.env.VALIO_MOCK==='true';
 const clients={
@@ -90,6 +90,7 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
         ROUND(p.carbon_kg_co2_per_kg, 3) AS carbon_kg_co2_per_kg,
         ROUND(p.delivery_reliability, 3) AS delivery_reliability,
         p.raw->'units' AS units, p.raw->'substitutions' AS substitutions,
+        p.raw->'synkkaData'->'nutritionalContent' AS nutrition_raw,
         i.quantity AS stock_quantity,
         CASE
           WHEN lower(p.name) = $3 OR EXISTS (
@@ -128,8 +129,9 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
       delivery_reliability DESC NULLS LAST,
       id ASC
     LIMIT $5`,[user,excludedAllergens,q,wordRegex,limit])).rows;
-  return rows.filter(r=>!(policy?.blocked_categories||[]).includes(r.category)).map(r=>({
+  return rows.filter(r=>!(policy?.blocked_categories||[]).includes(r.category)).map(({nutrition_raw,...r})=>({
     ...r,
+    nutrition:nutritionPer100(nutrition_raw),
     allowed_lot_size:Number(r.allowed_lot_size),
     carbon_kg_co2_per_kg:round3(r.carbon_kg_co2_per_kg),
     delivery_reliability:round3(r.delivery_reliability),

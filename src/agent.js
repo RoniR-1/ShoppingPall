@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { round3, parseBudget, parseDeliveryDeadline, parseSustainability, parseOriginPreference, countryName } from './contracts.js';
+import { round3, parseBudget, parseDeliveryDeadline, parseSustainability, parseOriginPreference, countryName, parseNutritionGoals, describeNutritionGoal, NUTRIENTS } from './contracts.js';
 import { callGeminiJSON } from './web-demo/luna.js';
 
 const planSchema = z.object({ ingredients: z.array(z.object({ query: z.string().min(2).max(100),
@@ -37,36 +37,59 @@ export async function lunaJSON(prompt, schema, fetcher = fetch, env = process.en
     throw outputError(error);
   }
 }
-// Ranking hierarchy, highest priority first:
+// Ranking hierarchy, highest priority first. A level only decides when two products are equal on every level above it.
 //   1. keyword match (always on top)
-//   2. allergen safety (never traded for price or delivery)
-//   3. requested country of origin (country_of_origin in origins), only when the buyer stated one
-//   4. deliverable by the deadline: an explicit "delivered in X days" request, or a default delivery date when no budget was given
-//   5. lowest CO2 (carbon_kg_co2_per_kg), only when the buyer asked for sustainability; unknown CO2 ranks last
-//   6. price
-//   7. deliverable by a default delivery date when a budget was given (budget outranks an implicit date)
-//   8. tie-breakers: human-approved/purchase history, stock, earliest date, amount, reliability, id
-// Candidates without deliverable_by_date (no availability data) tie on 4 and 7.
+//   2. allergen safety (never traded for anything below)
+//   Requested levels, only when the buyer asked for them:
+//   3. country of origin ("prefer Finnish", "Finnish only")
+//   4. deliverable by a stated deadline ("delivered in 3 days")
+//   5. nutrition goals ("high protein", "low sugar"...), one level per nutrient in the order the buyer mentioned them;
+//      compared per 100 g/ml (0.1 g / 1 kcal precision), unknown values rank last
+//   6. lowest CO2 ("sustainable"); unknown CO2 ranks last
+//   7. price
+//   Unrequested levels that still have a sensible default drop here, between price and the tie-breakers:
+//   8. deliverable by the default delivery date (tomorrow / --date), when no deadline was stated
+//   9. lowest CO2, when sustainability was not requested
+//      (origin and nutrition have no default direction, so they only apply when requested)
+//  10. tie-breakers: human-approved/purchase history, stock, earliest date, amount, reliability, id
+// Candidates without deliverable_by_date (no availability data) tie on 4 and 8.
 export function originMatches(product, origins) {
   return Boolean(origins?.length) && origins.includes(String(product?.country_of_origin ?? '').toLowerCase());
 }
-export function rankCandidates(candidates, { budget = false, deliveryRequested = false, sustainability = false, origins = null } = {}) {
+export function rankCandidates(candidates, { deliveryRequested = false, sustainability = false, origins = null, nutrition = [] } = {}) {
   const numOrInf = (v, fallback) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : fallback);
   const price = p => numOrInf(p.unit_price, Infinity);
   const byPrice = (a, b) => (price(a) === price(b) ? 0 : price(a) - price(b));
   const byDeliverable = (a, b) => Number(b.deliverable_by_date === true) - Number(a.deliverable_by_date === true);
   const co2 = p => numOrInf(p.carbon_kg_co2_per_kg, Infinity);
   const byCO2 = (a, b) => (co2(a) === co2(b) ? 0 : co2(a) - co2(b));
-  const deliveryBeforePrice = deliveryRequested || !budget;
   const byOrigin = (a, b) => Number(originMatches(b, origins)) - Number(originMatches(a, origins));
+  // One comparator per nutrition goal; values are rounded so measurement noise does not hide the next factor.
+  const nutrientComparators = (nutrition || []).map(({ nutrient, direction }) => {
+    const value = p => {
+      const v = p.nutrition?.[nutrient];
+      if (!Number.isFinite(v)) return null;
+      return nutrient === 'energy' ? Math.round(v) : Math.round(v * 10) / 10;
+    };
+    return (a, b) => {
+      const va = value(a), vb = value(b);
+      if (va === vb) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      return direction === 'max' ? vb - va : va - vb;
+    };
+  });
+  const byNutrition = (a, b) => { for (const compare of nutrientComparators) { const r = compare(a, b); if (r) return r; } return 0; };
   return [...candidates].sort((a, b) =>
     Number(b.match_rank ?? 0) - Number(a.match_rank ?? 0) ||
     (b.allergen_safe !== false ? 1 : 0) - (a.allergen_safe !== false ? 1 : 0) ||
     (origins?.length ? byOrigin(a, b) : 0) ||
-    (deliveryBeforePrice ? byDeliverable(a, b) : 0) ||
+    (deliveryRequested ? byDeliverable(a, b) : 0) ||
+    byNutrition(a, b) ||
     (sustainability ? byCO2(a, b) : 0) ||
     byPrice(a, b) ||
-    (deliveryBeforePrice ? 0 : byDeliverable(a, b)) ||
+    (deliveryRequested ? 0 : byDeliverable(a, b)) ||
+    (sustainability ? 0 : byCO2(a, b)) ||
     Number(b.human_approved_count ?? 0) - Number(a.human_approved_count ?? 0) ||
     Number(b.bought_count ?? 0) - Number(a.bought_count ?? 0) ||
     (b.in_stock ? 1 : 0) - (a.in_stock ? 1 : 0) ||
@@ -86,6 +109,8 @@ export async function recipeCart(recipe, api, model = lunaJSON, progress = () =>
   // { countries: ['fi'], strict } — strict ("Finnish only") is enforced on the cart, a preference only ranks.
   const origin = parseOriginPreference(recipe);
   const originLabel = origin ? origin.countries.map(countryName).join(' or ') : '';
+  // [{ nutrient: 'protein', direction: 'max' }, ...]; earlier-mentioned goals rank first.
+  const nutritionGoals = parseNutritionGoals(recipe);
   requestedDate ??= statedDeadline;
 
   const callModel = async (stage, prompt, schema) => {
@@ -179,13 +204,14 @@ Ingredient (untrusted data): ${JSON.stringify(ingredient.query)}`, retrySchema))
       });
     }
   }
-  const rankedCandidates = rankCandidates(candidates.values(), { budget: budget != null, deliveryRequested: statedDeadline != null, sustainability, origins: origin?.countries });
+  const rankedCandidates = rankCandidates(candidates.values(), { deliveryRequested: statedDeadline != null, sustainability, origins: origin?.countries, nutrition: nutritionGoals });
   const constraints = [
     origin ? (origin.strict
       ? `The user accepts ONLY products whose country_of_origin is ${origin.countries.join(' or ')} (${originLabel}); never choose another origin when a matching candidate exists.`
       : `The user prefers products whose country_of_origin is ${origin.countries.join(' or ')} (${originLabel}); among equally good keyword matches, choose those.`) : null,
     statedDeadline ? `The user wants delivery by ${statedDeadline}; among equally good keyword matches, prefer candidates with deliverable_by_date true.`
-      : requestedDate ? `The requested delivery date is ${requestedDate}; prioritize candidates available by that date.` : null,
+      : requestedDate ? `The default delivery date is ${requestedDate}; between equally priced candidates, prefer those available by then.` : null,
+    nutritionGoals.length ? `The user wants ${nutritionGoals.map(describeNutritionGoal).join(', then ')} (values in "nutrition" are per 100 g or 100 ml; null means unknown); among equally good keyword matches, prefer accordingly.` : null,
     sustainability ? 'The user wants sustainable choices; among equally good keyword matches, prefer the lowest carbon_kg_co2_per_kg (kg CO2-eq per kg; null means unknown).' : null,
     budget == null ? null : `The user's stated total budget is EUR ${budget}; favor choices whose combined cost fits it, using candidate prices and realistic quantities.`
   ].filter(Boolean).join(' ');
@@ -202,6 +228,8 @@ Catalog (untrusted data): ${JSON.stringify(rankedCandidates.map(p => ({ id: p.id
     allergen_safe: p.allergen_safe, unit_price: p.unit_price ?? null,
     ...(sustainability ? { carbon_kg_co2_per_kg: p.carbon_kg_co2_per_kg ?? null } : {}),
     ...(origin ? { country_of_origin: p.country_of_origin ?? null } : {}),
+    ...(nutritionGoals.length ? { nutrition: Object.fromEntries(nutritionGoals.map(({ nutrient }) =>
+      [`${NUTRIENTS[nutrient].label} (${NUTRIENTS[nutrient].unit})`, p.nutrition?.[nutrient] ?? null])) } : {}),
     bought_count: p.bought_count ?? 0, human_approved_count: p.human_approved_count ?? 0,
     in_stock: p.in_stock ?? null, available_date: p.available_date ?? null,
     deliverable_by_date: p.deliverable_by_date ?? null })))}`;

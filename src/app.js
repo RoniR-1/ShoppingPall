@@ -2,7 +2,7 @@ import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { z, ZodError } from 'zod';
 import { pool } from './db.js';
-import { id, selectedRequest, orderRequest, assert, round3 } from './contracts.js';
+import { id, selectedRequest, orderRequest, assert, round3, nutritionPer100 } from './contracts.js';
 import { ValioClient } from './valio.js';
 import { createOrder, decideOrder, excludeOrderFromBaseline, setOrderRoutine, answerMandateQuestion } from './orders.js';
 const columns = 'id,name,category,country_of_origin,sales_unit,allowed_lot_size,carbon_kg_co2_per_kg,delivery_reliability';
@@ -81,6 +81,7 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
       scored AS (
         SELECT p.id, p.name, p.category, p.country_of_origin, p.sales_unit, p.allowed_lot_size,
           ROUND(p.carbon_kg_co2_per_kg, 3) AS carbon_kg_co2_per_kg, ROUND(p.delivery_reliability, 3) AS delivery_reliability, p.raw->'units' AS units,
+          p.raw->'synkkaData'->'nutritionalContent' AS nutrition_raw,
           ${matchExpr} AS match_rank,
           COALESCE((
             SELECT array_agg(v->>'id')
@@ -103,7 +104,7 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
         bought_count DESC,
         delivery_reliability DESC NULLS LAST,
         id ASC
-      LIMIT ${limitParam}`, values)).rows;
+      LIMIT ${limitParam}`, values)).rows.map(({ nutrition_raw, ...p }) => ({ ...p, nutrition: nutritionPer100(nutrition_raw) }));
     const selectionId = randomUUID();
     const selection = (await pool.query('INSERT INTO selections(id,user_id,product_ids) VALUES ($1,$2,$3) RETURNING expires_at',
       [selectionId,req.user,products.map(p => p.id)])).rows[0];
