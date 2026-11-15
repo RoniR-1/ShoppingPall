@@ -13,3 +13,26 @@ test('substitute requires approval and credits actual SKU without repeated origi
 test('price cap exceptions require review and malformed caps are rejected',async t=>{const {agent}=await setup(t);await assert.rejects(agent.command('buyer',{action:'rule',rule:{query:'Database apples',minimum:10,target:20,price_quantity:0,max_price:1,currency:'EUR'}}));await agent.command('buyer',{action:'rule',rule:{query:'Database apples',minimum:10,target:20,price_quantity:1,max_price:1,currency:'EUR'}});await agent.command('buyer',{action:'snapshot',id:'a',on_hand:2});const order=agent.snapshot('buyer').orders[0];assert.equal(order.status,'PENDING_APPROVAL');assert.match(order.policy_breach,/Price cap exceeded/);});
 test('empty database fails without loading demo products',async t=>{const {args}=await setup(t);const agent=new RealInventorySimulation({...args,file:args.file+'-empty',catalog:async()=>[]});await assert.rejects(agent.initialize('buyer'),/No eligible products/);});
 test('substitution spike selects an eligible product even when others lack substitutes',async t=>{const {agent}=await setup(t);await agent.command('buyer',{action:'simulation',scenario:'substitution'});await agent.command('buyer',{action:'demand_spike'});const s=agent.snapshot('buyer');assert.equal(s.orders.length,1);assert.equal(s.orders[0].requested_product_name,'Database apples');assert.equal(s.orders[0].items[0].productId,'b');assert.equal(s.orders[0].status,'PENDING_APPROVAL');});
+test('automatic demo batches lead to real simulated replenishment activity',async t=>{
+ const {agent,advance}=await setup(t);
+ await agent.command('buyer',{action:'simulation',running:true,speed:'6x',scenario:'full'});
+ for(let i=0;i<9;i++){advance(1333);await agent.simulationStep('buyer');}
+ let s=agent.snapshot('buyer');
+ assert.ok(s.orders.length>0);
+ for(const category of ['CONSUMPTION','THRESHOLD','POLICY','ORDER'])assert.ok(s.telemetry.some(e=>e.category===category),category);
+ assert.ok(s.telemetry.some(e=>e.category==='CONSUMPTION'&&/Wholesale order|Large production batch|Catering order/.test(e.message)));
+ assert.ok(s.telemetry.some(e=>e.category==='CONSUMPTION'&&/Kitchen service|Breakfast service|Order preparation|Production run/.test(e.message)));
+ assert.ok(s.inventory.every(i=>i.on_hand>=0&&Number.isInteger(i.on_hand)));
+ await agent.command('buyer',{action:'simulation',running:false});
+ advance(5000);await agent.simulationStep('buyer');s=agent.snapshot('buyer');
+ assert.ok(s.telemetry.some(e=>e.category==='RESTOCK'));
+ assert.ok(s.orders.some(o=>o.shipments.some(sh=>sh.status==='RECEIVED')));
+});
+test('automatic demand does not consume stock held for an approval episode',async t=>{
+ const {agent,advance}=await setup(t);
+ await agent.command('buyer',{action:'simulation',running:true,speed:'6x',scenario:'full',governance:'human'});
+ await agent.command('buyer',{action:'snapshot',id:'a',on_hand:2});
+ assert.equal(agent.snapshot('buyer').orders[0].status,'PENDING_APPROVAL');
+ for(let i=0;i<9;i++){advance(1333);await agent.simulationStep('buyer');}
+ assert.equal(agent.snapshot('buyer').inventory.find(i=>i.id==='a').on_hand,2);
+});
