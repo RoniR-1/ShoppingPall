@@ -4,7 +4,7 @@ import {AsyncLocalStorage} from 'node:async_hooks';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {route} from './policy.js';
-import {directLines,normalizeQuery,substitutionQuery} from './text.js';
+import {directLines,normalizeQuery,substitutionQuery,compatibleProduct,concernsSelfHarm} from './text.js';
 import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {RealInventorySimulation} from './real-inventory-simulation.js';
 import {rankCandidates,originMatches} from '../agent.js';
@@ -61,6 +61,7 @@ const selectionSchema=z.object({
 
 
 async function parseRequestLines(text){
+if(concernsSelfHarm(text))throw Object.assign(Error('If you might hurt yourself, please move away from anything you could use to do so and contact local emergency services or someone you trust now. No order was placed.'),{status:422,code:'SUPPORT_NEEDED'});
 if(sourceContext.getStore()==='real'&&!process.env.LUNA_API_KEY)throw Object.assign(Error('Configure LUNA_API_KEY to use agent mode'),{code:'AI_NOT_CONFIGURED'});
 if(sourceContext.getStore()==='real'&&!process.env.LUNA_BASE_URL)throw Object.assign(Error('Configure LUNA_BASE_URL to use agent mode'),{code:'AI_NOT_CONFIGURED'});
 // Budget, delivery window and sustainability are applied by plan(); they must not become catalog search lines.
@@ -146,7 +147,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     let candidates=[];
     let matchedQuery=queries[0]||line.query;
     for(const q of [...new Set(queries)]){
-      candidates=await core('/internal/search',{q,user_id:user});
+      candidates=(await core('/internal/search',{q,user_id:user,intent:line.requested||line.query})).filter(p=>compatibleProduct(line.requested||line.query,p));
       if(candidates.length){matchedQuery=q;break;}
     }
     if(meta.managedSimulation&&context?.why?.product_id){
@@ -156,9 +157,9 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     const chosenId=approved[index]||pinned[index];
     if(!candidates.length){
       suggested=true;
-      candidates=await core('/internal/suggestions',{q:line.query});
+      candidates=(await core('/internal/suggestions',{q:line.query})).filter(p=>compatibleProduct(line.requested||line.query,p));
     }else if(candidates.length<4&&!chosenId&&!meta.managedSimulation){
-      const extra=await core('/internal/suggestions',{q:line.query});
+      const extra=(await core('/internal/suggestions',{q:line.query})).filter(p=>compatibleProduct(line.requested||line.query,p));
       const seen=new Set(candidates.map(c=>c.id));
       for(const s of extra)if(!seen.has(s.id)){candidates.push(s);seen.add(s.id);if(candidates.length>=8)break;}
     }
@@ -171,7 +172,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     if(chosenId){
       const byId=await core('/internal/search',{q:String(chosenId),user_id:user});
       const verified=byId.find(p=>p.id===chosenId);
-      if(!verified||verified.allergen_safe!==true)throw Error('Alternative is unavailable or conflicts with buyer allergen exclusions');
+      if(!verified||verified.allergen_safe!==true||!compatibleProduct(line.requested||line.query,verified))throw Error('Alternative is unavailable, does not match the request, or conflicts with buyer allergen exclusions');
       candidates=candidates.filter(p=>p.id!==chosenId);candidates.unshift(verified);
       candidates=[candidates.find(p=>p.id===chosenId),...candidates.filter(p=>p.id!==chosenId)];
       suggested=false;

@@ -71,6 +71,9 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
   }
 
   const choice = payload.choices?.[0];
+  if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+    throw aiError('The request could not be processed. Please rephrase the products and quantities; no order was placed.', 422, 'AI_REFUSAL');
+  }
   if (choice?.finish_reason === 'length') {
     throw aiError('AI output was truncated; retry or simplify the request', 502, 'AI_TRUNCATED');
   }
@@ -81,6 +84,6 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
   try {
     return JSON.parse(content.replace(/^```(?:json)?\s*|\s*```$/g, ''));
   } catch {
-    throw aiError('AI provider returned invalid JSON content', 502, 'AI_INVALID_RESPONSE');
+    throw aiError('Could not interpret the request. Please rephrase the products and quantities and try again; no order was placed.', 502, 'AI_INVALID_RESPONSE');
   }
 }

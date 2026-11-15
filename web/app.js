@@ -17,6 +17,7 @@ $('new-session').onclick = () => {
 $('buyer-label').textContent = activeBuyer;
 let settingsOpen = false;
 let lastExecOrder = null;
+let executionCleared = false;
 let lastOrders = [];
 let auditOrderId = null;
 let auditRequest = 0;
@@ -82,7 +83,10 @@ async function api(path, body) {
 
 function resetExecutionView() {
   lastExecOrder = null;
+  executionCleared = true;
   $('execution').hidden = true;
+  $('steps').innerHTML = '';
+  $('raw').textContent = '';
   ++auditRequest;
   auditOrderId = null;
   $('audit-panel').hidden = true;
@@ -460,6 +464,7 @@ function renderTraceNarrative(o) {
 
 function showExecution(o) {
   lastExecOrder = o;
+  executionCleared = false;
   if (plainMode && o.status === 'PENDING_APPROVAL') {
     $('execution').hidden = true;
     return;
@@ -482,7 +487,7 @@ function renderOrders(orders) {
   if (lastExecOrder) {
     const updatedActive = orders.find(o => o.id === lastExecOrder.id);
     if (updatedActive) showExecution(updatedActive);
-  } else if (visibleOrders.length && !plainMode) {
+  } else if (visibleOrders.length && !plainMode && !executionCleared) {
     showExecution(visibleOrders[0]);
   }
 
@@ -760,6 +765,7 @@ async function submit() {
     showInputError(msg);
     return;
   }
+  resetExecutionView();
   $('execution').hidden = false;
   $('exec-badge').className = 'badge pending';
   $('exec-badge').textContent = 'Processing…';
@@ -778,8 +784,7 @@ async function submit() {
     }
     await refresh();
   } catch (e) {
-    if (lastExecOrder) showExecution(lastExecOrder);
-    else $('execution').hidden = true;
+    $('execution').hidden = true;
     showInputError(e.message);
   }
 }

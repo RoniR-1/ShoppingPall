@@ -9,6 +9,7 @@ import {appendAudit,verifyAuditChain} from '../audit.js';
 import {planningEvents,changedProposal,decisionEvents,portalAuditInput,portalCommercial} from './audit.js';
 async function appendPortalAudit(db,event){await db.query('INSERT INTO audit_trace_refs(trace_id,user_id) VALUES($1,$2) ON CONFLICT(trace_id) DO NOTHING',[event.trace_id,event.user_id]);await appendAudit(db,event);}
 import {productsRequest,round3,nutritionPer100} from '../contracts.js';
+import {compatibleProduct} from './text.js';
 const app=express();
 const useMockValio=()=>process.env.VALIO_MOCK==='true';
 const clients={
@@ -35,7 +36,7 @@ app.use((req,res,next)=>{
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
   if(req.method==='GET'&&path==='/internal/audit')return res.json(demo.audit(req.query.user_id,req.query.order_id));
   if(req.method==='POST'&&path==='/internal/suggestions')return res.json(closestProducts(req.body.q,demo.products));
-  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id||'demo-buyer'));
+  if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id||'demo-buyer').filter(p=>!req.body.intent||compatibleProduct(req.body.intent,p)));
   if(req.method==='POST'&&path==='/internal/setup'){demo.reset(req.body.stock);return res.json({ok:true,stock:req.body.stock});}
   if(req.method==='POST'&&path==='/internal/replace')return res.json(demo.replace(req.body));
   if(req.method==='POST'&&path==='/internal/save')return res.json(demo.save(req.body));
@@ -57,7 +58,7 @@ app.post('/internal/setup',async(req,res)=>{
   await pool.query('UPDATE inventory SET quantity=$1',[stock]);
   res.json({ok:true,stock:req.body?.stock||'normal'});
 });
-async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
+async function rankedSearch(rawQuery,user='demo-buyer',limit=15,intent=null){
   const q=String(rawQuery||'').trim().toLowerCase();
   if(!q)return [];
   const policy=(await pool.query('SELECT excluded_allergens,blocked_categories FROM buyer_risk_policies WHERE user_id=$1',[user])).rows[0];
@@ -132,8 +133,8 @@ async function rankedSearch(rawQuery,user='demo-buyer',limit=15){
       COALESCE(stock_quantity, 0) DESC,
       delivery_reliability DESC NULLS LAST,
       id ASC
-    LIMIT $5`,[user,excludedAllergens,q,wordRegex,limit])).rows;
-  return rows.filter(r=>!(policy?.blocked_categories||[]).includes(r.category)).map(({nutrition_raw,...r})=>({
+    LIMIT $5`,[user,excludedAllergens,q,wordRegex,intent?500:limit])).rows;
+  return rows.filter(r=>!(policy?.blocked_categories||[]).includes(r.category)&&(!intent||compatibleProduct(intent,r))).slice(0,limit).map(({nutrition_raw,...r})=>({
     ...r,
     nutrition:nutritionPer100(nutrition_raw),
     allowed_lot_size:Number(r.allowed_lot_size),
@@ -244,7 +245,7 @@ app.post('/internal/suggestions',async(req,res)=>{
 app.post('/internal/search',async(req,res)=>{
  await pool.query(portalSchema);
  const q=String(req.body.q||'').trim(); if(!q) throw Error('Search required');
- res.json(await rankedSearch(q,String(req.body.user_id||'demo-buyer'),15));
+ res.json(await rankedSearch(q,String(req.body.user_id||'demo-buyer'),15,typeof req.body.intent==='string'?req.body.intent:null));
 });
 app.post('/internal/replace',async(req,res)=>res.json(await transaction(async db=>{
  await db.query(portalSchema);

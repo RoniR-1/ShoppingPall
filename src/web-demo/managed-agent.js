@@ -1,6 +1,7 @@
 import {randomUUID} from 'node:crypto';
-import {mkdir,readFile,writeFile,rename,unlink,rmdir} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,unlink} from 'node:fs/promises';
 import {dirname} from 'node:path';
+import {acquireStateLock} from './state-lock.js';
 import {z} from 'zod';
 import {DemoStore,demoContents} from './demo-store.js';
 export const ruleSchema=z.object({query:z.string().min(1).max(100),minimum:z.number().nonnegative(),target:z.number().positive(),on_hand:z.number().nonnegative(),committed:z.number().nonnegative().default(0),inbound:z.number().nonnegative().default(0),lot:z.number().positive().default(1),max_price:z.number().nonnegative().nullable().default(null),price_quantity:z.number().positive().default(1),currency:z.enum(['EUR','USD','GBP','SEK','NOK','DKK']).default('EUR'),price_unit:z.string().min(1).optional()}).refine(r=>r.target>=r.minimum,'Target must be at least minimum');
@@ -13,7 +14,7 @@ export class ManagedAgent {
  constructor({file,submit,listOrders,rejectOrder,now=()=>Date.now()}){this.file=file;this.submit=submit;this.listOrders=listOrders;this.rejectOrder=rejectOrder;this.now=now;this.states=Object.create(null);this.queue=Promise.resolve();}
  async load(){try{this.states=Object.assign(Object.create(null),JSON.parse(await readFile(this.file,'utf8')));for(const state of Object.values(this.states))for(const a of state.activity||[])if(a.status==='SUBMITTING'){a.status='RECONCILING';a.message='Dispatch outcome unknown after restart; inspect orders and resolve manually.';}}catch(e){if(e.code!=='ENOENT')throw e;}}
  async save(){await mkdir(dirname(this.file),{recursive:true});const tmp=this.file+'.'+randomUUID()+'.tmp';try{await writeFile(tmp,JSON.stringify(this.states),{mode:0o600,flag:'wx'});await rename(tmp,this.file);}finally{await unlink(tmp).catch(e=>{if(e.code!=='ENOENT')throw e;});}}
- serial(fn){const job=this.queue.then(async()=>{await mkdir(dirname(this.file),{recursive:true});const lock=this.file+'.lock';try{await mkdir(lock);}catch(e){if(e.code==='EEXIST')throw Object.assign(Error('Managed state is locked by another process. If it crashed, verify dispatches and remove the stale lock directory before retrying.'),{code:'MANAGED_STATE_LOCKED'});throw e;}try{await this.load();return await fn();}catch(e){await this.load().catch(()=>{});throw e;}finally{await rmdir(lock);}});this.queue=job.catch(()=>{});return job;}
+ serial(fn){const job=this.queue.then(async()=>{await mkdir(dirname(this.file),{recursive:true});const release=await acquireStateLock(this.file+'.lock');try{await this.load();return await fn();}catch(e){await this.load().catch(()=>{});throw e;}finally{await release();}});this.queue=job.catch(()=>{});return job;}
  state(user){const s=this.states[user]??={connected:true,enabled:true,provider:'Demo warehouse',location:'Main kitchen',rules:[],activity:[],last_check:null};
  s.connected=true;s.enabled=true;
  if(!s.inventory){s.inventory=new DemoStore().products.map(p=>({id:p.id,name:p.name,unit:p.sales_unit,on_hand:0}));for(const r of s.rules){let item=s.inventory.find(p=>p.name.toLowerCase()===r.query.toLowerCase()||p.id===r.query);if(!item){item={id:randomUUID(),name:r.query,unit:'ST',on_hand:0};s.inventory.push(item);}item.on_hand=r.on_hand;r.product_id=item.id;}}
