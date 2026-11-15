@@ -288,16 +288,17 @@ observes warehouse stock above the minimum. Pausing/disconnecting stops future
 checks; it does not cancel already-created orders. Demo orders and supplier
 stock remain in the core's process memory and reset when core restarts.
 
-State operations wait briefly for a live lock holder. A lock with a recorded
-owner is recovered automatically only when that owner is on the same host and
-the operating system confirms its process is gone. Locks are never reclaimed
-based on age: a long supplier call may still be in progress. An older ownerless
-lock, an unverifiable owner, or an abandoned recovery gate needs operator
-inspection. Stop all processes that share the affected state file, preserve the
-state and reconcile any uncertain dispatches against orders, then remove only
-the inspected stale `<state-file>.lock` and, if present,
-`<state-file>.lock.recovery` directories before restarting. The real inventory
-simulation uses the same locking behavior for its separate state file.
+On Linux, state operations use the kernel's `flock` lock on the persistent
+`<state-file>.lock.flock` sidecar. The lock is released when its process exits,
+including crashes; a live holder is never displaced by age. The Docker image
+installs `flock`; local Linux installations require the util-linux package.
+Do not remove the sidecar while processes are running. To upgrade from the older
+directory lock, stop **all** old app processes sharing the state file before
+starting the new version; the two versions cannot coordinate with each other.
+Old `.lock` and `.lock.recovery` directories are left untouched and ignored by
+the new version. Preserve the state and reconcile uncertain dispatches against
+orders after a crash. The real inventory simulation uses the same locking
+behavior for its separate state file. Keep one application replica per volume.
 
 This is not the production architecture described in the design: no real
 inventory connector, OAuth/credential vault, authenticated tenant identities,
