@@ -11,6 +11,20 @@ const number = n => Number.isFinite(Number(n)) ? Number(n) : 0;
 export class RealInventorySimulation extends ManagedAgent {
  constructor({file,catalog,now=()=>Date.now()}) { super({file,now}); this.catalog=catalog; }
  state(user){const state=this.states[user];if(!state)throw Error('Database simulation not initialized');return state;}
+ consumeBatch(s){
+  // Simulate whole service or production batches, scaled to each warehouse's
+  // configured stock range. Focus on the closest reorder points so a short
+  // demonstration includes the resulting order and delivery workflow.
+  const candidates=s.rules.filter(r=>!r.episode&&r.minimum>0&&s.inventory.some(i=>i.id===r.product_id&&i.on_hand>0))
+   .sort((a,b)=>(a.on_hand-a.minimum)/Math.max(1,a.target-a.minimum)-(b.on_hand-b.minimum)/Math.max(1,b.target-b.minimum)).slice(0,2);
+  if(!candidates.length)return;
+  const r=candidates[Math.floor(Math.random()*candidates.length)],item=s.inventory.find(i=>i.id===r.product_id),before=item.on_hand;
+  const amount=Math.max(1,Math.round(Math.max(1,r.target-r.minimum)*(.35+Math.random()*.3)));
+  item.on_hand=Math.max(0,before-amount);r.on_hand=item.on_hand;
+  const reasons=['Wholesale order','Large production batch','Catering order'][Math.floor(Math.random()*3)];
+  this.telemetry(s,'CONSUMPTION',`-${Math.round((before-item.on_hand)*100)/100} ${item.name} (${reasons}) | Stock: ${item.on_hand}/${r.target}`);
+  if(item.on_hand<r.minimum)this.telemetry(s,'THRESHOLD',`${item.name} below minimum ${r.minimum}; evaluating replenishment`);
+ }
  consume(s,spike=false){
   if(spike&&s.simulation.scenario==='substitution'){
    const candidates=s.rules.filter(r=>!r.episode&&r.minimum>0).filter(r=>{
@@ -71,7 +85,7 @@ export class RealInventorySimulation extends ManagedAgent {
  }
  async decide(user,id,decision){await this.serial(async()=>{const s=this.states[user],o=s.orders.find(o=>o.id===id);if(!o||o.status!=='PENDING_APPROVAL'||!['approve','reject'].includes(decision))throw Error('Order is no longer pending');o.status=decision==='approve'?'APPROVED':'REJECTED';const r=s.rules.find(r=>r.episode===o.id);if(o.status==='APPROVED'){this.dispatch(s,o);if(r){const a=s.activity.find(a=>a.id===o.id);a.status='SIMULATED_PLACED';}}else if(r){const a=s.activity.find(a=>a.id===o.id);a.status='REJECTED';a.message='Order rejected';}await this.save();});}
  dispatch(s,o){const now=this.now();o.shipments.forEach((sh,i)=>{sh.eta=new Date(now+delay(s.simulation.speed,i?2:1)).toISOString();sh.status=sh.backorder?'BACKORDERED':'IN_TRANSIT';if(sh.backorder)sh.release_at=new Date(now+delay(s.simulation.speed,1.25)).toISOString();});s.metrics.autonomous_orders++;this.telemetry(s,'ORDER',`${o.requested_product_name}: ${o.items.reduce((n,x)=>n+x.quantity,0)} ordered; first arrival ${new Date(o.shipments[0].eta).toLocaleTimeString('en-GB')}`);}
- async simulationStep(user){await this.serial(async()=>{const s=this.states[user];if(!s)return;const sim=s.simulation;if(sim.running&&this.now()>=sim.next_consumption){this.consume(s);const next=sim.next_consumption+interval(sim.speed);sim.next_consumption=next>this.now()?next:this.now()+interval(sim.speed);await this.save();}});await this.tick(user);}
+ async simulationStep(user){await this.serial(async()=>{const s=this.states[user];if(!s)return;const sim=s.simulation;if(sim.running&&this.now()>=sim.next_consumption){sim.demand_index=(sim.demand_index||0)+1;if(sim.demand_index%3===0)this.consume(s);else this.consumeBatch(s);const next=sim.next_consumption+interval(sim.speed);sim.next_consumption=next>this.now()?next:this.now()+interval(sim.speed);await this.save();}});await this.tick(user);}
  async tick(user){return this.serial(async()=>{const s=this.states[user];if(!s)return;const before=JSON.stringify(s);
   for(const o of s.orders.filter(o=>o.status==='APPROVED'))for(const sh of o.shipments.filter(sh=>sh.status==='BACKORDERED'&&Date.parse(sh.release_at)<=this.now())){sh.status='IN_TRANSIT';this.telemetry(s,'ORDER',`${sh.name}: backorder dispatched`);}
   for(const o of s.orders.filter(o=>o.status==='APPROVED'))for(const sh of o.shipments.filter(sh=>sh.status==='IN_TRANSIT'&&Date.parse(sh.eta)<=this.now())){const item=s.inventory.find(p=>p.id===sh.product_id);if(item){item.on_hand+=sh.quantity;const rule=s.rules.find(r=>r.product_id===item.id);if(rule)rule.on_hand=item.on_hand;}sh.status='RECEIVED';if(sh.backorder)o.remainder=Math.max(0,o.remainder-sh.quantity);sh.received_at=new Date(this.now()).toISOString();this.telemetry(s,'RESTOCK',`${sh.name}: received ${sh.quantity}${sh.substitution?' (substitute)':''}`);}

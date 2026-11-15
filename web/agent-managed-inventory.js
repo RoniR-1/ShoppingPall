@@ -149,7 +149,7 @@ function renderShipments() {
   const inTransit = shipments.filter(({ shipment }) => shipment.status === 'IN_TRANSIT').length;
   $('shipment-count').textContent = `${inTransit} IN TRANSIT`;
   if (!shipments.length) { $('shipments').replaceChildren(node('p', 'No simulated deliveries yet.', 'dashboard-empty')); return; }
-  $('shipments').replaceChildren(...shipments.slice(-12).reverse().map(({ order, shipment }) => {
+  $('shipments').replaceChildren(...shipments.slice(-2).reverse().map(({ order, shipment }) => {
     const row = node('article', null, 'shipment-card');
     const status = shipment.status === 'RECEIVED' ? 'RECEIVED' : shipment.status === 'IN_TRANSIT' ? 'IN TRANSIT' : shipment.status === 'BACKORDERED' ? 'BACKORDERED' : 'PLANNED';
     const header = node('div', null, 'approval-heading');
