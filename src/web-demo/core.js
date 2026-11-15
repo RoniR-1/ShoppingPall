@@ -5,6 +5,9 @@ import {DemoStore} from './demo-store.js';
 import {assertQuoteCutoffs} from './quote-check.js';
 import {pool,transaction,sourceContext,sourceName,databaseUrls} from './sources.js';
 import {ValioClient} from '../valio.js';
+import {appendAudit,verifyAuditChain} from '../audit.js';
+import {planningEvents,changedProposal,decisionEvents,portalAuditInput,portalCommercial} from './audit.js';
+async function appendPortalAudit(db,event){await db.query('INSERT INTO audit_trace_refs(trace_id,user_id) VALUES($1,$2) ON CONFLICT(trace_id) DO NOTHING',[event.trace_id,event.user_id]);await appendAudit(db,event);}
 import {productsRequest,round3,nutritionPer100} from '../contracts.js';
 const app=express();
 const useMockValio=()=>process.env.VALIO_MOCK==='true';
@@ -30,6 +33,7 @@ app.use((req,res,next)=>{
   if(req.method==='GET'&&path==='/internal/buyer-profile'){const approved=demo.list(req.query.user_id).filter(o=>o.status==='APPROVED');const totals=approved.map(o=>Number(o.total||0)).filter(n=>n>0);const maxOrderTotal=round3(totals.length?Math.max(...totals):0);const minOrderTotal=round3(totals.length?Math.min(...totals):0);return res.json({maxOrderTotal,minOrderTotal,spendCap:round3(Math.max(200,maxOrderTotal*1.5))});}
   if(req.method==='GET'&&path==='/internal/catalog-overview')return res.json(demo.overview());
   if(req.method==='GET'&&path==='/internal/orders')return res.json(demo.list(req.query.user_id));
+  if(req.method==='GET'&&path==='/internal/audit')return res.json(demo.audit(req.query.user_id,req.query.order_id));
   if(req.method==='POST'&&path==='/internal/suggestions')return res.json(closestProducts(req.body.q,demo.products));
   if(req.method==='POST'&&path==='/internal/search')return res.json(demo.search(req.body.q,req.body.user_id||'demo-buyer'));
   if(req.method==='POST'&&path==='/internal/setup'){demo.reset(req.body.stock);return res.json({ok:true,stock:req.body.stock});}
@@ -38,7 +42,7 @@ app.use((req,res,next)=>{
   if(req.method==='POST'&&path==='/internal/decision')return res.json(demo.decide(req.body));
   if(req.method==='POST'&&['/api/price','/api/availability'].includes(path))return res.json(demo.live(path.split('/').pop(),productsRequest.parse(req.body)));
   next();
- }catch(e){next(e);}
+ }catch(e){if(req.path==='/internal/decision')demo.failedDecision(req.body||{},e);next(e);}
 });
 app.get('/internal/source',async(_req,res)=>{
   const countRes=await pool.query('SELECT COUNT(*)::int AS count FROM products WHERE NOT deleted');
@@ -250,22 +254,38 @@ app.post('/internal/replace',async(req,res)=>res.json(await transaction(async db
  if(!replacement||replacement.user_id!==user_id||replacement.status!=='PENDING_APPROVAL')throw Error('Invalid replacement proposal');
  const old=row.body;old.status='REJECTED';old.superseded_by=replacement.id;old.steps.push('Order replaced by a new proposal');
  await db.query('INSERT INTO portal_orders(id,user_id,body) VALUES($1,$2,$3)',[replacement.id,user_id,replacement]);
- await db.query('UPDATE portal_orders SET body=$2 WHERE id=$1',[id,old]);return replacement;
+ await db.query('UPDATE portal_orders SET body=$2 WHERE id=$1',[id,old]);
+ for(const event of [portalAuditInput(old,'ORDER_SUPERSEDED','human_approver',{commercial_commitment:portalCommercial(old)}),...planningEvents(replacement)])await appendPortalAudit(db,event);return replacement;
 })));
-app.post('/internal/save',async(req,res)=>{
- await pool.query(portalSchema);
- const o=req.body; const saved=await pool.query(`INSERT INTO portal_orders VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET body=EXCLUDED.body WHERE portal_orders.user_id=EXCLUDED.user_id AND portal_orders.body->>'status'='PENDING_APPROVAL' RETURNING id`,[o.id,o.user_id,o]);if(!saved.rowCount)throw Error('Order cannot be replaced');res.json(o);
+app.post('/internal/save',async(req,res)=>res.json(await transaction(async db=>{
+ await db.query(portalSchema);
+ const o=req.body;
+ // Serialize even the first insertion, so duplicate saves cannot create duplicate events.
+ await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 7284))',[o.id]);
+ const prior=(await db.query('SELECT body FROM portal_orders WHERE id=$1 FOR UPDATE',[o.id])).rows[0]?.body;
+ const saved=await db.query(`INSERT INTO portal_orders VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET body=EXCLUDED.body WHERE portal_orders.user_id=EXCLUDED.user_id AND portal_orders.body->>'status'='PENDING_APPROVAL' RETURNING id`,[o.id,o.user_id,o]);
+ if(!saved.rowCount)throw Error('Order cannot be replaced');
+ if(changedProposal(prior,o))for(const event of planningEvents(o))await appendPortalAudit(db,event);
+ return o;
+})));
+app.get('/internal/audit',async(req,res)=>{
+ const {user_id,order_id}=req.query;
+ const order=(await pool.query('SELECT 1 FROM portal_orders WHERE id=$1 AND user_id=$2',[order_id,user_id])).rowCount;
+ if(!order)throw Object.assign(Error('Order not found'),{status:404});
+ const chain=(await pool.query('SELECT event FROM audit_events WHERE user_id=$1 ORDER BY sequence',[user_id])).rows.map(r=>r.event);
+ res.json({events:chain.filter(event=>event.order_id===order_id),verification:verifyAuditChain(chain),storage:'postgres'});
 });
 app.get('/internal/orders',async(req,res)=>{
  await pool.query(portalSchema);
  res.json((await pool.query('SELECT body FROM portal_orders WHERE user_id=$1 ORDER BY (body->>\'created_at\') DESC NULLS LAST',[req.query.user_id])).rows.map(r=>r.body));
 });
-app.post('/internal/decision',async(req,res)=>res.json(await transaction(async db=>{
+app.post('/internal/decision',async(req,res)=>{let failedPolicy={};try{return res.json(await transaction(async db=>{
  await db.query(portalSchema);
  const {id,user_id,action,human=false}=req.body||{};
  if(!['approve','reject'].includes(action)) throw Error('Invalid action');
  const row=(await db.query('SELECT body FROM portal_orders WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,user_id])).rows[0];
  if(!row) throw Error('Order not found'); const o=row.body;
+ let auditPolicy=null,stockAtCommit=[];
  if(o.status!=='PENDING_APPROVAL') return o;
  if(action==='reject') o.status='REJECTED';
  else {
@@ -277,19 +297,30 @@ app.post('/internal/decision',async(req,res)=>res.json(await transaction(async d
   if(!human&&(o.context?.agent?.type!=='managed'||o.context?.confidence?.method!=='deterministic_threshold'||o.items.some(item=>item.substitution)))throw Error('Human approval is required for generated or substituted carts');
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))',[user_id]);
   const policy=(await db.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1',[user_id])).rows[0]||{hard_spend_limit:1000,weekly_spend_limit:5000,blocked_categories:[],excluded_allergens:[]};
-  const total=Number(o.total);if(!Number.isFinite(total)||total<0||total>Number(policy.hard_spend_limit))throw Error('Order exceeds buyer hard spend limit');
+  const total=Number(o.total);failedPolicy={hard_spend_limit:Number(policy.hard_spend_limit),weekly_spend_limit:Number(policy.weekly_spend_limit),blocked_categories:policy.blocked_categories||[],excluded_allergens:policy.excluded_allergens||[],total};if(!Number.isFinite(total)||total<0||total>Number(policy.hard_spend_limit))throw Error('Order exceeds buyer hard spend limit');
   const spent=(await db.query(`SELECT COALESCE(SUM(amount),0)::double precision AS amount FROM (SELECT total_cents/100.0 AS amount FROM orders WHERE user_id=$1 AND status='APPROVED' AND created_at>=now()-interval '7 days' UNION ALL SELECT (body->>'total')::numeric AS amount FROM portal_orders WHERE user_id=$1 AND body->>'status'='APPROVED' AND (body->>'created_at')::timestamptz>=now()-interval '7 days') t`,[user_id])).rows[0];
+  failedPolicy.weekly_spend_before=Number(spent.amount);
   if(total+Number(spent.amount)>Number(policy.weekly_spend_limit))throw Error('Order exceeds buyer weekly spend limit');
   for(const item of o.items){const row=(await db.query(`SELECT p.category,COALESCE((SELECT array_agg(v->>'id') FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'classifications','[]'::jsonb)) c, jsonb_array_elements(COALESCE(c->'values','[]'::jsonb)) v WHERE c->>'name'='allergen' AND v->>'unit'='CONTAINS'),'{}'::text[]) AS allergens FROM products p WHERE p.id=$1 AND NOT p.deleted`,[item.productId])).rows[0];if(!row||(policy.blocked_categories||[]).includes(row.category)||(row.allergens||[]).some(a=>(policy.excluded_allergens||[]).includes(a)))throw Error('Product unavailable or conflicts with buyer policy; request a new quote');}
   for(const item of [...o.items].sort((a,b)=>a.productId.localeCompare(b.productId))){
-   const r=await db.query('UPDATE inventory SET quantity=quantity-$2 WHERE product_id=$1 AND quantity>=$2',[item.productId,item.quantity]);
+   const r=await db.query('UPDATE inventory SET quantity=quantity-$2 WHERE product_id=$1 AND quantity>=$2 RETURNING quantity',[item.productId,item.quantity]);
    if(!r.rowCount) throw Error(`Insufficient stock for ${item.name||item.productId}; re-quote the order`);
+   stockAtCommit.push({sku:item.productId,quantity:item.quantity,before:Number(r.rows[0].quantity)+Number(item.quantity),after:Number(r.rows[0].quantity)});
   }
+  auditPolicy={hard_spend_limit:Number(policy.hard_spend_limit),weekly_spend_limit:Number(policy.weekly_spend_limit),weekly_spend_before:Number(spent.amount),blocked_categories:policy.blocked_categories||[],excluded_allergens:policy.excluded_allergens||[],total,hard_spend_passed:true,weekly_spend_passed:true,categories_passed:true,allergens_passed:true,quote_fresh:true,cutoffs_passed:true,stock_check_passed:true};
   o.status='APPROVED';
   if(human) o.human_approved=true;
  }
  o.steps.push(o.status==='APPROVED'?'Order approved · inventory updated':'Order rejected');
- await db.query('UPDATE portal_orders SET body=$2 WHERE id=$1',[id,o]);return o;
-})));
+ await db.query('UPDATE portal_orders SET body=$2 WHERE id=$1',[id,o]);
+ for(const event of decisionEvents(o,action,human,auditPolicy,stockAtCommit))await appendPortalAudit(db,event);return o;
+}));}catch(error){
+ const {id,user_id,action}=req.body||{};
+ if(action==='approve')await transaction(async db=>{
+  const order=(await db.query('SELECT body FROM portal_orders WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,user_id])).rows[0]?.body;
+  if(order?.status==='PENDING_APPROVAL')await appendPortalAudit(db,portalAuditInput(order,'GUARDRAIL_FAILED','autonomous_agent',{policy_snapshot:{...failedPolicy,result:'failed',reason:error.message},commercial_commitment:portalCommercial(order)}));
+ });
+ throw error;
+}});
 app.use((e,req,res,next)=>res.status(e.status||422).json(req.path.startsWith('/api/')?{error:e.message,code:e.status===429?'UPSTREAM_RATE_LIMITED':'CORE_ERROR',detail:[{loc:['body'],msg:e.message,type:'value_error'}]}:{error:e.message,code:e.code||'CORE_ERROR'}));
 app.listen(Number(process.env.BACKEND_PORT||4003),'127.0.0.1',()=>console.log('Core :'+(process.env.BACKEND_PORT||4003)));

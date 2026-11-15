@@ -298,3 +298,23 @@ Real-data mode rejects managed-agent endpoints. All purchase outcomes are
 explicitly simulated. Warehouse snapshots are manually entered demo inputs.
 
 Focused checks: `node --test test/managed-agent.test.js`.
+
+### Audit ledger
+
+Existing databases must apply the additive audit migration before starting the updated core or portal. With `DATABASE_URL` configured, run:
+
+```sh
+node --env-file-if-exists=.env --input-type=module -e 'import {pool} from "./src/db.js"; import {readFile} from "node:fs/promises"; try { await pool.query(await readFile("sql/audit-migration.sql","utf8")); } finally { await pool.end(); }'
+```
+
+The portal's real-data source can use a different database. Apply the migration to `REAL_DATABASE_URL` as well, before starting that source:
+
+```sh
+node --env-file-if-exists=.env --input-type=module -e 'import pg from "pg"; import {readFile} from "node:fs/promises"; const pool = new pg.Pool({connectionString: process.env.REAL_DATABASE_URL}); try { if (!process.env.REAL_DATABASE_URL) throw Error("REAL_DATABASE_URL is required"); await pool.query(await readFile("sql/audit-migration.sql", "utf8")); } finally { await pool.end(); }'
+```
+
+For a portal order, `GET /portal/orders/:id/audit?user_id=<buyer>&perspective=buyer|wholesaler` returns its events and the server's verification result for the complete buyer chain. Add `format=json` or `format=csv` to download an export. The `X-Data-Source` header selects `demo` or `real`, as with other portal endpoints. The wholesaler projection omits buyer policy snapshots. The portal trace reference is the existing order ID; the ledger does not copy reasoning into its events. Demo audit records are process-memory only and are lost on restart; resetting demo stock does not clear them.
+
+`GET /audit` returns the current buyer's hash chain, verification result and JSON events; `?format=csv` downloads CSV, and `?perspective=wholesaler` removes buyer policy details. Verification covers the complete unredacted per-buyer chain; redacted exports cannot independently reconstruct event hashes. A retained independently trusted chain head is needed to detect removal of a suffix. Database triggers reject ordinary update, delete and truncate operations; database owners can bypass triggers and rewrite history. Protect the database and externally anchor or sign chain heads before relying on this ledger for compliance.
+
+The demo's `X-User-Id` is a user-supplied identifier, not authenticated identity, and the perspective option is not an authorization boundary. Replace it with authenticated sessions, separate buyer/supplier access control and independently verifiable signatures before deployment. SHA-256 linking establishes tamper evidence against a trusted head; it does not establish legal non-repudiation, trusted timestamps, supplier acceptance or a signed authorization. Core mock commitments record a local inventory transaction, not transmission to Valio Aimo; live core approval records authorization only. Historical orders are not backfilled, and failed checks outside recorded order attempts may not appear.

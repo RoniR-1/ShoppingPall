@@ -2,13 +2,36 @@ import { randomUUID, createHash } from 'node:crypto';
 import { transaction } from './db.js';
 import { assert, round3 } from './contracts.js';
 import { OrderScreeningService, OrderStatus } from './order-screening.js';
+import { appendAudit, auditActor, commercialSnapshot } from './audit.js';
 const defaultScreening = new OrderScreeningService();
+const currentRules = async (db,user) => (await db.query('SELECT * FROM buyer_risk_policies WHERE user_id=$1',[user])).rows[0] || { hard_spend_limit:1000, weekly_spend_limit:5000, blocked_categories:[], excluded_allergens:[] };
+const mockCommitment = order => ({ ...commercialSnapshot(order.items,order.currency,order.total_cents,order.requested_date), commitment_kind:'local_mock_inventory_transaction', supplier_order_submitted:false, mocked:true });
 function assertCutoffs(items) {
   for (const item of items) {
     const cutoff = item.availability?.closingTime;
     assert(cutoff == null || (typeof cutoff === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/i.test(cutoff) && Number.isFinite(Date.parse(cutoff)) && Date.parse(cutoff) > Date.now()),
       409, `Order cutoff passed or is ambiguous for ${item.productId}; reject and request a new quote`);
   }
+}
+async function approvalChecks(db, user, order) {
+  const rules = await currentRules(db,user);
+  try {
+    assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount, 409, 'Quote expired; reject this order and submit a new quote');
+    assertCutoffs(order.items);
+    await assertSubstitutionPolicy(db,user,order.items);
+  } catch (error) {
+    error.auditFailure = { rules, failure:error.message, quote_id:order.quote_id, order_id:order.id,
+      commercial_commitment:commercialSnapshot(order.items,order.currency,order.total_cents,order.requested_date) };
+    throw error;
+  }
+}
+async function auditApprovalFailure(user,error) {
+  if (error.auditFailure) {
+    const { rules, failure, quote_id, order_id, commercial_commitment } = error.auditFailure;
+    await transaction(db => appendAudit(db, { user_id:user, quote_id, order_id, actor:auditActor('autonomous_agent',user),
+      event_type:'GUARDRAIL_FAILED', policy_snapshot:{ rules, failure, phase:'approval recheck' }, commercial_commitment }));
+  }
+  throw error;
 }
 async function lockBuyer(db, user) {
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [user]);
@@ -152,6 +175,7 @@ function buildMandateQuestions(items, { penalties, cartTotal, spendCap, weeklyLi
 export async function createOrder(user, key, input, screening = defaultScreening) {
   const request = { ...input, items: [...input.items].sort((a, b) => a.productId.localeCompare(b.productId)) };
   const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
+  let evaluatedRules;
   return transaction(async db => {
     await lockBuyer(db, user);
     // Serialize retries for the same customer/key, including simultaneous first submissions.
@@ -161,6 +185,7 @@ export async function createOrder(user, key, input, screening = defaultScreening
     const quote = (await db.query('SELECT * FROM quotes WHERE id=$1 AND user_id=$2 AND expires_at>now() FOR UPDATE', [input.quote_id, user])).rows[0];
     assert(quote, 409, 'Quote missing, expired, or belongs to another user');
     assert(!(await db.query('SELECT 1 FROM quote_locks WHERE quote_id=$1', [quote.id])).rowCount, 409, 'Quote is locked by another pending mandate');
+    evaluatedRules = await currentRules(db,user);
     const items = buildOrderItems(request.items, quote);
     assertCutoffs(items);
     const total = items.reduce((sum, i) => sum + i.line_total_cents, 0);
@@ -183,9 +208,23 @@ export async function createOrder(user, key, input, screening = defaultScreening
     const result = (await db.query(`INSERT INTO orders (id,user_id,quote_id,idempotency_key,request_hash,status,flag_reason,items,currency,total_cents,mocked,requested_date,risk_score,risk_details,routine,decided_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,CASE WHEN $6='APPROVED' THEN now() ELSE NULL END) RETURNING *`,
       [randomUUID(),user,input.quote_id,key,hash,status,reason,JSON.stringify(items.map(i=>({...i,requestedDate:quote.requested_date}))),quote.currency,total,quote.mocked,quote.requested_date,risk.score,JSON.stringify(risk),routine])).rows[0];
+    await appendAudit(db, { user_id:user, order_id:result.id, quote_id:quote.id, actor:auditActor('autonomous_agent',user),
+      event_type:status === 'PENDING_APPROVAL' ? 'ESCALATED_FOR_APPROVAL' : 'GUARDRAIL_PASSED',
+      policy_snapshot:{ rules:policy, risk, screening:screeningResult, forced:input.force_flag, decision:status, reason },
+      commercial_commitment:commercialSnapshot(items,quote.currency,total,quote.requested_date) });
+    if (status === 'APPROVED') await appendAudit(db, { user_id:user, order_id:result.id, quote_id:quote.id, actor:auditActor(result.mocked ? 'wholesaler_system' : 'autonomous_agent',user), event_type:result.mocked ? 'ORDER_COMMITTED' : 'ORDER_AUTHORIZED', commercial_commitment:result.mocked ? mockCommitment(result) : commercialSnapshot(items,quote.currency,total,quote.requested_date) });
     if (status === 'PENDING_APPROVAL') await db.query('INSERT INTO quote_locks(quote_id,order_id) VALUES($1,$2)', [quote.id,result.id]);
     await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [result.id,user,status]);
     return result;
+  }).catch(async error => {
+    if (error.status === 422) await transaction(async db => {
+      const quote = (await db.query('SELECT * FROM quotes WHERE id=$1 AND user_id=$2', [input.quote_id,user])).rows[0];
+      if (!quote) return;
+      await appendAudit(db, { user_id:user, quote_id:quote.id, actor:auditActor('autonomous_agent',user), event_type:'GUARDRAIL_FAILED',
+        policy_snapshot:{ rules:evaluatedRules ?? null, failure:error.message, requested_items:request.items },
+        commercial_commitment:{ ...commercialSnapshot(quote.items,quote.currency,0,quote.requested_date), total:null, total_eur:null } });
+    });
+    throw error;
   });
 }
 export async function excludeOrderFromBaseline(user, orderId, exclude) {
@@ -214,6 +253,9 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
     const question = (details.questions || []).find(q => q.id === questionId);
     assert(question, 404, 'Mandate question not found');
     if (answer === 'no' && !alternative) return { order_id: orderId, question, menu: question.alternatives };
+    await appendAudit(db, { user_id:user, order_id:order.id, quote_id:order.quote_id, actor:auditActor('human_approver',user),
+      event_type:alternative === 'cancel' ? 'HUMAN_REJECTED' : 'HUMAN_MANDATE_RESPONSE', policy_snapshot:{ question, answer, alternative:alternative ?? null },
+      commercial_commitment:commercialSnapshot(order.items,order.currency,order.total_cents,order.requested_date) });
     if (answer === 'yes') {
       question.answer = 'yes';
     } else {
@@ -230,6 +272,7 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
         assert(removed, 422, 'This question does not identify a removable item');
         order.items = order.items.filter(i => i.productId !== removed.productId);
         if (order.items.length === 0) {
+          await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('human_approver',user), event_type:'HUMAN_REJECTED', policy_snapshot:{ reason:'Last item removed', question_id:questionId }, commercial_commitment:commercialSnapshot([],order.currency,0,order.requested_date) });
           const rejected = (await db.query("UPDATE orders SET status='REJECTED',decided_at=now(),risk_details=$1 WHERE id=$2 RETURNING *", [JSON.stringify(details),orderId])).rows[0];
           await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,'REJECTED']);
           await db.query('DELETE FROM quote_locks WHERE order_id=$1', [orderId]);
@@ -299,31 +342,30 @@ export async function answerMandateQuestion(user, orderId, { questionId, answer,
       const allAnswered = details.questions.every(q => q.answer !== null);
       const status = allAnswered ? 'APPROVED' : 'PENDING_APPROVAL';
       if (status === 'APPROVED') {
-        assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount,
-          409, 'Quote expired; reject this order and submit a new quote');
-        assertCutoffs(order.items);
-        await assertSubstitutionPolicy(db, user, order.items);
+        await approvalChecks(db,user,order);
       }
+      await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('autonomous_agent',user), event_type:risk.decision === 'AUTO_APPROVE' ? 'GUARDRAIL_PASSED' : 'ESCALATED_FOR_APPROVAL', policy_snapshot:{ rules:policy, risk, decision:status }, commercial_commitment:commercialSnapshot(order.items,order.currency,totalCents,order.requested_date) });
       const updated = (await db.query('UPDATE orders SET items=$1,total_cents=$2,status=$3,decided_at=CASE WHEN $3=\'APPROVED\' THEN now() ELSE NULL END,routine=CASE WHEN $3=\'APPROVED\' THEN true ELSE routine END,risk_details=$4,risk_score=$5 WHERE id=$6 RETURNING *',
         [JSON.stringify(order.items),totalCents,status,JSON.stringify(details),risk.score,orderId])).rows[0];
-      if (status === 'APPROVED') await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,status]);
+      if (status === 'APPROVED') await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('human_approver',user), event_type:'HUMAN_APPROVED', policy_snapshot:{ rules:await currentRules(db,user), risk:details, rechecks:'passed' }, commercial_commitment:commercialSnapshot(updated.items,updated.currency,updated.total_cents,updated.requested_date) });
+      if (status === 'APPROVED' && updated.mocked) await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('wholesaler_system',user), event_type:'ORDER_COMMITTED', commercial_commitment:mockCommitment(updated) });
+    if (status === 'APPROVED') await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,status]);
       if (status !== 'PENDING_APPROVAL') await db.query('DELETE FROM quote_locks WHERE order_id=$1', [orderId]);
       return { order: updated, completed: status === 'APPROVED' };
     }
     const allAnswered = details.questions.every(q => q.answer !== null);
     const status = allAnswered ? 'APPROVED' : 'PENDING_APPROVAL';
     if (status === 'APPROVED') {
-      assert((await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount,
-        409, 'Quote expired; reject this order and submit a new quote');
-      assertCutoffs(order.items);
-      await assertSubstitutionPolicy(db, user, order.items);
+      await approvalChecks(db,user,order);
     }
     const updated = (await db.query('UPDATE orders SET status=$1,decided_at=CASE WHEN $1=\'APPROVED\' THEN now() ELSE NULL END,routine=CASE WHEN $1=\'APPROVED\' THEN true ELSE routine END,risk_details=$2 WHERE id=$3 RETURNING *',
       [status,JSON.stringify(details),orderId])).rows[0];
+    if (status === 'APPROVED') await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('human_approver',user), event_type:'HUMAN_APPROVED', policy_snapshot:{ rules:await currentRules(db,user), risk:details, rechecks:'passed' }, commercial_commitment:commercialSnapshot(updated.items,updated.currency,updated.total_cents,updated.requested_date) });
+    if (status === 'APPROVED' && updated.mocked) await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('wholesaler_system',user), event_type:'ORDER_COMMITTED', commercial_commitment:mockCommitment(updated) });
     if (status === 'APPROVED') await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,status]);
     if (status !== 'PENDING_APPROVAL') await db.query('DELETE FROM quote_locks WHERE order_id=$1', [orderId]);
     return { order: updated, completed: status === 'APPROVED' };
-  });
+  }).catch(error => auditApprovalFailure(user,error));
 }
 export async function decideOrder(user, orderId, decision) {
   return transaction(async db => {
@@ -333,14 +375,15 @@ export async function decideOrder(user, orderId, decision) {
     if (order.status === decision) return order;
     assert(order.status === 'PENDING_APPROVAL', 409, 'Order has already been decided');
     if (decision === 'APPROVED') {
-      const fresh = (await db.query('SELECT 1 FROM quotes WHERE id=$1 AND expires_at>now()', [order.quote_id])).rowCount;
-      assert(fresh, 409, 'Quote expired; reject this order and submit a new quote for review');
-      assertCutoffs(order.items);
-      await assertSubstitutionPolicy(db, user, order.items);
+      await approvalChecks(db,user,order);
     }
     const updated = (await db.query('UPDATE orders SET status=$1,decided_at=now(),routine=CASE WHEN $1=\'APPROVED\' THEN true ELSE routine END WHERE id=$2 RETURNING *', [decision,orderId])).rows[0];
+    await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('human_approver',user),
+      event_type:decision === 'APPROVED' ? 'HUMAN_APPROVED' : 'HUMAN_REJECTED', policy_snapshot:{ rules:await currentRules(db,user), risk:order.risk_details, decision, rechecks:decision === 'APPROVED' ? 'passed' : 'not evaluated' },
+      commercial_commitment:commercialSnapshot(order.items,order.currency,order.total_cents,order.requested_date) });
+    if (decision === 'APPROVED' && updated.mocked) await appendAudit(db, { user_id:user, order_id:orderId, quote_id:order.quote_id, actor:auditActor('wholesaler_system',user), event_type:'ORDER_COMMITTED', commercial_commitment:mockCommitment(updated) });
     await db.query('DELETE FROM quote_locks WHERE order_id=$1', [orderId]);
     await db.query('INSERT INTO order_events(order_id,user_id,status) VALUES ($1,$2,$3)', [orderId,user,decision]);
     return updated;
-  });
+  }).catch(error => auditApprovalFailure(user,error));
 }

@@ -11,6 +11,7 @@ import {rankCandidates,originMatches} from '../agent.js';
 import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints,parseOriginPreference,countryName,parseNutritionGoals,describeNutritionGoal,NUTRIENTS} from '../contracts.js';
 import {callGeminiJSON} from './luna.js';
 import {allocateAvailable} from './quote-check.js';
+import {projectAuditEvent,auditCsv} from '../audit.js';
 
 const app=express();
 app.use(express.json({limit:'64kb'}));
@@ -115,6 +116,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     user_id:user,
     created_at:new Date().toISOString(),
     quote_expires_at:new Date(Date.now()+15*60*1000).toISOString(),
+    supplier_claims:[], supplier_mode:sourceContext.getStore()==='demo'?'demo_mock':(process.env.VALIO_MOCK==='true'?'mock':'live'),
     raw_prompt:meta.rawPrompt||lines.map(l=>l.requested||`${l.quantity} ${l.query}`).join(', '),
     delivery_deadline:deliveryDeadline||null,
     prefers_low_carbon:sustainability,
@@ -135,6 +137,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
   };
   const used=new Map();
   const date=deliveryDeadline||new Date(Date.now()+86400000).toISOString().slice(0,10);
+  o.quote_requested_date=date;
   const lineOptions=[];
 
   for(let index=0;index<lines.length;index++){
@@ -180,6 +183,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     const ids=candidates.map(p=>p.id);
     const request={customer:user,requestedDate:date,products:ids};
     const [prices,stock]=await Promise.all([core('/api/price',request),core('/api/availability',request)]);
+    o.supplier_claims.push({request,price:prices,availability:stock});
     const enriched=candidates.map(p=>{
       const price=prices.products.find(x=>x.productId===p.id);
       const a=stock.products.find(x=>x.productId===p.id);
@@ -403,6 +407,7 @@ ${origin?`5o. The buyer ${origin.strict?'accepts ONLY':'prefers'} products whose
           lot:p.lot,
           quantity,
           available:p.available,
+          available_date:p.available_date,
           closing_time:p.closing_time,
           price:p.price,
           lineTotal:round3(quantity*p.price),
@@ -481,6 +486,7 @@ ${origin?`5o. The buyer ${origin.strict?'accepts ONLY':'prefers'} products whose
   if(policyBreach)o.reason=`Price cap review required: ${policyBreach}`;
   else if(meta.managedSimulation&&context.simulation?.governance==='human')o.reason='Human-in-the-loop review required';
   o.status='PENDING_APPROVAL';
+  o.audit_autonomous=auto;
   if(auto){
     o.audit_trail.push({at:new Date().toISOString(),actor:'gatekeeper',text:meta.managedSimulation?`Auto-approved under simulation governance after price-cap validation (risk score ${o.score}; buyer threshold ${threshold}).`:`Auto-approved: risk score ${o.score} is within buyer "${user}" threshold of ${threshold}.`});
   }else{
@@ -591,6 +597,18 @@ app.post('/portal/config',async(req,res)=>{
   res.json({user_id:saved.user_id,threshold:round3(saved.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash'});
 });
 app.get('/portal/orders',async(req,res)=>res.json(await core('/internal/orders?user_id='+encodeURIComponent(z.string().min(1).parse(req.query.user_id)))));
+app.get('/portal/orders/:id/audit',async(req,res)=>{
+ const user=z.string().trim().min(1).max(100).parse(req.query.user_id);
+ const orderId=z.uuid().parse(req.params.id);
+ const perspective=z.enum(['buyer','wholesaler']).default('buyer').parse(req.query.perspective);
+ const format=z.enum(['json','csv']).optional().parse(req.query.format);
+ const data=await core('/internal/audit?user_id='+encodeURIComponent(user)+'&order_id='+encodeURIComponent(orderId));
+ const result={...data,events:data.events.map(event=>projectAuditEvent(event,perspective)),perspective,
+  limitation:'Integrity is checked against the complete buyer chain on the server. A hash chain is not a signature or proof of non-repudiation. Demo identities are not authenticated.'};
+ if(format)res.set('Content-Disposition',`attachment; filename="audit-${orderId}.${format}"`);
+ if(format==='csv')return res.type('text/csv').send(auditCsv(result.events));
+ res.json(result);
+});
 app.post('/portal/requests',async(req,res)=>{
   const b=z.object({
     user_id:z.string().min(1).max(100),
