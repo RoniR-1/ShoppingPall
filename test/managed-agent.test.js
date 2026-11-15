@@ -114,3 +114,13 @@ test('simulation holds a missing pending order for reconciliation',async()=>{
     assert.equal(a.state('buyer').rules.find(rule=>rule.id===episode.context.why.rule_id).episode,null);
   }finally{await rm(dir,{recursive:true,force:true});}
 });
+test('simulated managed approvals reject overflow in creation order and preserve rejection reason',async()=>{
+ const rejected=[];const a=new ManagedAgent({file:'/unused',rejectOrder:async(_user,id)=>rejected.push(id)});
+ const s={simulation:{},telemetry:[],activity:[]};
+ const orders=Array.from({length:7},(_,i)=>({id:String(i),status:'PENDING_APPROVAL',created_at:new Date(100000+i*1000).toISOString(),context:{agent:{type:'managed'},action_id:String(i)}})).reverse();
+ s.activity=orders.map(o=>({id:o.id,order_id:o.id,status:'PENDING_APPROVAL'}));
+ await a.enforceApprovalLimit('buyer',s,orders);
+ assert.deepEqual(rejected,['5','6']);assert.deepEqual(orders.filter(o=>o.status==='PENDING_APPROVAL').map(o=>o.id).sort(),['0','1','2','3','4']);
+ assert.match(s.activity.find(x=>x.id==='5').message,/queue is full/);assert.ok(s.telemetry.some(e=>e.message.includes('queue is full')));
+ await a.enforceApprovalLimit('buyer',s,orders);assert.equal(rejected.length,2);
+});

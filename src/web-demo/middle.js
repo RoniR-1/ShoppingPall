@@ -491,7 +491,8 @@ ${origin?`5o. The buyer ${origin.strict?'accepts ONLY':'prefers'} products whose
 const managedAgent=new ManagedAgent({
   file:process.env.MANAGED_STATE_FILE||'.local/managed-agent.json',
   submit:(lines,user,context,id)=>sourceContext.run('demo',()=>plan(lines,user,false,{},false,context,{},id,{managedSimulation:Boolean(context.simulation)})),
-  listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user)))
+  listOrders:user=>sourceContext.run('demo',()=>core('/internal/orders?user_id='+encodeURIComponent(user))),
+  rejectOrder:(user,id)=>sourceContext.run('demo',()=>core('/internal/decision',{id,user_id:user,action:'reject',human:false}))
 });
 const managedReady=managedAgent.load();
 async function managedStatePayload(user){
