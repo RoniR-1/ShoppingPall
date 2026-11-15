@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { recipeCart, lunaJSON, rankCandidates } from '../src/agent.js';
 import { z } from 'zod';
-import { parseBudget, stripBudget, parseDeliveryDeadline, stripOrderConstraints, parseSustainability, parseOriginPreference } from '../src/contracts.js';
+import { parseBudget, stripBudget, parseDeliveryDeadline, stripOrderConstraints, parseSustainability, parseOriginPreference, parseNutritionGoals, nutritionPer100 } from '../src/contracts.js';
 
 test('recipe reuses planned synonyms without an extra model call', async () => {
   const replies = [
@@ -210,7 +210,7 @@ test('recipeCart keeps word match first and prioritizes delivery by the requeste
   const prompt = prompts[1];
   assert.ok(prompt.indexOf('exact-late') < prompt.indexOf('loose-early'), 'Higher word match remains first despite missing the requested date');
   assert.match(prompt, /stated total budget is EUR 10/);
-  assert.match(prompt, /prioritize candidates available by that date/);
+  assert.match(prompt, /default delivery date is 2026-11-17; between equally priced candidates, prefer those available by then/);
   assert.match(prompt, /"deliverable_by_date":false/);
   assert.match(prompt, /"deliverable_by_date":true/);
   assert.equal(cart.items[0].quantity, 5, 'Over-budget quantity should trigger correction to the EUR 10 limit');
@@ -440,6 +440,79 @@ test('recipeCart only ranks by a preferred origin and does not enforce it', asyn
   const cart = await recipeCart('2 kg apples, prefer Finnish', originApi, async () => replies.shift());
   assert.deepEqual(cart.items, [{ productId: 'fr-apple', quantity: 1 }]);
   assert.equal(cart.requiresApproval, undefined);
+});
+
+test('parseNutritionGoals reads one goal per nutrient in the order mentioned and strips them from product lines', () => {
+  for (const [text, expected] of [
+    ['2 high protein yoghurt, low sugar', [['protein', 'max'], ['sugar', 'min']]],
+    ['10 eggs, less salt and more fibre', [['salt', 'min'], ['fibre', 'max']]],
+    ['1 milk, low in saturated fat, fewer calories', [['saturatedFat', 'min'], ['energy', 'min']]],
+    ['2 lactose free milk', [['lactose', 'min']]], ['keto: 2 kg chicken', [['carbs', 'min']]],
+    ['1 sugar-free gum', [['sugar', 'min']]], ['1 Greek yoghurt protein-rich', [['protein', 'max']]],
+    ['1 sugar, 2 kg salt', []], ['1 kg brown sugar', []]
+  ]) assert.deepEqual(parseNutritionGoals(text).map(g => [g.nutrient, g.direction]), expected, text);
+  assert.equal(stripOrderConstraints('2 high protein yoghurt, low sugar, Finnish only, budget €20'), '2 yoghurt');
+  assert.equal(stripOrderConstraints('1 sugar, 2 kg salt'), '1 sugar, 2 kg salt');
+});
+
+test('nutritionPer100 normalises nutrition values to per 100 g/ml and skips per-portion values', () => {
+  assert.deepEqual(nutritionPer100([
+    { id: 'PRO-', value: 3.7, unit: 'GRM', basisQuantity: 100, basisQuantityUnit: 'GRM' },
+    { id: 'FAT', value: 10, unit: 'GRM', basisQuantity: 40, basisQuantityUnit: 'GRM' },
+    { id: 'SALTEQ', value: 1, unit: 'GRM', basisQuantity: 1, basisQuantityUnit: 'PTN' },
+    { id: 'ENER-E14', value: 496, unit: 'E14', basisQuantity: 100, basisQuantityUnit: 'MLT' }
+  ]), { protein: 3.7, fat: 25, energy: 496 });
+  assert.deepEqual(nutritionPer100(null), {});
+});
+
+test('rankCandidates gives each nutrition goal its own level, below keyword match, allergens, origin and delivery', () => {
+  const candidates = [
+    { id: 'weak-best-protein', match_rank: 2, allergen_safe: true, nutrition: { protein: 30, sugar: 0 } },
+    { id: 'exact-p10-s9-cheap', match_rank: 4, allergen_safe: true, unit_price: 1, carbon_kg_co2_per_kg: 0.1, nutrition: { protein: 10, sugar: 9 } },
+    { id: 'exact-p10-s2', match_rank: 4, allergen_safe: true, unit_price: 3, carbon_kg_co2_per_kg: 2, nutrition: { protein: 10.02, sugar: 2 } },
+    { id: 'exact-p12-s15', match_rank: 4, allergen_safe: true, unit_price: 5, nutrition: { protein: 12, sugar: 15 } },
+    { id: 'exact-unknown', match_rank: 4, allergen_safe: true, unit_price: 0.5, nutrition: {} },
+    { id: 'exact-unsafe', match_rank: 4, allergen_safe: false, nutrition: { protein: 50, sugar: 0 } }
+  ];
+  const ids = nutrition => rankCandidates(candidates, { nutrition, sustainability: true }).map(p => p.id);
+  // Protein first (10 and 10.02 tie at 0.1 g precision), then sugar decides, then CO2 and price.
+  assert.deepEqual(ids([{ nutrient: 'protein', direction: 'max' }, { nutrient: 'sugar', direction: 'min' }]),
+    ['exact-p12-s15', 'exact-p10-s2', 'exact-p10-s9-cheap', 'exact-unknown', 'exact-unsafe', 'weak-best-protein']);
+  // Mentioning sugar first changes the priority.
+  assert.deepEqual(ids([{ nutrient: 'sugar', direction: 'min' }, { nutrient: 'protein', direction: 'max' }]),
+    ['exact-p10-s2', 'exact-p10-s9-cheap', 'exact-p12-s15', 'exact-unknown', 'exact-unsafe', 'weak-best-protein']);
+});
+
+test('recipeCart sends the requested nutrients to the model and ranks by them', async () => {
+  const prompts = [];
+  const replies = [{ ingredients: [{ query: 'yoghurt' }] }, { items: [{ productId: 'high', quantity: 1 }] }];
+  await recipeCart('2 yoghurt, high protein', async path => {
+    if (path.startsWith('/catalog/search?')) return { selection_id: 'sel-1', products: [
+      { id: 'low', name: 'Yoghurt', match_rank: 4, allergen_safe: true, nutrition: { protein: 3, sugar: 4 } },
+      { id: 'high', name: 'Yoghurt', match_rank: 4, allergen_safe: true, nutrition: { protein: 10, sugar: 4 } }
+    ] };
+    assert.fail(`Unexpected path ${path}`);
+  }, async prompt => { prompts.push(prompt); return replies.shift(); });
+  assert.ok(prompts[1].indexOf('"high"') < prompts[1].indexOf('"low"'));
+  assert.match(prompts[1], /wants most protein/);
+  assert.match(prompts[1], /"nutrition":\{"protein \(g\)":10\}/);
+  assert.doesNotMatch(prompts[1], /sugar \(g\)/);
+});
+
+test('rankCandidates moves unrequested delivery and CO2 levels between price and the tie-breakers', () => {
+  const candidates = [
+    { id: 'cheap-late-dirty', match_rank: 4, allergen_safe: true, unit_price: 1, deliverable_by_date: false, carbon_kg_co2_per_kg: 9 },
+    { id: 'pricey-fast-green', match_rank: 4, allergen_safe: true, unit_price: 5, deliverable_by_date: true, carbon_kg_co2_per_kg: 0.1 },
+    { id: 'mid-late-green-favourite', match_rank: 4, allergen_safe: true, unit_price: 3, deliverable_by_date: false, carbon_kg_co2_per_kg: 0.1, human_approved_count: 9 },
+    { id: 'mid-late-dirty', match_rank: 4, allergen_safe: true, unit_price: 3, deliverable_by_date: false, carbon_kg_co2_per_kg: 2 },
+    { id: 'mid-fast-dirty', match_rank: 4, allergen_safe: true, unit_price: 3, deliverable_by_date: true, carbon_kg_co2_per_kg: 2 }
+  ];
+  const ids = options => rankCandidates(candidates, options).map(p => p.id);
+  // Nothing requested: price, then default-date delivery, then CO2, then history.
+  assert.deepEqual(ids({}), ['cheap-late-dirty', 'mid-fast-dirty', 'mid-late-green-favourite', 'mid-late-dirty', 'pricey-fast-green']);
+  // Requested delivery and sustainability move above price.
+  assert.deepEqual(ids({ deliveryRequested: true, sustainability: true }),
+    ['pricey-fast-green', 'mid-fast-dirty', 'mid-late-green-favourite', 'mid-late-dirty', 'cheap-late-dirty']);
 });
 
 test('recipeCart enriches and sorts candidates with live price and availability when requestedDate is set', async () => {

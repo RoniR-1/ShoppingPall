@@ -339,6 +339,9 @@ function renderOrderCard(o, interactive = true) {
   </article>`;
 }
 
+const NUTRIENT_LABELS = { protein: 'protein', saturatedFat: 'sat. fat', fat: 'fat', carbs: 'carbs', sugar: 'sugar', salt: 'salt', fibre: 'fibre', lactose: 'lactose' };
+function nutrientLabel(key) { return NUTRIENT_LABELS[key] ?? key; }
+
 function selectionReasonText(mode) {
   if (mode === 'human-substitution') return 'selected as your requested substitute';
   if (mode === 'human-pinned') return 'kept from your current selection during order edit';
@@ -387,11 +390,14 @@ function renderTraceNarrative(o) {
     const candList = lt.topCandidates.slice(0, 3).map((c, idx) => {
       const isWinner = lt.selectionMode !== 'origin-blocked' && (c.productId === lt.selectedProductId || idx === 0);
       const origin = c.country_of_origin ? `, ${esc(String(c.country_of_origin).toUpperCase())}` : '';
+      // Show the nutrients the buyer asked about, per 100 g/ml.
+      const nutrition = (o.nutrition_goals || []).map(g => c.nutrition?.[g.nutrient] != null
+        ? `, ${fmtNum(c.nutrition[g.nutrient])}${g.nutrient === 'energy' ? ' kcal' : ' g ' + esc(nutrientLabel(g.nutrient))}/100` : '').join('');
       const rel = c.reliability != null ? `, ${fmtNum(Number(c.reliability) * 100)}% rel` : '';
       const co2 = c.carbon != null ? `, ${fmtNum(c.carbon)} CO₂` : '';
       const hist = Number(c.bought_count || 0) > 0 ? `, ${c.bought_count}× prior` : ', new';
       const safety = c.allergen_safe === false ? ', ⚠ allergen' : '';
-      return `<span class="trace-cand${isWinner ? ' is-winner' : ''}">${idx + 1}) <strong>${esc(c.name)}</strong> <small>(${fmtMoney(c.price)}/${esc(c.unit)}, ${fmtNum(c.available)} avail${origin}${rel}${co2}${hist}${safety})</small>${isWinner ? ` ✓ <em>${fmtNum(lt.selectedQty)} ${esc(lt.selectedUnit || c.unit)}</em>` : ''}</span>`;
+      return `<span class="trace-cand${isWinner ? ' is-winner' : ''}">${idx + 1}) <strong>${esc(c.name)}</strong> <small>(${fmtMoney(c.price)}/${esc(c.unit)}, ${fmtNum(c.available)} avail${origin}${nutrition}${rel}${co2}${hist}${safety})</small>${isWinner ? ` ✓ <em>${fmtNum(lt.selectedQty)} ${esc(lt.selectedUnit || c.unit)}</em>` : ''}</span>`;
     }).join(' · ');
     const totalMatches = lt.totalCandidates || lt.topCandidates.length;
     return `<li><strong>"${esc(lt.requested)}"</strong> → <code>${esc(lt.matchedQuery || lt.query)}</code>${altsText} (${totalMatches} match${totalMatches === 1 ? '' : 'es'}): ${candList}. ${lt.selectionMode === 'origin-blocked' ? `Nothing picked (${selectionReasonText(lt.selectionMode)})` : `Picked <strong>${esc(lt.selectedName || lt.topCandidates[0]?.name)}</strong> (${selectionReasonText(lt.selectionMode)})`}.</li>`;
