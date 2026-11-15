@@ -1,3 +1,5 @@
+import { renderAudit, setAuditPerspective } from './audit-render.js';
+
 const $ = id => document.getElementById(id);
 let dataSource = 'real';
 const plainMode = false;
@@ -16,6 +18,8 @@ $('buyer-label').textContent = activeBuyer;
 let settingsOpen = false;
 let lastExecOrder = null;
 let lastOrders = [];
+let auditOrderId = null;
+let auditRequest = 0;
 const acceptedQuestionsByOrder = new Map();
 let promptScenarios = [];
 let guidedScenario = null;
@@ -79,6 +83,9 @@ async function api(path, body) {
 function resetExecutionView() {
   lastExecOrder = null;
   $('execution').hidden = true;
+  ++auditRequest;
+  auditOrderId = null;
+  $('audit-panel').hidden = true;
   clearInputError();
 }
 
@@ -326,6 +333,7 @@ function renderOrderCard(o, interactive = true) {
         <div class="order-meta">${esc(o.reason || '')}</div>
       </div>
       <div class="order-head-right">
+        <button type="button" class="link-btn" data-audit-order="${esc(o.id)}">Audit trail</button>
         <button type="button" class="link-btn inspect-btn" data-inspect-order="${esc(o.id)}">${isInspected ? '● Trace shown' : 'Inspect trace'}</button>
         ${statusBadge(o.status, o.score, o.threshold)}
       </div>
@@ -489,6 +497,56 @@ function renderOrders(orders) {
     : '<div class="empty">No processed orders yet.</div>';
 }
 
+function auditPath(format) {
+  const params = new URLSearchParams({ user_id: activeBuyer, perspective: $('audit-perspective').value });
+  if (format) params.set('format', format);
+  return `/orders/${encodeURIComponent(auditOrderId)}/audit?${params}`;
+}
+
+
+async function loadAudit() {
+  if (!auditOrderId) return;
+  const request = ++auditRequest;
+  $('audit-content').innerHTML = '<p class="order-meta">Loading audit trail…</p>';
+  try {
+    const data = await api(auditPath());
+    if (request === auditRequest) $('audit-content').innerHTML = renderAudit(data, $('audit-perspective').value);
+  } catch (error) {
+    if (request === auditRequest) $('audit-content').innerHTML = `<p role="alert">Could not load audit trail: ${esc(error.message)}</p>`;
+  }
+}
+
+async function exportAudit(format) {
+  if (!auditOrderId) return;
+  try {
+    const response = await fetch('/portal' + auditPath(format), { headers: { 'X-Data-Source': dataSource } });
+    if (!response.ok) throw Error((await response.text()).slice(0, 300) || response.statusText);
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `audit-${auditOrderId}-${$('audit-perspective').value}.${format}`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    $('audit-content').innerHTML = `<p role="alert">Export failed: ${esc(error.message)}</p>`;
+  }
+}
+
+$('audit-perspective').onchange = () => {
+  setAuditPerspective($('audit-perspective').value, $('audit-reasoning'));
+  loadAudit();
+};
+$('audit-json').onclick = () => exportAudit('json');
+$('audit-csv').onclick = () => exportAudit('csv');
+$('audit-close').onclick = () => { ++auditRequest; $('audit-panel').hidden = true; auditOrderId = null; };
+$('audit-reasoning').onclick = () => {
+  const order = lastOrders.find(o => o.id === auditOrderId);
+  if (!order) return;
+  showExecution(order);
+  renderOrders(lastOrders);
+  $('execution').scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
+
 function setSettingsView(open) {
   settingsOpen = plainMode ? false : Boolean(open);
   $('setup').hidden = !settingsOpen;
@@ -544,9 +602,19 @@ async function refresh() {
   ]);
   renderBuyers(buyerData.buyers || []);
   renderOrders(orders);
+  if (auditOrderId && !$('audit-panel').hidden) await loadAudit();
 }
 
 async function handleOrderDecision(e) {
+  const auditBtn = e.target.closest('button[data-audit-order]');
+  if (auditBtn) {
+    auditOrderId = auditBtn.dataset.auditOrder;
+    $('audit-panel').hidden = false;
+    $('audit-order').textContent = `Order ${auditOrderId}`;
+    await loadAudit();
+    $('audit-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
   const inspectBtn = e.target.closest('button[data-inspect-order]');
   if (inspectBtn) {
     const targetOrder = lastOrders.find(o => o.id === inspectBtn.dataset.inspectOrder);

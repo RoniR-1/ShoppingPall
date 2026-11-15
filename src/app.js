@@ -1,7 +1,8 @@
 import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { z, ZodError } from 'zod';
-import { pool } from './db.js';
+import { pool, transaction } from './db.js';
+import { appendAudit, auditActor, commercialSnapshot, verifyAuditChain, projectAuditEvent, auditCsv } from './audit.js';
 import { id, selectedRequest, orderRequest, assert, round3, nutritionPer100 } from './contracts.js';
 import { ValioClient } from './valio.js';
 import { createOrder, decideOrder, excludeOrderFromBaseline, setOrderRoutine, answerMandateQuestion } from './orders.js';
@@ -155,8 +156,13 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
         orderable: Boolean(priced && stock.salesBlock === false && stock.logisticModel === 'Stock' && line && cutoffOk),
         price, availability: stock };
     });
-    const quote = (await pool.query(`INSERT INTO quotes(id,user_id,requested_date,currency,items,mocked)
-      VALUES($1,$2,$3,$4,$5,$6) RETURNING *`, [randomUUID(),req.user,request.requestedDate,prices.currency,JSON.stringify(items),valio.mock])).rows[0];
+    const quote = await transaction(async db => {
+      const row = (await db.query(`INSERT INTO quotes(id,user_id,requested_date,currency,items,mocked)
+        VALUES($1,$2,$3,$4,$5,$6) RETURNING *`, [randomUUID(),req.user,request.requestedDate,prices.currency,JSON.stringify(items),valio.mock])).rows[0];
+      await appendAudit(db, { user_id:req.user, quote_id:row.id, actor:auditActor('wholesaler_system',req.user), event_type:'QUOTE_VERIFIED',
+        commercial_commitment:{ ...commercialSnapshot(items,prices.currency,0,request.requestedDate), total:null, total_eur:null, mocked:valio.mock, expires_at:row.expires_at } });
+      return row;
+    });
     res.status(201).json(quote);
   });
   app.post('/orders', async (req,res) => {
@@ -167,6 +173,14 @@ export function createApp({ valio = new ValioClient(), screening } = {}) {
     }
     const key = id.parse(req.get('Idempotency-Key'));
     res.status(201).json(await createOrder(req.user,key,input,screening));
+  });
+  app.get('/audit', async (req,res) => {
+    const query = z.object({ perspective:z.enum(['buyer','wholesaler']).default('buyer'), format:z.enum(['json','csv']).default('json') }).strict().parse(req.query);
+    const events = (await pool.query('SELECT event FROM audit_events WHERE user_id=$1 ORDER BY sequence', [req.user])).rows.map(r => r.event);
+    const verification = verifyAuditChain(events);
+    const projected = events.map(e => projectAuditEvent(e,query.perspective));
+    if (query.format === 'csv') return res.type('text/csv').attachment('audit-trail.csv').send(auditCsv(projected));
+    res.json({ events:projected, verification, perspective:query.perspective, assurance:'Hash chain only; no independent signature or external timestamp' });
   });
   app.get('/orders', async (req,res) => {
     const query = z.object({ status: z.enum(['PENDING_APPROVAL','APPROVED','REJECTED']).default('PENDING_APPROVAL'),

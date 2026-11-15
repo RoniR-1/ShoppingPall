@@ -55,6 +55,9 @@ test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
           assert.equal(result.status, 201);
           assert.equal(result.body.items[0].orderable, false);
           assert.equal((await api('/orders', {quote_id:result.body.id,items:[{productId:'460000',quantity:1}]})).status, 422);
+          const audit=(await api('/audit')).body.events.filter(e=>e.quote_id===result.body.id);
+          assert.equal(audit.filter(e=>e.event_type==='GUARDRAIL_FAILED').length,1);
+          assert.equal(audit.some(e=>e.event_type==='ORDER_COMMITTED'),false);
         }
       } finally { valio.availability = originalAvailability; }
     });
@@ -83,10 +86,24 @@ test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
       assert.equal(results[0].status,201); assert.equal(results[0].body.status,'APPROVED');
       assert.equal(results[0].body.id,results[1].body.id); assert.equal(Number(results[0].body.total_cents),250);
       routineOrderId=results[0].body.id;
+      const audit = (await api('/audit')).body;
+      assert.equal(audit.verification.valid,true);
+      const entries=audit.events.filter(e => e.order_id===routineOrderId);
+      assert.equal(entries.filter(e => e.event_type==='GUARDRAIL_PASSED').length,1);
+      assert.equal(entries.filter(e => e.event_type==='ORDER_COMMITTED').length,1);
+      assert.equal(entries.find(e => e.event_type==='ORDER_COMMITTED').commercial_commitment.supplier_order_submitted,false);
+      const supplier=(await api('/audit?perspective=wholesaler')).body;
+      assert.equal(supplier.events.find(e=>e.order_id===routineOrderId && e.event_type==='GUARDRAIL_PASSED').policy_snapshot,null);
       console.log(`[baseline-debug] created order ${routineOrderId}: routine=${results[0].body.routine}, exclude_from_baseline=${results[0].body.exclude_from_baseline}, risk_score=${results[0].body.risk_score}`);
       assert.equal(results[0].body.routine,true);
       assert.equal(results[0].body.exclude_from_baseline,false);
       assert.equal((await api('/orders',orderBody({force_flag:true}),user,key)).status,409);
+    });
+    await t.test('audit rows reject update, delete and truncate', async () => {
+      await assert.rejects(pool.query("UPDATE audit_events SET event=event WHERE user_id=$1",[user]),/append-only/);
+      await assert.rejects(pool.query('DELETE FROM audit_events WHERE user_id=$1',[user]),/append-only/);
+      await assert.rejects(pool.query('TRUNCATE audit_events'),/append-only/);
+      assert.equal((await api('/audit')).body.verification.valid,true);
     });
     await t.test('approved order can be removed from and restored to the risk baseline',async t => {
       const excluded=await api(`/orders/${routineOrderId}/baseline-exclusion`,{exclude:true});
@@ -205,6 +222,10 @@ test('PostgreSQL-backed catalog, quotes, and approval workflow', async t => {
       const order=(await api('/orders',orderBody({force_flag:true}))).body;
       await pool.query("UPDATE quotes SET expires_at=now()-interval '1 second' WHERE id=$1",[quote.id]);
       assert.equal((await api(`/orders/${order.id}/approve`,{})).status,409);
+      const failed=(await api('/audit')).body.events.filter(e=>e.order_id===order.id && e.event_type==='GUARDRAIL_FAILED');
+      assert.equal(failed.length,1);
+      assert.equal(failed[0].policy_snapshot.phase,'approval recheck');
+      assert.ok(failed[0].policy_snapshot.rules);
       assert.equal((await api(`/orders/${order.id}/reject`,{})).status,200);
       assert.equal((await api('/orders',orderBody())).status,409);
     });

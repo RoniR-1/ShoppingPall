@@ -1,3 +1,5 @@
+import {createAuditEvent,verifyAuditChain} from '../audit.js';
+import {planningEvents,changedProposal,decisionEvents,portalAuditInput,portalCommercial} from './audit.js';
 import {assertQuoteCutoffs} from './quote-check.js';
 // Explicit synthetic net contents per demo sales unit, not Valio product facts.
 export const demoContents={
@@ -11,7 +13,7 @@ export class DemoStore {
  constructor(){
   const fixtures=[['demo-beer','Lager beer','demo-dark-beer',[]],['demo-dark-beer','Dark beer','demo-beer',[]],['demo-eggs','Eggs',null,[]],['demo-dark-chocolate','Dark chocolate','demo-milk-chocolate',[]],['demo-milk-chocolate','Milk chocolate','demo-dark-chocolate',['milk']],['demo-milk','Milk',null,['milk']],['demo-potato-salad','Potato salad',null,['milk']]];
   this.products=fixtures.map(([id,name,sub,allergens])=>({id,name,allergens,net_contents:demoContents[id],search_text:name.toLowerCase(),sales_unit:'ST',allowed_lot_size:1,carbon_kg_co2_per_kg:null,delivery_reliability:null,raw:{substitutions:sub?[{product:id,substituteProduct:sub}]:[]}}));
-  this.orders=new Map();this.buyers=new Map([['demo-buyer',this.#normThreshold(process.env.SUSPICION_THRESHOLD??25)]]);this.reset('normal');
+  this.auditChains=new Map();this.orders=new Map();this.buyers=new Map([['demo-buyer',this.#normThreshold(process.env.SUSPICION_THRESHOLD??25)]]);this.reset('normal');
  }
  #normThreshold(v){const n=Number(v);if(!Number.isFinite(n)||n<0)throw Error('Invalid threshold');return Math.round(n*1000)/1000;}
  #normUser(u){const id=String(u||'').trim();if(!id)throw Error('Buyer ID required');return id;}
@@ -58,13 +60,17 @@ export class DemoStore {
   });
  }
  overview(){const row=p=>({...p,quantity:this.stock.get(p.id)});return {mocked:true,products:this.products.map(p=>({...row(p),substitutions:p.raw.substitutions.map(s=>row(this.products.find(p=>p.id===s.substituteProduct)))}))};}
- save(o){const prior=this.orders.get(o.id);if(prior&&(prior.user_id!==o.user_id||prior.status!=='PENDING_APPROVAL'))throw Error('Order cannot be replaced');if(o.user_id&&!this.buyers.has(o.user_id))this.buyers.set(o.user_id,this.#normThreshold(process.env.SUSPICION_THRESHOLD??25));this.orders.set(o.id,structuredClone(o));return o;}
- replace({id,user_id,replacement}){const old=this.orders.get(id);if(!old||old.user_id!==user_id||old.status!=='PENDING_APPROVAL')throw Error('Original order is no longer pending');if(!replacement||replacement.user_id!==user_id||replacement.status!=='PENDING_APPROVAL'||this.orders.has(replacement.id))throw Error('Invalid replacement proposal');const prior=structuredClone(old);prior.status='REJECTED';prior.superseded_by=replacement.id;prior.steps.push('Order replaced by a new proposal');this.orders.set(id,prior);this.orders.set(replacement.id,structuredClone(replacement));return structuredClone(replacement);}
+ appendAudit(input){const chain=this.auditChains.get(input.user_id)||[];const event=createAuditEvent(input,chain.at(-1)?.integrity_hash??null);chain.push(event);this.auditChains.set(input.user_id,chain);}
+ failedDecision({id,user_id,action},error){const o=this.orders.get(id);if(o&&o.user_id===user_id&&o.status==='PENDING_APPROVAL'&&action==='approve')this.appendAudit(portalAuditInput(o,'GUARDRAIL_FAILED','autonomous_agent',{policy_snapshot:{result:'failed',reason:error.message},commercial_commitment:portalCommercial(o)}));}
+ audit(user,id){const order=this.orders.get(id);if(!order||order.user_id!==user)throw Object.assign(Error('Order not found'),{status:404});const chain=this.auditChains.get(user)||[];return {events:structuredClone(chain.filter(e=>e.order_id===id)),verification:verifyAuditChain(chain),storage:'memory'};}
+ save(o){const prior=this.orders.get(o.id);if(prior&&(prior.user_id!==o.user_id||prior.status!=='PENDING_APPROVAL'))throw Error('Order cannot be replaced');if(o.user_id&&!this.buyers.has(o.user_id))this.buyers.set(o.user_id,this.#normThreshold(process.env.SUSPICION_THRESHOLD??25));if(changedProposal(prior,o))for(const event of planningEvents(o))this.appendAudit(event);this.orders.set(o.id,structuredClone(o));return o;}
+ replace({id,user_id,replacement}){const old=this.orders.get(id);if(!old||old.user_id!==user_id||old.status!=='PENDING_APPROVAL')throw Error('Original order is no longer pending');if(!replacement||replacement.user_id!==user_id||replacement.status!=='PENDING_APPROVAL'||this.orders.has(replacement.id))throw Error('Invalid replacement proposal');const prior=structuredClone(old);prior.status='REJECTED';prior.superseded_by=replacement.id;prior.steps.push('Order replaced by a new proposal');for(const event of [portalAuditInput(old,'ORDER_SUPERSEDED','human_approver',{commercial_commitment:portalCommercial(old)}),...planningEvents(replacement)])this.appendAudit(event);this.orders.set(id,prior);this.orders.set(replacement.id,structuredClone(replacement));return structuredClone(replacement);}
  list(user){return structuredClone([...this.orders.values()].filter(o=>o.user_id===user));}
  decide({id,user_id,action,human=false}){
   const o=this.orders.get(id);if(!o||o.user_id!==user_id)throw Error('Order not found');
   if(!['approve','reject'].includes(action))throw Error('Invalid action');
   if(o.status!=='PENDING_APPROVAL')return structuredClone(o);
+  let stockAtCommit=null;
   if(action==='approve'){
    if(o.incomplete||!o.items.length)throw Error('Resolve missing items first');
    assertQuoteCutoffs(o.items);
@@ -73,9 +79,11 @@ export class DemoStore {
    if(!human&&(o.context?.agent?.type!=='managed'||o.context?.confidence?.method!=='deterministic_threshold'||o.items.some(i=>i.substitution)))throw Error('Human approval is required for generated or substituted carts');
    const totals=new Map();for(const i of o.items){if(!Number.isFinite(i.quantity)||i.quantity<=0)throw Error('Invalid quantity');totals.set(i.productId,(totals.get(i.productId)||0)+i.quantity);}
    for(const [id,quantity]of totals)if(!this.stock.has(id)||this.stock.get(id)<quantity)throw Error('Stock changed; submit a fresh request');
+   stockAtCommit=[...totals].map(([sku,quantity])=>({sku,quantity,before:this.stock.get(sku),after:this.stock.get(sku)-quantity}));
    for(const [id,quantity]of totals)this.stock.set(id,this.stock.get(id)-quantity);
    if(human)o.human_approved=true;
   }
+  for(const event of decisionEvents(o,action,human,action==='approve'?{quote_fresh:true,cutoffs_passed:true,allergen_check_passed:true,stock_check_passed:true}:null,stockAtCommit))this.appendAudit(event);
   o.status=action==='approve'?'APPROVED':'REJECTED';if(action==='approve'&&human)o.human_approved=true;o.steps.push(action==='approve'?'Demo purchase completed · stock updated':'Order rejected');return structuredClone(o);
  }
  live(kind,r){return kind==='price'?{customerId:r.customer,currency:'EUR',pricingDate:r.requestedDate,products:r.products.map(productId=>({productId,quantity:1,netPriceFound:false,error:!this.stock.has(productId),priceWithTax:{value:2.5,currency:'EUR',validFrom:r.requestedDate,validTo:r.requestedDate}}))}:{timeNow:new Date().toISOString(),requestedDate:r.requestedDate,products:r.products.map(productId=>({productId,salesBlock:false,logisticModel:'Stock',closingTime:null,scheduleLines:[{availableAmount:this.stock.get(productId)||0,availableDate:r.requestedDate,salesUnit:'ST',salesBlock:false}]}))};}

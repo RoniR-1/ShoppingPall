@@ -138,6 +138,25 @@
         </details>
       </section>
 
+      <section class="panel audit-panel" id="audit-panel" hidden aria-labelledby="audit-title">
+        <div class="panel-bar">
+          <span id="audit-title">Audit trail</span>
+          <button class="link-btn" id="audit-close" type="button">Close</button>
+        </div>
+        <p class="order-meta" id="audit-order"></p>
+        <div class="audit-controls">
+          <label for="audit-perspective">Perspective</label>
+          <select id="audit-perspective">
+            <option value="buyer">Buyer governance</option>
+            <option value="wholesaler">Valio Aimo wholesaler</option>
+          </select>
+          <button class="ghost-btn small-btn" id="audit-json" type="button">Export JSON</button>
+          <button class="ghost-btn small-btn" id="audit-csv" type="button">Export CSV</button>
+          <button class="link-btn" id="audit-reasoning" type="button">View agent reasoning</button>
+        </div>
+        <div id="audit-content" aria-live="polite"></div>
+      </section>
+
       <details class="panel history-panel scenarios-panel" id="scenarios-wrap" data-chrome>
         <summary class="panel-bar history-summary">
           <span>Guided demo scenarios <span class="muted">(presets)</span></span>
