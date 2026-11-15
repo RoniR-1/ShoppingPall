@@ -36,3 +36,26 @@ test('automatic demand does not consume stock held for an approval episode',asyn
  for(let i=0;i<9;i++){advance(1333);await agent.simulationStep('buyer');}
  assert.equal(agent.snapshot('buyer').inventory.find(i=>i.id==='a').on_hand,2);
 });
+test('approval queue keeps five oldest requests and rejects overflow until a slot opens',async t=>{
+ const {args}=await setup(t);
+ const products=Array.from({length:7},(_,i)=>({id:String(i),name:`Product ${i}`,sales_unit:'ST',base_unit:'ST',allowed_lot_size:1,quantity:20,units:[{unitId:'ST',sizeInBaseUnits:1}],substitutions:[]}));
+ const agent=new RealInventorySimulation({...args,file:args.file+'-cap',catalog:async()=>products});await agent.initialize('buyer');
+ await agent.command('buyer',{action:'simulation',governance:'human',scenario:'full'});
+ for(let i=0;i<6;i++)await agent.command('buyer',{action:'snapshot',id:String(i),on_hand:2});
+ let s=agent.snapshot('buyer');assert.deepEqual(s.orders.map(o=>o.status),['PENDING_APPROVAL','PENDING_APPROVAL','PENDING_APPROVAL','PENDING_APPROVAL','PENDING_APPROVAL','REJECTED']);
+ const rejected=s.orders[5];assert.match(rejected.reason,/queue is full/);assert.equal(rejected.shipments[0].status,'REJECTED');
+ assert.match(s.activity.find(a=>a.id===rejected.id).message,/queue is full/);
+ assert.ok(s.telemetry.some(e=>e.message.includes('queue is full')));
+ await agent.tick('buyer');assert.match(agent.snapshot('buyer').activity.find(a=>a.id===rejected.id).message,/queue is full/);
+ await agent.command('buyer',{action:'decision',id:s.orders[0].id,decision:'reject'});
+ await agent.command('buyer',{action:'snapshot',id:'6',on_hand:2});s=agent.snapshot('buyer');
+ assert.equal(s.orders.filter(o=>o.status==='PENDING_APPROVAL').length,5);assert.equal(s.orders[6].status,'PENDING_APPROVAL');
+});
+test('initialization rejects previously stored overflow, preserving oldest approvals',async t=>{
+ const {agent,args}=await setup(t);const s=agent.states.buyer;
+ s.orders=Array.from({length:7},(_,i)=>({id:String(i),status:'PENDING_APPROVAL',requested_product_name:`Product ${i}`,context:{agent:{type:'managed'}},shipments:[{status:'PENDING_APPROVAL'}]}));
+ s.activity=s.orders.map((o,i)=>({id:o.id,status:'PENDING_APPROVAL',at:new Date(100000+i*1000).toISOString()}));
+ s.orders.reverse();await agent.save();const restarted=new RealInventorySimulation(args);await restarted.load();await restarted.initialize('buyer');
+ const result=restarted.snapshot('buyer');assert.deepEqual(result.orders.filter(o=>o.status==='PENDING_APPROVAL').map(o=>o.id).sort(),['0','1','2','3','4']);
+ assert.match(result.activity.find(a=>a.id==='5').message,/queue is full/);
+});

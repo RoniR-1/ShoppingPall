@@ -5,12 +5,26 @@ const interval = speed => speed === '6x' ? 1333 : speed === 'fast' ? 3000 : 8000
 const delay = (speed, multiplier = 1) => Math.round((speed === '6x' ? 5000 : speed === 'fast' ? 8000 : 12000) * multiplier);
 const compatible = (a,b) => { const size = p => (p.units || []).find(u => u.unitId === p.unit)?.sizeInBaseUnits; return Boolean(a.baseUnit && b.baseUnit && a.baseUnit === b.baseUnit && a.unit === b.unit && Number.isFinite(Number(size(a))) && Number(size(a)) > 0 && Number(size(a)) === Number(size(b))); };
 const number = n => Number.isFinite(Number(n)) ? Number(n) : 0;
+const APPROVAL_LIMIT = 5;
 
 // This engine persists simulated warehouse state and orders separately from the
 // supplier database. Only the catalog snapshot is read from PostgreSQL.
 export class RealInventorySimulation extends ManagedAgent {
  constructor({file,catalog,now=()=>Date.now()}) { super({file,now}); this.catalog=catalog; }
  state(user){const state=this.states[user];if(!state)throw Error('Database simulation not initialized');return state;}
+ enforceApprovalLimit(s){
+  const pending=s.orders.filter(o=>o.status==='PENDING_APPROVAL'&&o.context?.agent?.type==='managed').sort((a,b)=>{
+   const time=o=>Date.parse(o.created_at||s.activity.find(entry=>entry.id===o.id)?.at)||0;
+   return time(a)-time(b);
+  });
+  for(const o of pending.slice(APPROVAL_LIMIT)){
+   o.status='REJECTED';o.reason='Automatically rejected: approval queue is full (maximum 5).';
+   for(const shipment of o.shipments||[])if(shipment.status==='PENDING_APPROVAL')shipment.status='REJECTED';
+   const activity=s.activity.find(a=>a.id===o.id);if(activity){activity.status='REJECTED';activity.message=o.reason;}
+   this.telemetry(s,'ORDER',`${o.requested_product_name}: ${o.reason}`);
+  }
+  return pending.length>APPROVAL_LIMIT;
+ }
  consumeBatch(s){
   // Simulate whole service or production batches, scaled to each warehouse's
   // configured stock range. Focus on the closest reorder points so a short
@@ -39,7 +53,7 @@ export class RealInventorySimulation extends ManagedAgent {
  }
  async initialize(user) {
   await this.serial(async()=>{
-   if(this.states[user]?.catalog_source==='database')return;
+   if(this.states[user]?.catalog_source==='database'){if(this.enforceApprovalLimit(this.states[user]))await this.save();return;}
    const products=await this.catalog(user);
    if(!Array.isArray(products)||!products.length)throw Object.assign(Error('No eligible products found in the database. Check the catalog and buyer policy.'),{status:503});
    const eligible=products.filter(p=>p.id&&p.name&&p.sales_unit&&number(p.allowed_lot_size)>0&&number(p.quantity)>0);
@@ -87,6 +101,7 @@ export class RealInventorySimulation extends ManagedAgent {
  dispatch(s,o){const now=this.now();o.shipments.forEach((sh,i)=>{sh.eta=new Date(now+delay(s.simulation.speed,i?2:1)).toISOString();sh.status=sh.backorder?'BACKORDERED':'IN_TRANSIT';if(sh.backorder)sh.release_at=new Date(now+delay(s.simulation.speed,1.25)).toISOString();});s.metrics.autonomous_orders++;this.telemetry(s,'ORDER',`${o.requested_product_name}: ${o.items.reduce((n,x)=>n+x.quantity,0)} ordered; first arrival ${new Date(o.shipments[0].eta).toLocaleTimeString('en-GB')}`);}
  async simulationStep(user){await this.serial(async()=>{const s=this.states[user];if(!s)return;const sim=s.simulation;if(sim.running&&this.now()>=sim.next_consumption){sim.demand_index=(sim.demand_index||0)+1;if(sim.demand_index%3===0)this.consume(s);else this.consumeBatch(s);const next=sim.next_consumption+interval(sim.speed);sim.next_consumption=next>this.now()?next:this.now()+interval(sim.speed);await this.save();}});await this.tick(user);}
  async tick(user){return this.serial(async()=>{const s=this.states[user];if(!s)return;const before=JSON.stringify(s);
+  this.enforceApprovalLimit(s);
   for(const o of s.orders.filter(o=>o.status==='APPROVED'))for(const sh of o.shipments.filter(sh=>sh.status==='BACKORDERED'&&Date.parse(sh.release_at)<=this.now())){sh.status='IN_TRANSIT';this.telemetry(s,'ORDER',`${sh.name}: backorder dispatched`);}
   for(const o of s.orders.filter(o=>o.status==='APPROVED'))for(const sh of o.shipments.filter(sh=>sh.status==='IN_TRANSIT'&&Date.parse(sh.eta)<=this.now())){const item=s.inventory.find(p=>p.id===sh.product_id);if(item){item.on_hand+=sh.quantity;const rule=s.rules.find(r=>r.product_id===item.id);if(rule)rule.on_hand=item.on_hand;}sh.status='RECEIVED';if(sh.backorder)o.remainder=Math.max(0,o.remainder-sh.quantity);sh.received_at=new Date(this.now()).toISOString();this.telemetry(s,'RESTOCK',`${sh.name}: received ${sh.quantity}${sh.substitution?' (substitute)':''}`);}
   for(const r of s.rules){
@@ -105,7 +120,7 @@ export class RealInventorySimulation extends ManagedAgent {
    let policyBreach=null;try{enforcePriceCap(lines,context);}catch(e){policyBreach=e.message;this.telemetry(s,'POLICY',policyBreach);}
    const manual=s.simulation.governance==='human'||Boolean(substitute)||Boolean(policyBreach);
    const o={id,requested_product_name:item.name,requested_quantity:p.quantity,context,items:lines,total:lines.reduce((n,l)=>n+l.quantity*l.price,0),status:manual?'PENDING_APPROVAL':'APPROVED',reason:policyBreach|| (substitute?'Substitution requires review':manual?'Human-in-the-loop review required':'Price cap validated'),policy_breach:policyBreach,incomplete:false,simulated:true,scenario,remainder:p.quantity-first,shipments:lines.map(l=>({product_id:l.productId,name:l.name,quantity:l.quantity,substitution:l.substitution||false,backorder:l.backorder||false,status:manual?'PENDING_APPROVAL':'IN_TRANSIT',eta:null}))};
-   s.orders.push(o);activity.status=manual?'PENDING_APPROVAL':'SIMULATED_PLACED';activity.order_id=id;activity.what=lines;s.metrics.spend_governed+=o.total;if(!policyBreach)this.telemetry(s,'POLICY',`${item.name}: simulated quote validated against price cap`);if(manual)this.telemetry(s,'ORDER',`${item.name}: ${substitute?'substitution':'order'} awaiting approval`);else this.dispatch(s,o);
+   s.orders.push(o);activity.status=manual?'PENDING_APPROVAL':'SIMULATED_PLACED';activity.order_id=id;activity.what=lines;s.metrics.spend_governed+=o.total;if(!policyBreach)this.telemetry(s,'POLICY',`${item.name}: simulated quote validated against price cap`);if(manual){this.enforceApprovalLimit(s);if(o.status==='PENDING_APPROVAL')this.telemetry(s,'ORDER',`${item.name}: ${substitute?'substitution':'order'} awaiting approval`);}else this.dispatch(s,o);
   }
   if(JSON.stringify(s)!==before)await this.save();
  });}
