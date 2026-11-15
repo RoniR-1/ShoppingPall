@@ -9,7 +9,7 @@ import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
 import {RealInventorySimulation} from './real-inventory-simulation.js';
 import {rankCandidates,originMatches} from '../agent.js';
 import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints,parseOriginPreference,countryName,parseNutritionGoals,describeNutritionGoal,NUTRIENTS} from '../contracts.js';
-import {callGeminiJSON} from './luna.js';
+import {callGeminiJSON, configuredLunaModels} from './luna.js';
 import {allocateAvailable} from './quote-check.js';
 import {projectAuditEvent,auditCsv} from '../audit.js';
 
@@ -109,7 +109,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
   const originLabel=origin?origin.countries.map(countryName).join(' or '):'';
   // [{nutrient:'protein',direction:'max'},...]; each is its own ranking level, earlier-mentioned first.
   const nutritionGoals=parseNutritionGoals(meta.rawPrompt);
-  const parserModel=process.env.LUNA_API_KEY?(process.env.LUNA_MODEL||'gemini-2.5-flash'):'local-rule-parser';
+  const parserModel=process.env.LUNA_API_KEY?(configuredLunaModels()[0]):'local-rule-parser';
   const o={
     id:actionId||randomUUID(),
     context,
@@ -585,7 +585,7 @@ app.get('/portal/config',async(req,res)=>{
     core('/internal/buyer-config?user_id='+encodeURIComponent(user)),
     core('/internal/source')
   ]);
-  res.json({user_id:cfg.user_id,threshold:round3(cfg.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash',...src});
+  res.json({user_id:cfg.user_id,threshold:round3(cfg.threshold),model:configuredLunaModels()[0],...src});
 });
 app.post('/portal/config',async(req,res)=>{
   const b=z.object({
@@ -595,7 +595,7 @@ app.post('/portal/config',async(req,res)=>{
   }).parse(req.body);
   if(b.stock)await core('/internal/setup',{stock:b.stock});
   const saved=await core('/internal/buyers',{user_id:b.user_id,threshold:round3(b.threshold)});
-  res.json({user_id:saved.user_id,threshold:round3(saved.threshold),model:process.env.LUNA_MODEL||'gemini-2.5-flash'});
+  res.json({user_id:saved.user_id,threshold:round3(saved.threshold),model:configuredLunaModels()[0]});
 });
 app.get('/portal/orders',async(req,res)=>res.json(await core('/internal/orders?user_id='+encodeURIComponent(z.string().min(1).parse(req.query.user_id)))));
 app.get('/portal/orders/:id/audit',async(req,res)=>{

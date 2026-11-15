@@ -2,6 +2,23 @@ function aiError(message, status, code) {
   return Object.assign(Error(message), { status, code });
 }
 
+const DEFAULT_MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const providerStates = new WeakMap();
+
+export function configuredLunaModels(env = process.env) {
+  const configured = (env.LUNA_MODELS || '').trim();
+  return configured ? [...new Set(configured.split(',').map(model => model.trim()).filter(Boolean))] :
+    (env.LUNA_MODEL || '').trim() ? [env.LUNA_MODEL.trim()] : [...DEFAULT_MODELS];
+}
+
+function positiveSetting(value, fallback, name) {
+  const number = Number(value || fallback);
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw aiError(`${name} must be a positive integer`, 503, 'AI_NOT_CONFIGURED');
+  }
+  return number;
+}
+
 export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.env, fetchImpl = fetch } = {}) {
   const base = (env.LUNA_BASE_URL || '').trim().replace(/\/+$/, '');
   const rawKey = (env.LUNA_API_KEY || '').trim();
@@ -9,44 +26,71 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
   if (!apiKey || !base) {
     throw aiError('Configure LUNA_API_KEY and LUNA_BASE_URL to use the agent', 503, 'AI_NOT_CONFIGURED');
   }
-
-  const timeout = Number(env.LUNA_TIMEOUT_MS || 60000);
-  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
-    throw aiError('LUNA_TIMEOUT_MS must be a positive integer', 503, 'AI_NOT_CONFIGURED');
+  const models = configuredLunaModels(env);
+  if (!models.length) throw aiError('LUNA_MODELS must contain at least one model', 503, 'AI_NOT_CONFIGURED');
+  const timeout = positiveSetting(env.LUNA_TIMEOUT_MS, 10000, 'LUNA_TIMEOUT_MS');
+  const cooldown = positiveSetting(env.LUNA_COOLDOWN_MS, 60000, 'LUNA_COOLDOWN_MS');
+  const maxTokens = positiveSetting(env.LUNA_MAX_TOKENS, 8192, 'LUNA_MAX_TOKENS');
+  let states = providerStates.get(env);
+  if (!states) providerStates.set(env, states = new Map());
+  const config = JSON.stringify([base, apiKey, models]);
+  if (!states.has(config)) states.set(config, new Map());
+  const state = states.get(config);
+  let lastError;
+  for (const model of models) {
+    let modelState = state.get(model);
+    if (modelState && (modelState.until > Date.now() || modelState.probing)) {
+      lastError = modelState.error;
+      continue;
+    }
+    if (modelState) modelState.probing = true;
+    try {
+      const value = await requestModel({base, apiKey, model, timeout, maxTokens, systemPrompt, userPrompt, fetchImpl});
+      state.delete(model);
+      return value;
+    } catch (error) {
+      if (!error.retryable) {
+        if (modelState) modelState.probing = false;
+        throw error;
+      }
+      lastError = error;
+      if (models.length > 1) state.set(model, {until: Date.now() + cooldown, probing: false, error});
+    }
   }
-  // Thinking models count hidden reasoning against max_tokens, so leave room beyond the short JSON answer.
-  const maxTokens = Number(env.LUNA_MAX_TOKENS || 8192);
-  if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) {
-    throw aiError('LUNA_MAX_TOKENS must be a positive integer', 503, 'AI_NOT_CONFIGURED');
-  }
+  throw lastError || aiError('AI provider unavailable or timed out; retry the request', 502, 'AI_UNAVAILABLE');
+}
 
+async function requestModel({base, apiKey, model, timeout, maxTokens, systemPrompt, userPrompt, fetchImpl}) {
+  const controller = new AbortController();
+  let timer;
   let response;
-  try {
-    response = await fetchImpl(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: env.LUNA_MODEL || 'gemini-2.5-flash',
-        temperature: 0,
-        max_tokens: maxTokens,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        response_format: { type: 'json_object' }
-      }),
-      signal: AbortSignal.timeout(timeout)
-    });
-  } catch {
-    throw aiError('AI provider unavailable or timed out; retry the request', 502, 'AI_UNAVAILABLE');
-  }
-
   let raw;
   try {
-    raw = await response.text();
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(Error('timeout')); }, timeout);
+    });
+    await Promise.race([(async () => {
+      response = await fetchImpl(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, temperature: 0, max_tokens: maxTokens,
+          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+          response_format: { type: 'json_object' } }),
+        signal: controller.signal
+      });
+      raw = await response.text();
+    })(), deadline]);
   } catch {
-    if (response.status === 429) throw aiError('AI provider rate limited the request; retry later', 429, 'AI_RATE_LIMITED');
-    throw aiError('AI provider response unavailable or timed out; retry the request', 502, 'AI_UNAVAILABLE');
+    if (response && !response.ok && response.status !== 429 && response.status < 500) {
+      throw aiError(`AI provider request failed (${response.status}): Provider rejected request`, 502, 'AI_PROVIDER_ERROR');
+    }
+    const error = response?.status === 429
+      ? aiError('AI provider rate limited the request; retry later', 429, 'AI_RATE_LIMITED')
+      : aiError('AI provider unavailable or timed out; retry the request', 502, 'AI_UNAVAILABLE');
+    error.retryable = true;
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 
   let payload;
@@ -66,11 +110,13 @@ export async function callGeminiJSON(systemPrompt, userPrompt, { env = process.e
   }
   if (!response.ok) {
     const detail = String(payload.error?.message || 'Provider rejected request').replaceAll(apiKey, '[redacted]');
-    throw aiError(
+    const error = aiError(
       `AI provider request failed (${response.status}): ${detail}`,
       response.status === 429 ? 429 : 502,
       response.status === 429 ? 'AI_RATE_LIMITED' : 'AI_PROVIDER_ERROR'
     );
+    error.retryable = response.status === 429 || response.status >= 500;
+    throw error;
   }
 
   const choice = payload.choices?.[0];
