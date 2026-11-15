@@ -9,19 +9,20 @@
 </head>
 <body class="inventory-dashboard">
 <header class="topbar">
-  <div class="topbar-left"><a class="brand" href="/user-agent-demo">shopping pal</a><span class="status-tag">demo warehouse · simulated</span></div>
+  <div class="topbar-left"><a class="brand" href="/user-agent-demo">shopping pal</a><span class="status-tag">database catalog · simulated operations</span></div>
   <nav class="topbar-right" aria-label="Main navigation"><a class="nav-link" href="/user-agent-demo">User agent demo</a><a class="nav-link" href="/agent-managed-inventory" aria-current="page">Agent-Managed Inventory</a><span class="buyer-tag">buyer: <strong id="buyer-label"></strong></span><button id="new-session" class="ghost-btn small-btn" type="button">New Session</button></nav>
 </header>
 <main class="container inventory-workspace">
   <div class="col">
     <section class="panel" aria-labelledby="simulation-title">
-      <div class="panel-bar"><span id="simulation-title">01 · Inventory simulation</span><span class="muted">Demo only · no live orders</span></div>
-      <p class="intro">Monitor stock and let the agent replenish products when they fall below their minimum.</p>
+      <div class="panel-bar"><span id="simulation-title">01 · Inventory simulation</span><span class="muted">No live orders</span></div>
+      <p class="intro">Products come from the database. Stock changes, quotes, orders and arrivals are simulated.</p>
       <p id="error" class="input-error" role="alert" hidden></p>
       <div class="simulation-actions"><button class="primary-btn" id="simulation-toggle" type="button">Start simulation</button><button class="ghost-btn" id="demand-spike" type="button">Simulate demand spike</button></div>
       <div class="control-grid">
         <div><span class="field-label" id="speed-label">Speed</span><div class="speed-options" role="group" aria-labelledby="speed-label"><button class="ghost-btn" type="button" data-speed="1x">1x (8s)</button><button class="ghost-btn" type="button" data-speed="fast">Fast (3s)</button><button class="ghost-btn" type="button" data-speed="6x">6x (1.3s)</button></div></div>
         <label><span class="field-label">Governance mode</span><select id="governance"><option value="autonomous">Full Autonomous</option><option value="human">Human-in-the-Loop</option></select></label>
+        <label><span class="field-label">Order scenario</span><select id="scenario"><option value="mixed">Mixed scenarios</option><option value="full">Standard order</option><option value="partial">Partial order</option><option value="substitution">Substitution</option></select></label>
       </div>
       <div class="kpi-grid" aria-label="Operations summary">
         <div><span>Agent status</span><strong class="agent-status" id="agent-status"><i></i><span>PAUSED</span></strong><small id="status-caption">Simulation is paused</small></div>
@@ -33,18 +34,20 @@
     <section class="panel" aria-labelledby="stock-title">
       <div class="panel-bar"><span id="stock-title">02 · Inventory</span><span class="muted" id="sku-count">0 MONITORED</span></div>
       <p class="intro">Stock is shown against each product's target. The marker indicates its reorder minimum.</p>
-      <div id="stock-list" class="stock-list"><p class="dashboard-empty">Start the simulation to load the demo products.</p></div>
+      <div id="stock-list" class="stock-list"><p class="dashboard-empty">Loading products from the database...</p></div>
       <div class="stock-legend"><span><i class="legend-min"></i> Minimum</span><span><i class="legend-target"></i> Target</span></div>
-      <details id="rule-details" class="inventory-details"><summary>+ Replenishment rules <span class="muted">(thresholds and price caps)</span></summary><div class="details-content"><p>Stock thresholds use sales units. Price caps are checked against supplier quotes using the product's configured units.</p><button class="ghost-btn" id="open-agent-chat" type="button">Draft with agent</button><form id="rule" class="dashboard-form"><label>Product<select name="query" required></select></label><div class="form-grid"><label>Minimum<input name="minimum" step="any" type="number" value="10" min="0" required></label><label>Target<input name="target" step="any" type="number" value="20" min="0.001" required></label><label>On hand<input name="on_hand" type="number" value="0" min="0" readonly></label><label>Maximum price<input name="max_price" type="number" min="0" step="0.01" placeholder="No price cap"></label><label>Cap quantity<input name="price_quantity" type="number" min="0.001" step="any" value="1" required></label><label>Currency<select name="currency"><option>EUR</option><option>USD</option><option>GBP</option><option>SEK</option><option>NOK</option><option>DKK</option></select></label><label>Price unit<select name="price_unit" required></select></label></div><p id="rule-units" class="muted"></p><p id="rule-draft" role="status"></p><button class="primary-btn">Save reviewed rule</button></form></div></details>
+      <details id="rule-details" class="inventory-details"><summary>+ Replenishment rules <span class="muted">(thresholds and price caps)</span></summary><div class="details-content"><p>Stock thresholds use sales units. Price caps are checked against simulated quotes using the product's configured units.</p><button class="ghost-btn" id="open-agent-chat" type="button">Draft with agent</button><form id="rule" class="dashboard-form"><label>Product<select name="query" required></select></label><div class="form-grid"><label>Minimum<input name="minimum" step="any" type="number" value="10" min="0" required></label><label>Target<input name="target" step="any" type="number" value="20" min="0.001" required></label><label>On hand<input name="on_hand" type="number" value="0" min="0" readonly></label><label>Maximum price<input name="max_price" type="number" min="0" step="0.01" placeholder="No price cap"></label><label>Cap quantity<input name="price_quantity" type="number" min="0.001" step="any" value="1" required></label><label>Currency<select name="currency"><option>EUR</option><option>USD</option><option>GBP</option><option>SEK</option><option>NOK</option><option>DKK</option></select></label><label>Price unit<select name="price_unit" required></select></label></div><p id="rule-units" class="muted"></p><p id="rule-draft" role="status"></p><button class="primary-btn">Save reviewed rule</button></form></div></details>
       <details class="inventory-details"><summary>+ Manual stock override <span class="muted">(edge-case testing)</span></summary><div class="details-content"><form id="inventory" class="dashboard-form"><label>Product<select id="inventory-product" required></select></label><p id="inventory-current"></p><label>New on-hand amount<input id="inventory-amount" type="number" min="0" step="any" required></label><div class="form-actions"><button class="primary-btn" type="submit">Save quantity</button><button class="ghost-btn" id="inventory-edit" type="button">Edit rule</button></div></form><p id="inventory-status" role="status"></p></div></details>
     </section>
   </div>
   <div class="col">
     <section class="panel" aria-labelledby="activity-title">
-      <div class="panel-bar"><span id="activity-title">03 · Agent activity</span><span class="muted">Live demo feed</span></div>
+      <div class="panel-bar"><span id="activity-title">03 · Agent activity</span><span class="muted">Simulated operations</span></div>
       <div class="activity-heading"><strong>Approval queue</strong><span class="muted" id="approval-count">0 PENDING</span></div>
       <p class="intro">Orders awaiting approval and blocked replenishments appear here.</p>
       <div id="approvals"><p class="dashboard-empty">No orders awaiting approval.</p></div>
+      <div class="activity-heading shipments-heading"><strong>Simulated deliveries</strong><span class="muted" id="shipment-count">0 IN TRANSIT</span></div>
+      <div id="shipments"><p class="dashboard-empty">No deliveries yet.</p></div>
       <details class="inventory-details" open><summary>+ Live agent telemetry <span class="muted">(local time)</span></summary><div id="telemetry" class="telemetry-feed" role="log" aria-live="polite"><p class="telemetry-empty">Awaiting agent activity...</p></div></details>
       <details class="inventory-details"><summary>+ Decision evidence <span class="muted">(audit and reconciliation)</span></summary><div class="details-content" id="activity"></div></details>
     </section>

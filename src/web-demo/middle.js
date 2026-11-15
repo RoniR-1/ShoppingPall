@@ -6,6 +6,9 @@ import {z} from 'zod';
 import {route} from './policy.js';
 import {directLines,normalizeQuery,substitutionQuery} from './text.js';
 import {ManagedAgent,enforcePriceCap} from './managed-agent.js';
+import {RealInventorySimulation} from './real-inventory-simulation.js';
+import {rankCandidates} from '../agent.js';
+import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,stripOrderConstraints} from '../contracts.js';
 import {rankCandidates,originMatches} from '../agent.js';
 import {round3,parseBudget,parseDeliveryDeadline,parseSustainability,parseOriginPreference,countryName,stripOrderConstraints} from '../contracts.js';
 import {callGeminiJSON} from './luna.js';
@@ -499,6 +502,32 @@ async function managedStatePayload(user){
   const orders=await core('/internal/orders?user_id='+encodeURIComponent(user));
   return {...structuredClone(s),preview:managedAgent.preview(user),orders,simulated:true};
 }
+
+const realInventory=new RealInventorySimulation({
+  file:process.env.REAL_INVENTORY_STATE_FILE||'.local/agent-managed-inventory-real.json',
+  catalog:async user=>{
+    try{return (await sourceContext.run('real',()=>core('/internal/inventory-simulation-catalog?user_id='+encodeURIComponent(user)))).products;}
+    catch(e){throw Object.assign(Error('Cannot load the database catalog. Check REAL_DATABASE_URL and database availability.'),{status:503,code:'CATALOG_UNAVAILABLE'});}
+  }
+});
+const realInventoryReady=realInventory.load();
+const realUser=value=>z.string().trim().min(1).max(100).default('demo-buyer').parse(value);
+app.get('/portal/agent-managed-inventory',async(req,res,next)=>{
+  if(sourceContext.getStore()!=='real')return next();
+  const user=realUser(req.query.user_id);await realInventoryReady;await realInventory.initialize(user);res.json(realInventory.snapshot(user));
+});
+app.post('/portal/agent-managed-inventory',async(req,res,next)=>{
+  if(sourceContext.getStore()!=='real')return next();
+  const body=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),action:z.string().min(1)}).passthrough().parse(req.body||{});
+  await realInventoryReady;await realInventory.initialize(body.user_id);res.json(await realInventory.command(body.user_id,body));
+});
+app.post('/portal/agent-managed-inventory/chat',async(req,res,next)=>{
+  if(sourceContext.getStore()!=='real')return next();
+  const body=z.object({user_id:z.string().trim().min(1).max(100).default('demo-buyer'),text:z.string().min(1).max(2000)}).parse(req.body||{});
+  await realInventoryReady;await realInventory.initialize(body.user_id);res.json(realInventory.chat(body.user_id,body.text));
+});
+const realSimulationInFlight=new Set();
+setInterval(()=>{for(const user of Object.keys(realInventory.states)){if(realSimulationInFlight.has(user))continue;realSimulationInFlight.add(user);realInventory.simulationStep(user).catch(()=>{}).finally(()=>realSimulationInFlight.delete(user));}},250).unref();
 
 app.use((req,_res,next)=>{if(/^\/portal\/agent-managed-inventory(?=\/|\?|$)/.test(req.url))req.url=req.url.replace('/portal/agent-managed-inventory','/portal/managed-agent');next();});
 app.use('/portal/managed-agent',(req,res,next)=>{

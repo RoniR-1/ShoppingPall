@@ -203,6 +203,31 @@ app.get('/internal/catalog-overview',async(req,res)=>{
   const products=await rankedSearch(q,String(req.query.user_id||'demo-buyer'),8);
   res.json({mocked:client.mock,products});
 });
+// Read-only catalog snapshot for the isolated inventory simulation. No supplier
+// orders or database inventory changes are made by this endpoint.
+app.get('/internal/inventory-simulation-catalog',async(req,res)=>{
+  const user=String(req.query.user_id||'').trim();
+  if(!user)throw Error('Buyer ID required');
+  const result=await pool.query(`WITH seed AS (
+      SELECT id,raw FROM products WHERE NOT deleted
+      ORDER BY CASE WHEN jsonb_typeof(raw->'substitutions')='array' AND jsonb_array_length(raw->'substitutions')>0 THEN 0 ELSE 1 END,id LIMIT 500
+    ), candidates AS (
+      SELECT id FROM seed UNION SELECT x->>'substituteProduct' FROM seed,
+        jsonb_array_elements(CASE WHEN jsonb_typeof(raw->'substitutions')='array' THEN raw->'substitutions' ELSE '[]'::jsonb END) x
+      WHERE x->>'product'=seed.id AND x->>'substituteProduct' IS NOT NULL
+    )
+    SELECT p.id,p.name,p.category,p.sales_unit,p.allowed_lot_size,
+    p.raw->'units' AS units,p.raw->>'baseUnit' AS base_unit,p.raw->'substitutions' AS substitutions,i.quantity,
+    COALESCE((SELECT array_agg(v->>'id') FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'classifications','[]'::jsonb)) c,
+      jsonb_array_elements(COALESCE(c->'values','[]'::jsonb)) v WHERE c->>'name'='allergen' AND v->>'unit'='CONTAINS'),'{}'::text[]) AS allergens
+    FROM products p JOIN inventory i ON i.product_id=p.id
+    WHERE p.id IN (SELECT id FROM candidates) AND NOT p.deleted AND p.allowed_lot_size>0 AND i.quantity>0
+      AND NOT EXISTS (SELECT 1 FROM buyer_risk_policies b WHERE b.user_id=$1 AND
+        (p.category=ANY(b.blocked_categories) OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(p.raw->'synkkaData'->'classifications','[]'::jsonb)) c,
+          jsonb_array_elements(COALESCE(c->'values','[]'::jsonb)) v WHERE c->>'name'='allergen' AND v->>'unit'='CONTAINS' AND v->>'id'=ANY(b.excluded_allergens))))
+    ORDER BY p.id`,[user]);
+  res.json({products:result.rows});
+});
 app.post('/internal/suggestions',async(req,res)=>{
  const terms=searchTokens(String(req.body.q||'')).slice(0,20);
  if(!terms.length)return res.json([]);
