@@ -1,5 +1,13 @@
 import 'dotenv/config';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+
+if (process.env.REAL_DATABASE_URL?.trim()) {
+  const seed = spawnSync(process.execPath, ['scripts/seed.js', '--if-empty'], { stdio: 'inherit', env: { ...process.env, DATABASE_URL: process.env.REAL_DATABASE_URL } });
+  if (seed.error || seed.status !== 0) {
+    console.error('Database initialization failed:', seed.error || seed.status);
+    process.exit(1);
+  }
+}
 
 const children = ['core', 'middle', 'frontend'].map(name =>
   spawn(process.execPath, [`src/web-demo/${name}.js`], { stdio: 'inherit', env: process.env })
