@@ -27,6 +27,38 @@ npm run web
 
 Open [http://127.0.0.1:3001](http://127.0.0.1:3001) and select **Demo**.
 
+### Optional: use an API key locally
+
+To use AI-assisted ordering with a provider that supports the OpenAI-compatible
+Chat Completions API, add its API key, endpoint, and model to a local `.env`
+file. For a new setup, copy the example file:
+
+```sh
+cp .env.example .env
+```
+
+If you already have a `.env` file, add or update the settings below instead of
+overwriting it. Replace these values with the ones for your provider:
+
+```dotenv
+LUNA_BASE_URL=https://your-provider.example/v1
+LUNA_API_KEY=your_api_key
+LUNA_MODELS=your-model-name
+```
+
+`LUNA_BASE_URL` is the provider's OpenAI-compatible API base URL, and
+`LUNA_MODELS` lists that provider's supported model names in priority order.
+For Gemini, the compatible base URL is
+`https://generativelanguage.googleapis.com/v1beta/openai/`. Start or restart
+`npm run web` after editing the file.
+Without a key, Demo can still process direct product and quantity requests using
+its local parser. Keep `.env` private; it is ignored by Git.
+
+To opt into live Valio quotes, set `VALIO_MOCK=false` and add `VALIO_API_KEY`
+to `.env`, then restart the server. The portal's **Real** data source also
+requires `REAL_DATABASE_URL` and a seeded catalog; see the
+[technical reference](TECHNICAL.md#demo-and-real-data-selector) for setup.
+
 ## Documentation
 
 - [Technical reference](TECHNICAL.md) — architecture, API contract, CLI, database setup, and operational details.
