@@ -123,3 +123,15 @@ DROP TRIGGER IF EXISTS audit_events_no_update_delete ON audit_events;
 CREATE TRIGGER audit_events_no_update_delete BEFORE UPDATE OR DELETE ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_audit_mutation();
 DROP TRIGGER IF EXISTS audit_events_no_truncate ON audit_events;
 CREATE TRIGGER audit_events_no_truncate BEFORE TRUNCATE ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION reject_audit_mutation();
+
+-- Captured supplier data; imports replace this snapshot transactionally.
+CREATE TABLE IF NOT EXISTS valio_catalog (
+  product_id text PRIMARY KEY REFERENCES products(id),
+  price jsonb NOT NULL,
+  availability jsonb NOT NULL,
+  currency text NOT NULL,
+  customer_id text NOT NULL,
+  requested_date date NOT NULL,
+  captured_at timestamptz NOT NULL
+);
+ALTER TABLE valio_catalog ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'supplier';

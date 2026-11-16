@@ -117,7 +117,7 @@ async function plan(lines,user,force_flag=false,approved={},demo_unavailable=fal
     user_id:user,
     created_at:new Date().toISOString(),
     quote_expires_at:new Date(Date.now()+15*60*1000).toISOString(),
-    supplier_claims:[], supplier_mode:sourceContext.getStore()==='demo'?'demo_mock':(process.env.VALIO_MOCK==='true'?'mock':'live'),
+    supplier_claims:[], supplier_mode:sourceContext.getStore()==='demo'?'demo_mock':(process.env.VALIO_MOCK==='true'?'snapshot_mock_checkout':'snapshot'),
     raw_prompt:meta.rawPrompt||lines.map(l=>l.requested||`${l.quantity} ${l.query}`).join(', '),
     delivery_deadline:deliveryDeadline||null,
     prefers_low_carbon:sustainability,

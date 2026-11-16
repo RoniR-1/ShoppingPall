@@ -12,7 +12,9 @@
     "cli": "node --env-file-if-exists=.env src/cli.js",
     "test": "node --env-file-if-exists=.env --test test/*.test.js",
     "web": "node scripts/web-demo.js",
-    "test:portal": "vitest run"
+    "test:portal": "vitest run",
+    "export:valio": "node --env-file-if-exists=.env scripts/export-valio-catalog.js",
+    "generate:catalog": "node scripts/generate-valio-catalog.js"
   },
   "dependencies": {
     "csv-parse": "^7.0.3",
