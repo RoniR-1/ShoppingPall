@@ -7,8 +7,11 @@ const providerStates = new WeakMap();
 
 export function configuredLunaModels(env = process.env) {
   const configured = (env.LUNA_MODELS || '').trim();
-  return configured ? [...new Set(configured.split(',').map(model => model.trim()).filter(Boolean))] :
-    (env.LUNA_MODEL || '').trim() ? [env.LUNA_MODEL.trim()] : [...DEFAULT_MODELS];
+  const legacy = (env.LUNA_MODEL || '').trim();
+  const selected = configured || legacy;
+  return selected
+    ? [...new Set(selected.split(',').map(model => model.trim().replace(/^models\//, '')).filter(Boolean))]
+    : [...DEFAULT_MODELS];
 }
 
 function positiveSetting(value, fallback, name) {
