@@ -11,12 +11,7 @@ async function appendPortalAudit(db,event){await db.query('INSERT INTO audit_tra
 import {productsRequest,round3,nutritionPer100} from '../contracts.js';
 import {compatibleProduct} from './text.js';
 const app=express();
-const useMockValio=()=>process.env.VALIO_MOCK==='true';
-const clients={
-  demo:new ValioClient({mock:true,inventoryPool:pool}),
-  get real(){return new ValioClient({mock:useMockValio(),inventoryPool:pool});}
-};
-const client={get mock(){return sourceName()==='demo'||useMockValio();},price:r=>clients[sourceName()].price(r),availability:r=>clients[sourceName()].availability(r)};
+const client = new ValioClient({inventoryPool:pool});
 app.use(express.json({limit:'1mb'}));
 app.use((req,res,next)=>{const key=process.env.CORE_API_KEY||(process.env.NODE_ENV==='production'?null:'local-demo-key');if(!key)return res.status(503).json({error:'Configure CORE_API_KEY',code:'CORE_AUTH_NOT_CONFIGURED'});return req.get('X-API-Key')===key?next():res.status(401).json({detail:'Invalid API key',code:'CORE_UNAUTHORIZED'});});
 const defaultThreshold=()=>round3(Number(process.env.SUSPICION_THRESHOLD??25));

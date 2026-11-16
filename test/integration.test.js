@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createApp } from '../src/app.js';
 import { pool } from '../src/db.js';
-import { ValioClient } from '../src/valio.js';
+import { TestValioClient as ValioClient } from './support/valio-mock.js';
 import { recipeCart } from '../src/agent.js';
 import { createOrder } from '../src/orders.js';
 import { OrderScreeningService } from '../src/order-screening.js';

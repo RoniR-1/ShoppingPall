@@ -54,12 +54,36 @@ For Gemini, the compatible base URL is
 Without a key, Demo can still process direct product and quantity requests using
 its local parser. Keep `.env` private; it is ignored by Git.
 
-To opt into live Valio quotes, set `VALIO_MOCK=false` and add `VALIO_API_KEY`
-to `.env`, then restart the server. The portal's **Real** data source also
-requires `REAL_DATABASE_URL` and a seeded catalog; see the
-[technical reference](TECHNICAL.md#demo-and-real-data-selector) for setup.
+The portal's **Real** data source requires `REAL_DATABASE_URL` and a seeded
+catalog snapshot. See the offline catalog instructions below and the
+[technical reference](TECHNICAL.md#demo-and-real-data-selector).
 
 ## Documentation
 
 - [Technical reference](TECHNICAL.md) — architecture, API contract, CLI, database setup, and operational details.
 - [Reliability audit and failure modes](FMEA.md) — failure-mode analysis, recovery procedures, and regression results.
+
+### Offline Valio catalog
+
+Price and availability for the Real source are read from PostgreSQL, with no
+runtime Valio API calls. The checked-in `data/valio-catalog.json` contains
+**synthetic demo prices and stock**, not Valio prices or actual availability.
+The deterministic `npm run generate:catalog` recreates it from local product
+names, package sizes and stable product IDs. These illustrative amounts are not
+supplier quotes or tax calculations. Deleted products are unavailable. The
+fixed 2020 baseline makes generation reproducible and avoids expiring demo
+cutoffs; it is not a capture timestamp.
+
+Run `npm run seed` to load products and the snapshot transactionally. Repeating
+it replaces the same snapshot without replenishing inventory. For the portal's
+Real database, run `DATABASE_URL="$REAL_DATABASE_URL" npm run seed`; startup
+also imports the snapshot when the product catalog is already populated. A
+missing snapshot leaves price and availability unavailable until it is
+regenerated and imported. The stored `source` and API `snapshotSource` identify
+this data as `synthetic`.
+
+The API response's `snapshotDate` identifies the snapshot baseline; the requested
+date is a compatibility field and does not establish real availability.
+`VALIO_MOCK=true` enables simulated local checkout
+and caps snapshot quantities by remaining local inventory. Demo remains a
+separate in-memory simulation.

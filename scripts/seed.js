@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { parse } from 'csv-parse/sync';
 import { pool, transaction } from '../src/db.js';
+import { validateSnapshot, importSnapshot } from '../src/catalog-snapshot.js';
 const root = new URL('../', import.meta.url);
 const read = name => readFile(new URL(name, root), 'utf8');
 function indexCSV(text, column) {
@@ -18,17 +19,21 @@ try {
     read('sql/schema.sql'), read('product_data.json'), read('valio_aimo_junction26_carbon_footprint.csv'), read('valio_aimo_junction26_delivery_reliability.csv')
   ]);
   const products = JSON.parse(productsText);
+  const snapshotText = await read('data/valio-catalog.json').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const snapshot = snapshotText ? validateSnapshot(JSON.parse(snapshotText), products) : null;
+  if (!snapshot) console.warn('Valio snapshot missing: price and availability remain unavailable until exported and seeded');
   const carbon = indexCSV(carbonText, 'AVG kg CO2-eq/kg');
   const reliability = indexCSV(reliabilityText, 'deliveryReliability');
   const ids = new Set();
   await transaction(async db => {
     await db.query("SELECT pg_advisory_xact_lock(2026, 1)");
     await db.query(schema);
+    let skipProducts = false;
     if (process.argv.includes('--if-empty')) {
       const existing = await db.query('SELECT 1 FROM products LIMIT 1');
-      if (existing.rowCount) { console.log('Catalog already populated; skipping seed'); return; }
+      if (existing.rowCount) { console.log('Catalog already populated; skipping product seed'); skipProducts = true; }
     }
-    for (let i = 0; i < products.length; i += 200) {
+    for (let i = 0; !skipProducts && i < products.length; i += 200) {
       const rows = products.slice(i, i + 200).map(p => {
         if (typeof p.id !== 'string' || ids.has(p.id)) throw new Error('Missing or duplicate product id');
         ids.add(p.id);
@@ -45,6 +50,7 @@ try {
         delivery_reliability=EXCLUDED.delivery_reliability, raw=EXCLUDED.raw`, [JSON.stringify(rows)]);
     }
     await db.query('INSERT INTO inventory(product_id) SELECT id FROM products ON CONFLICT DO NOTHING');
+    if (snapshot) await importSnapshot(db, snapshot);
   });
   console.log(JSON.stringify({ products: ids.size, carbonMatches: [...ids].filter(id => carbon.has(id)).length,
     reliabilityMatches: [...ids].filter(id => reliability.has(id)).length }));

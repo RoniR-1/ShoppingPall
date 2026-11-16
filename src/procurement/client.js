@@ -20,11 +20,12 @@ export class ProcurementError extends Error {
   constructor(status, code, message, cause) { super(message, { cause }); this.status = status; this.code = code; }
 }
 export class ProcurementClient {
-  constructor({ baseUrl = process.env.VALIO_BASE_URL, apiKey = process.env.VALIO_API_KEY, fetchImpl = fetch } = {}) {
-    if (!baseUrl || !apiKey) throw Error('VALIO_BASE_URL and VALIO_API_KEY required');
-    Object.assign(this, { baseUrl, apiKey, fetchImpl });
+  constructor({ baseUrl = process.env.VALIO_BASE_URL, apiKey = process.env.VALIO_API_KEY, fetchImpl = fetch, snapshotClient } = {}) {
+    Object.assign(this, { baseUrl, apiKey, fetchImpl, snapshotClient });
   }
   async request(path, method, body) {
+    if (!this.baseUrl || !this.apiKey) throw Error('VALIO_BASE_URL and VALIO_API_KEY required for supplier downloads');
+    if (method !== 'GET') throw Error('Supplier POST requests are available only to the offline export');
     const op = spec.paths[path]?.[method.toLowerCase()];
     if (!op) throw Error('Unsupported API operation');
     if (body) body = schema(op.requestBody.content['application/json'].schema).parse(body);
@@ -61,6 +62,6 @@ export class ProcurementClient {
       throw new ProcurementError(502, timeout ? 'VALIO_TIMEOUT' : 'VALIO_UNAVAILABLE', timeout ? 'Valio request timed out after 15 seconds' : 'Valio unavailable', error);
     }
   }
-  availability(body) { return this.request('/api/availability', 'POST', body); }
-  price(body) { return this.request('/api/price', 'POST', body); }
+  async availability(body) { body = schema(spec.paths['/api/availability'].post.requestBody.content['application/json'].schema).parse(body); const { ValioClient } = await import('../valio.js'); return (this.snapshotClient ?? new ValioClient()).availability(body); }
+  async price(body) { body = schema(spec.paths['/api/price'].post.requestBody.content['application/json'].schema).parse(body); const { ValioClient } = await import('../valio.js'); return (this.snapshotClient ?? new ValioClient()).price(body); }
 }

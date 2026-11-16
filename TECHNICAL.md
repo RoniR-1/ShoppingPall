@@ -53,9 +53,12 @@ carbon/reliability are unknown rather than invented. Stock reset preserves order
 until the core process restarts; restarting restores stock and clears demo orders.
 Agent mode separately requires the configured model credentials.
 
-Real requires `REAL_DATABASE_URL` with the seeded catalog schema and
-`VALIO_API_KEY`. Real prices/availability come from Valio and orders are stored in
-PostgreSQL. Real checkout remains preview-only. The selector validates the real
+Real requires `REAL_DATABASE_URL` with the seeded catalog and static snapshot.
+The checked-in snapshot contains synthetic demo prices and availability, not
+supplier prices or actual stock. `snapshotSource` identifies its provenance.
+Prices and availability come from PostgreSQL. `VALIO_MOCK=true` enables simulated
+local checkout and caps captured availability by remaining local inventory;
+otherwise checkout remains preview-only. The selector validates the real
 connection before switching and retains Demo on failure. Demo resets cannot touch
 PostgreSQL. `DEMO_DATABASE_URL` is no longer used.
 
@@ -89,9 +92,15 @@ Run `npm install`, configure `.env` using the settings above, then `npm run seed
 and `npm run web`. Open http://127.0.0.1:3001. Keep `VALIO_MOCK=true` for
 local simulated checkout. The existing `.env` is preserved, including credentials.
 
-### Live Valio mode
+### Offline catalog snapshot
 
-Set `VALIO_MOCK=false` and supply `VALIO_API_KEY` in `.env`, then restart the server. The default upstream is `https://junction26.valioaimo.fi`. The client sends JSON with `customer`, `requestedDate`, and `products` and authenticates with `X-API-Key`. Both wrappers enforce 1–1,000 distinct products, use a 15-second timeout, and surface upstream 429 responses without automatic retries. No catalog-wide price/stock refresh is performed. Mock mode must be explicitly enabled; it never silently substitutes for failed live calls. Mock quotes are visibly labeled and use EUR 2.50 per sales unit with synthetic stock.
+The committed snapshot can be recreated without a network using
+`npm run generate:catalog`; run `npm run seed` to import it. Generated amounts
+are illustrative and use a fixed baseline date, not a supplier capture date.
+For the portal database use `DATABASE_URL="$REAL_DATABASE_URL" npm run seed`.
+See the README offline catalog section for date, customer, validity and recovery
+limitations. Runtime reads the snapshot from PostgreSQL and never calls the
+supplier's price or availability endpoints. The in-memory Demo is independent.
 
 ### Legacy monolith startup
 
@@ -253,7 +262,7 @@ npm run cli -- agent --user-id customer-123 --preset suspicious-order
 npm run cli -- approvals --user-id customer-123
 ```
 
-The first preset is automatically `APPROVED`; the second is `PENDING_APPROVAL`. Enter `a` or `r` in the approval console, or use `approve ORDER_UUID` / `reject ORDER_UUID` with `--user-id`. `approvals --list-only` prints without prompting. Both presets select products `460000` and `460001` from the local catalog, with at least one sales unit rounded up to a valid lot size. In live mode these products might be unavailable; deterministic demos use `VALIO_MOCK=true`.
+The first preset is automatically `APPROVED`; the second is `PENDING_APPROVAL`. Enter `a` or `r` in the approval console, or use `approve ORDER_UUID` / `reject ORDER_UUID` with `--user-id`. `approvals --list-only` prints without prompting. Both presets select products `460000` and `460001` from the local catalog, with at least one sales unit rounded up to a valid lot size. Availability depends on the imported snapshot and may be unavailable.
 
 ### Recipe agent
 
@@ -293,8 +302,9 @@ constructor configuration and `setThreshold` override it.
 ## Standalone procurement workflow
 
 The repository's ES-module Node stack is also used by the standalone procurement
-module in `src/procurement/`. It does not use PostgreSQL or the demo mock switch.
-Configure `VALIO_BASE_URL` and `VALIO_API_KEY`, then run:
+module in `src/procurement/`. It reads availability from PostgreSQL and uses the
+configured catalog download endpoint. Configure `DATABASE_URL`, `VALIO_BASE_URL`
+and `VALIO_API_KEY`, then run:
 
 ```sh
 node --env-file-if-exists=.env src/procurement/cli.js order.json

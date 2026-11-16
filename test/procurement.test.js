@@ -28,6 +28,13 @@ function setup({ amounts = [2,3,9], terminal = false, blocked = false, scheduleB
       scheduleLines:[{salesBlock:scheduleBlock,availableAmount:terminal?999999:amounts[['a','b','c'].indexOf(id)],availableDate:request.requestedDate,salesUnit:'KG'}]
     }))});
   }});
+  client.snapshotClient = { availability: async request => {
+    calls.push('database'); requests.push({ method: 'DB', path: '/api/availability', body: request });
+    return {timeNow:'2026-11-14T00:00:00Z',requestedDate:request.requestedDate,products:request.products.map(id => ({
+      productId:id, salesBlock:blocked, logisticModel:terminal?'Terminal':'Stock', closingTime:null,
+      scheduleLines:[{salesBlock:scheduleBlock,availableAmount:terminal?999999:amounts[['a','b','c'].indexOf(id)],availableDate:request.requestedDate,salesUnit:'KG'}]
+    }))};
+  }};
   const catalog = new Catalog(client);
   const session = new ProcurementSession({client,catalog,customer:'test',requestedDate:'2026-11-16'});
   for (const method of ['process', 'run']) {
@@ -101,8 +108,8 @@ test('workflow calls catalog once and availability only for original and direct 
   const result = await session.process(line, {approvedProductIds:['b']});
   assert.deepEqual(requests, [
     {method:'GET', path:'/api/products/download', body:undefined},
-    {method:'POST', path:'/api/availability', body:{customer:'test', requestedDate:'2026-11-16', products:['a']}},
-    {method:'POST', path:'/api/availability', body:{customer:'test', requestedDate:'2026-11-16', products:['b']}}
+    {method:'DB', path:'/api/availability', body:{customer:'test', requestedDate:'2026-11-16', products:['a']}},
+    {method:'DB', path:'/api/availability', body:{customer:'test', requestedDate:'2026-11-16', products:['b']}}
   ]);
   assert.deepEqual(result.completedOrders.map(({productId, quantity, remainingStock}) => ({productId, quantity, remainingStock})), [
     {productId:'a', quantity:2, remainingStock:0}, {productId:'b', quantity:3, remainingStock:0}
@@ -231,18 +238,12 @@ test('client strips key after cross-origin HTTPS redirect and retains one deadli
   assert.equal(calls[1].headers['X-API-Key'],undefined);
   assert.equal(calls[0].signal,calls[1].signal);
 });
-test('client 429, network, timeout and malformed schema have structured errors and no retries', async () => {
-  for (const [fetchImpl,status,code] of [
-    [async()=>new Response('',{status:429}),429,'VALIO_RATE_LIMITED'],
-    [async()=>{throw new TypeError('offline');},502,'VALIO_UNAVAILABLE'],
-    [async()=>{throw new DOMException('timeout','TimeoutError');},502,'VALIO_TIMEOUT'],
-    [async()=>Response.json({products:[]}),502,'VALIO_INVALID_RESPONSE']
-  ]) {
-    let calls=0;
-    const client=new ProcurementClient({baseUrl:'https://supplier.test',apiKey:'secret',fetchImpl:async (...args)=>{calls++;return fetchImpl(...args);}});
-    await assert.rejects(client.availability({customer:'test',requestedDate:'2026-11-16',products:['a']}), error=>error.status===status && error.code===code);
-    assert.equal(calls,1);
-  }
+test('procurement price and availability do not use supplier HTTP', async () => {
+  const client = new ProcurementClient({baseUrl:'https://supplier.test',apiKey:'secret',fetchImpl:async()=>{throw Error('network called');},snapshotClient:{availability:async()=>({products:[]}),price:async()=>({products:[]})}});
+  const request = {customer:'test', requestedDate:'2026-11-16', products:['a']};
+  assert.deepEqual(await client.availability(request), {products:[]});
+  assert.deepEqual(await client.price(request), {products:[]});
+  await assert.rejects(client.request('/api/price','POST',{}), /offline export/);
 });
 for (const decision of ['accept', 'reject']) test(`run resumes later lines after a human chooses to ${decision} a shortfall`, async () => {
   const {session} = setup({amounts:[2,3,9]});
