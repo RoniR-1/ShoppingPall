@@ -24,6 +24,10 @@ try {
   await transaction(async db => {
     await db.query("SELECT pg_advisory_xact_lock(2026, 1)");
     await db.query(schema);
+    if (process.argv.includes('--if-empty')) {
+      const existing = await db.query('SELECT 1 FROM products LIMIT 1');
+      if (existing.rowCount) { console.log('Catalog already populated; skipping seed'); return; }
+    }
     for (let i = 0; i < products.length; i += 200) {
       const rows = products.slice(i, i + 200).map(p => {
         if (typeof p.id !== 'string' || ids.has(p.id)) throw new Error('Missing or duplicate product id');
